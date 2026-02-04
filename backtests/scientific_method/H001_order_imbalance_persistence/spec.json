@@ -1,0 +1,37 @@
+{
+  "name": "Order Imbalance Persistence",
+  "hypothesis_id": "H001",
+  "description": "Order book imbalance predicts short-horizon logit changes in mid price.",
+  "inputs": {
+    "decision_paths": [],
+    "market_paths": ["./logs/market_*.jsonl"],
+    "reference_paths": []
+  },
+  "market_selection": {
+    "condition_ids": [],
+    "token_ids": [],
+    "filters": {
+      "slug_prefix": null
+    }
+  },
+  "sampling": {
+    "start_ms": null,
+    "end_ms": null,
+    "cadence_ms": 1000
+  },
+  "features": {
+    "imbalance_l1": true,
+    "imbalance_depth": {
+      "levels": 5
+    }
+  },
+  "label": {
+    "type": "micro",
+    "horizons_sec": [5, 15, 30]
+  },
+  "metrics": ["correlation", "ridge_regression", "autocorr_half_life"],
+  "acceptance": {
+    "min_corr": 0.02
+  },
+  "random_seed": 0
+}

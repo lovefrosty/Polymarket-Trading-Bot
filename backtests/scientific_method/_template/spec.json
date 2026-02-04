@@ -1,0 +1,69 @@
+{
+  "name": "Template Hypothesis",
+  "hypothesis_id": "H000_template",
+  "description": "Replace with your hypothesis.",
+  "inputs": {
+    "decision_paths": ["./logs/decision_*.jsonl"],
+    "reference_paths": ["./logs/reference_*.jsonl"]
+  },
+  "market_selection": {
+    "condition_ids": [],
+    "token_ids": [],
+    "filters": {
+      "slug_prefix": null
+    }
+  },
+  "sampling": {
+    "start_ms": null,
+    "end_ms": null,
+    "cadence_ms": 1000
+  },
+  "features": {
+    "imbalance_depth": {},
+    "imbalance_windows_sec": [30, 120],
+    "momentum_windows_sec": [30, 120],
+    "time_of_day": true
+  },
+  "label": {
+    "type": "micro",
+    "horizons_sec": [5, 15, 30]
+  },
+  "model": {
+    "type": "logistic",
+    "l2_lambda": 1.0,
+    "max_iter": 500,
+    "tol": 1e-6,
+    "seed": 0,
+    "train_frac": 0.7
+  },
+  "regime": {
+    "enabled": true,
+    "hmm_path": "models/regimes/hmm_reference.json",
+    "obs_return_sec": 300,
+    "vol_half_life_sec": 1800
+  },
+  "execution": {
+    "fee_bps": 25,
+    "qty_for_features": 1.0
+  },
+  "sizing": {
+    "kelly_fraction_max": 0.25,
+    "initial_equity": 1000.0
+  },
+  "constraints": {
+    "portfolio_path": "config/portfolio.yaml"
+  },
+  "pstar_diff_bps_soft": 10.0,
+  "pstar_diff_bps_hard": 50.0,
+  "pstar_diff_bps_decay_k": 2.0,
+  "c_trade_min": 0.3,
+  "depth_within_ticks_n": 5,
+  "depth_at_notional_target": 10.0,
+  "shock_horizon_sec": 10,
+  "shock_quantile_q": 0.01,
+  "shock_min_count": 5,
+  "acceptance": {
+    "min_corr": 0.05
+  },
+  "random_seed": 0
+}

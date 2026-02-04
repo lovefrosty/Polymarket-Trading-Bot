@@ -1,0 +1,18 @@
+{
+  "markets": [
+    {
+      "name": "BTC 15m Up/Down",
+      "slug_prefix": null,
+      "discovery_backend": "clob",
+      "selection_regex": null,
+      "allow_unknown_symbol": false,
+      "condition_id": "",
+      "token_ids": [],
+      "reference_symbol": "BTC",
+      "min_tick": 0.01,
+      "min_size": 1,
+      "max_price": 0.99,
+      "min_price": 0.01
+    }
+  ]
+}

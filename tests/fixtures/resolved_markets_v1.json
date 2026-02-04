@@ -1,0 +1,19 @@
+{
+  "schema_version": "resolved_markets_v1",
+  "run_id": "run",
+  "t_created_wall_iso": "2024-01-01T00:00:00.000Z",
+  "markets": [
+    {
+      "name": "BTC 15m Up/Down",
+      "reference_symbol": "BTC",
+      "market_slug": "btc-updown-15m-1704067200",
+      "condition_id": "0xcond",
+      "outcomes": ["Down", "Up"],
+      "tokens": [
+        {"token_id": "token_down", "outcome": "Down"},
+        {"token_id": "token_up", "outcome": "Up"}
+      ],
+      "constraints": {"min_tick": 0.01, "min_size": 1, "min_price": 0.01, "max_price": 0.99}
+    }
+  ]
+}

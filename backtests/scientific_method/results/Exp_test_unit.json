@@ -1,0 +1,101 @@
+{
+  "config": {
+    "c_trade_min": 0.3,
+    "depth_at_notional_target": 10.0,
+    "depth_within_ticks_n": 5,
+    "pstar_diff_bps_decay_k": 2.0,
+    "pstar_diff_bps_hard": 50.0,
+    "pstar_diff_bps_soft": 10.0
+  },
+  "decision_summary": {
+    "confidence_buckets": {
+      "<0.3": 1
+    },
+    "feature_asof_sources": {
+      "hybrid": 1
+    },
+    "trade_rate_by_regime": {
+      "1": 0.0
+    }
+  },
+  "depth_telemetry": {
+    "depth_at_notional_ask": {
+      "count": 2,
+      "min": 10.0,
+      "p50": 10.0,
+      "p90": 10.0,
+      "p95": 10.0
+    },
+    "depth_at_notional_bid": {
+      "count": 2,
+      "min": 10.0,
+      "p50": 10.0,
+      "p90": 10.0,
+      "p95": 10.0
+    },
+    "depth_within_ticks_ask": {
+      "count": 2,
+      "min": 18.0,
+      "p50": 18.0,
+      "p90": 20.0,
+      "p95": 20.0
+    },
+    "depth_within_ticks_bid": {
+      "count": 2,
+      "min": 22.0,
+      "p50": 22.0,
+      "p90": 25.0,
+      "p95": 25.0
+    },
+    "imbalance_corr": -1.0
+  },
+  "feature_order": [
+    "ref_ret_60s_regime0",
+    "ref_ret_60s_regime1",
+    "ref_ret_60s_regime2"
+  ],
+  "hypothesis_id": "Exp_test_unit",
+  "invariants": {
+    "execution_not_vwap": 0,
+    "feature_from_future": 0,
+    "feature_time_violations": 0,
+    "fee_double_count": 0,
+    "low_confidence": 1,
+    "warnings": []
+  },
+  "name": "Exp_test",
+  "pass": true,
+  "pnl": 0.0,
+  "pstar_stats": {
+    "alpha_basis": {
+      "count": 2,
+      "min": 0.6065306597126334,
+      "p50": 0.6065306597126334,
+      "p90": 0.6065306597126334,
+      "p95": 0.6065306597126334
+    },
+    "diff_bps": {
+      "count": 2,
+      "min": 20.0,
+      "p50": 20.0,
+      "p90": 20.0,
+      "p95": 20.0
+    },
+    "extreme_count": 0
+  },
+  "regime_pnl": {},
+  "schema_version": "scientific_method_result_v1",
+  "test_metrics": {
+    "accuracy": 1.0,
+    "brier": 1.0000000000575112e-12,
+    "logloss": 1.000000500029089e-06
+  },
+  "trades": 0,
+  "train_metrics": {
+    "accuracy": 1.0,
+    "brier": 1.0000000000575112e-12,
+    "iterations": 0,
+    "logloss": 1.000000500029089e-06,
+    "w_norm": 0.0
+  }
+}

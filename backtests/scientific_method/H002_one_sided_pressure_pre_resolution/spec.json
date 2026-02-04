@@ -1,0 +1,39 @@
+{
+  "name": "One-Sided Pressure Pre-Resolution",
+  "hypothesis_id": "H002",
+  "description": "Imbalance and momentum intensify as time-to-expiry shrinks.",
+  "inputs": {
+    "decision_paths": ["./logs/decision_*.jsonl"],
+    "market_paths": ["./logs/market_*.jsonl"],
+    "reference_paths": []
+  },
+  "market_selection": {
+    "condition_ids": [],
+    "token_ids": [],
+    "filters": {
+      "slug_prefix": null
+    }
+  },
+  "sampling": {
+    "start_ms": null,
+    "end_ms": null,
+    "cadence_ms": 1000
+  },
+  "features": {
+    "imbalance_l1": true,
+    "imbalance_depth": {
+      "levels": 5
+    },
+    "z_mom": true
+  },
+  "label": {
+    "type": "micro",
+    "horizons_sec": [5]
+  },
+  "metrics": ["bucket_effects"],
+  "acceptance": {
+    "min_bucket_gap": 0.0
+  },
+  "tte_buckets_sec": [180, 60, 30],
+  "random_seed": 0
+}

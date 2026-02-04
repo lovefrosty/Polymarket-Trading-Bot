@@ -1,0 +1,48 @@
+{
+  "limit": 100,
+  "count": 4,
+  "data": [
+    {
+      "accepting_orders": true,
+      "active": true,
+      "archived": false,
+      "closed": false,
+      "condition_id": "0x1",
+      "tokens": [
+        {"outcome": "Up", "price": 0.5, "token_id": "t1"},
+        {"outcome": "Down", "price": 0.5, "token_id": "t2"}
+      ]
+    },
+    {
+      "accepting_orders": false,
+      "active": true,
+      "closed": false,
+      "condition_id": "0x2",
+      "tokens": [
+        {"outcome": "Up", "price": 0.5, "token_id": "t3"},
+        {"outcome": "Down", "price": 0.5, "token_id": "t4"}
+      ]
+    },
+    {
+      "accepting_orders": true,
+      "active": true,
+      "closed": true,
+      "condition_id": "0x3",
+      "tokens": [
+        {"outcome": "Up", "price": 0.5, "token_id": "t5"},
+        {"outcome": "Down", "price": 0.5, "token_id": "t6"}
+      ]
+    },
+    {
+      "accepting_orders": true,
+      "active": true,
+      "closed": false,
+      "condition_id": "0x4",
+      "tokens": [
+        {"outcome": "Up", "price": 0.5, "token_id": "t7"},
+        {"outcome": "Down", "price": 0.5, "token_id": "t8"},
+        {"outcome": "Maybe", "price": 0.1, "token_id": "t9"}
+      ]
+    }
+  ]
+}

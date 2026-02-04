@@ -1,0 +1,35 @@
+{
+  "name": "Time of Day Effects",
+  "hypothesis_id": "H003",
+  "description": "Time-of-day influences spread/depth and calibration.",
+  "inputs": {
+    "decision_paths": ["./logs/decision_*.jsonl"],
+    "market_paths": [],
+    "reference_paths": ["./logs/reference_*.jsonl"]
+  },
+  "market_selection": {
+    "condition_ids": [],
+    "token_ids": [],
+    "filters": {
+      "slug_prefix": null
+    }
+  },
+  "sampling": {
+    "start_ms": null,
+    "end_ms": null,
+    "cadence_ms": 1000
+  },
+  "features": {
+    "spread": true,
+    "depth": true
+  },
+  "label": {
+    "type": "window",
+    "window_secs": 900
+  },
+  "metrics": ["hourly_calibration", "spread_depth_by_hour"],
+  "acceptance": {
+    "max_brier": 0.25
+  },
+  "random_seed": 0
+}

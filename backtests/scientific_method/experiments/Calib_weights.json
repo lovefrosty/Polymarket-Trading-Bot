@@ -1,0 +1,98 @@
+{
+  "name": "Calib_weights_v1",
+  "inputs": {
+    "decision_paths": ["decision_*.jsonl"],
+    "reference_paths": ["reference_*.jsonl"]
+  },
+  "label": {
+    "mode": "directional",
+    "horizon_sec": 15
+  },
+  "features": [
+    {
+      "name": "edge_bps_buy",
+      "path": "calc.edge_bps_buy",
+      "class": "edge",
+      "units": "bps",
+      "expected_range": [-500, 500],
+      "missing": "drop"
+    },
+    {
+      "name": "z_mom",
+      "path": "notes.signals.z_mom",
+      "class": "price_momentum",
+      "units": "sigma",
+      "expected_range": [-5, 5],
+      "missing": "drop"
+    },
+    {
+      "name": "z_revert",
+      "path": "notes.signals.z_revert",
+      "class": "price_momentum",
+      "units": "sigma",
+      "expected_range": [-5, 5],
+      "missing": "drop"
+    },
+    {
+      "name": "vol_ewma",
+      "path": "notes.signals.vol_ewma",
+      "class": "volatility",
+      "units": "unitless",
+      "expected_range": [0, 10],
+      "missing": "drop"
+    },
+    {
+      "name": "diff_bps",
+      "path": "p_star.diff_bps",
+      "class": "data_quality",
+      "units": "bps",
+      "expected_range": [0, 1000],
+      "missing": "drop"
+    },
+    {
+      "name": "spread_bps",
+      "path": "book.spread_bps",
+      "class": "liquidity",
+      "units": "bps",
+      "expected_range": [0, 1000],
+      "missing": "drop"
+    },
+    {
+      "name": "depth_at_qty_buy",
+      "path": "exec_cost.depth_at_qty_buy",
+      "class": "liquidity",
+      "units": "shares",
+      "expected_range": [0, 100000],
+      "missing": "drop"
+    },
+    {
+      "name": "slippage_bps_buy",
+      "path": "exec_cost.slippage_bps_buy",
+      "class": "execution_cost",
+      "units": "bps",
+      "expected_range": [0, 1000],
+      "missing": "drop"
+    }
+  ],
+  "standardize": {
+    "method": "median_mad"
+  },
+  "orthogonalize": {
+    "method": "residualize",
+    "ridge_lambda": 1e-6
+  },
+  "model": {
+    "type": "ridge_logistic",
+    "l2_lambda": 1.0,
+    "max_iter": 500,
+    "tol": 1e-6,
+    "seed": 0,
+    "train_frac": 0.7
+  },
+  "stability": {
+    "time_slices": 3,
+    "min_slice_size": 50
+  },
+  "require_feature_asof": false,
+  "random_seed": 0
+}
