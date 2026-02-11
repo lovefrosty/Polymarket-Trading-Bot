@@ -44,6 +44,7 @@ class Metrics:
         self._out_of_order = Counter()
         self._market_unknown_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
         self._market_ignored_old_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
+        self._market_active_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
         self._sequence_gap_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
         self._sequence_out_of_order_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
 
@@ -69,6 +70,8 @@ class Metrics:
                 self._market_unknown_recv_ts_ms.append(recv_ms)
             elif state == "ignored_old":
                 self._market_ignored_old_recv_ts_ms.append(recv_ms)
+            elif state == "active":
+                self._market_active_recv_ts_ms.append(recv_ms)
         # Only active market traffic contributes to lag health.
         include_lag = channel != "market" or state == "active"
         if include_lag and t_event_ms is not None and t_recv_wall_ms is not None:
@@ -89,6 +92,11 @@ class Metrics:
         now_ms = int(now_wall_ms)
         self._prune_recent(self._market_ignored_old_recv_ts_ms, now_ms)
         return float(len(self._market_ignored_old_recv_ts_ms))
+
+    def market_active_rate_per_min(self, now_wall_ms: int) -> float:
+        now_ms = int(now_wall_ms)
+        self._prune_recent(self._market_active_recv_ts_ms, now_ms)
+        return float(len(self._market_active_recv_ts_ms))
 
     def record_sequence_warning(self, warning_code: str, recv_wall_ms: int) -> None:
         code = str(warning_code or "").lower()

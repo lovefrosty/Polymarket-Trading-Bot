@@ -575,7 +575,14 @@ class RuntimeEngine:
 
             fsm_state = fsm.status().state.value
             feature_max_ts = int(pstar.ts_event_ms or 0)
-            decision_ts_event_ms = int(now_ms)
+            # Guard against wall-clock and event-clock ms precision ties/skew.
+            decision_ts_event_ms = int(
+                max(
+                    int(now_ms),
+                    int(snap.ts_event_ms or 0) + 1,
+                    int(pstar.ts_event_ms or 0) + 1,
+                )
+            )
             signal_age_ms = int(max(0, now_ms - feature_max_ts)) if feature_max_ts else 10_000
             self.signal_age_samples.append(float(signal_age_ms))
             ack_p95 = _quantile(list(self.send_ack_samples), 0.95)
@@ -822,7 +829,17 @@ class RuntimeEngine:
                     self._handle_broker_event(token_id, side, event, decision_id)
                 self.open_quotes[token_id].pop(side, None)
             if verdict.action == "FREEZE":
-                self.db.append_alert(now_ms, "critical", "POLICY_FREEZE", f"{token_id}:{side}:{','.join(verdict.reason_codes)}")
+                freeze_severity = "critical"
+                freeze_code = "POLICY_FREEZE"
+                if self.mode == "OBSERVE":
+                    freeze_severity = "warning"
+                    freeze_code = "POLICY_FREEZE_OBSERVE"
+                self.db.append_alert(
+                    now_ms,
+                    freeze_severity,
+                    freeze_code,
+                    f"{token_id}:{side}:{','.join(verdict.reason_codes)}",
+                )
             return
 
         if self.mode == "OBSERVE" or self.broker is None:
@@ -3907,6 +3924,8 @@ async def _run() -> None:
     rollover_quiet_window_ms = int(trading_cfg.get("rollover_quiet_window_ms", 500))
     unknown_alert_threshold_per_min = int(trading_cfg.get("rollover_unknown_alert_threshold_per_min", 120))
     unknown_alert_cooldown_ms = int(trading_cfg.get("rollover_unknown_alert_cooldown_ms", 60_000))
+    unknown_alert_min_ratio = float(trading_cfg.get("rollover_unknown_alert_min_ratio_vs_active", 2.0))
+    unknown_alert_startup_grace_ms = int(trading_cfg.get("rollover_unknown_alert_startup_grace_ms", 180_000))
     reference_sources = args.reference_source or settings.reference_source or "poll_coinbase,poll_binance_perp"
 
     stop_event = asyncio.Event()
@@ -4008,6 +4027,7 @@ async def _run() -> None:
             unknown_count = metrics.market_unknown_count()
             unknown_rate = metrics.market_unknown_rate_per_min(now_ms)
             ignored_old_rate = metrics.market_ignored_old_rate_per_min(now_ms)
+            active_rate = metrics.market_active_rate_per_min(now_ms)
             current_market_slug = rollover_manager.current.market_slug if rollover_manager is not None else None
             current_selection_key = rollover_manager.current.selection_key if rollover_manager is not None else None
             current_end_source = rollover_manager.current.market_end_source if rollover_manager is not None else None
@@ -4017,7 +4037,10 @@ async def _run() -> None:
                 metric_value=float(unknown_count),
                 market_slug=current_market_slug,
                 selection_key=current_selection_key,
-                payload={"unknown_rate_per_min": unknown_rate},
+                payload={
+                    "unknown_rate_per_min": unknown_rate,
+                    "active_rate_per_min": active_rate,
+                },
             )
             db.append_rollover_metric(
                 ts_ms=now_ms,
@@ -4043,7 +4066,16 @@ async def _run() -> None:
                 payload=guard_state,
             )
             if (
-                unknown_rate >= float(max(1, unknown_alert_threshold_per_min))
+                _should_emit_unknown_ws_alert(
+                    mode=mode,
+                    now_ms=now_ms,
+                    run_epoch_ms=runtime.run_epoch_ms,
+                    unknown_rate_per_min=float(unknown_rate),
+                    active_rate_per_min=float(active_rate),
+                    threshold_per_min=int(unknown_alert_threshold_per_min),
+                    min_ratio_vs_active=float(unknown_alert_min_ratio),
+                    startup_grace_ms=int(unknown_alert_startup_grace_ms),
+                )
                 and int(now_ms - last_unknown_alert_ms) >= int(max(1, unknown_alert_cooldown_ms))
             ):
                 last_unknown_alert_ms = int(now_ms)
@@ -4055,7 +4087,9 @@ async def _run() -> None:
                     payload={
                         "unknown_msg_count": int(unknown_count),
                         "unknown_rate_per_min": float(unknown_rate),
+                        "active_rate_per_min": float(active_rate),
                         "threshold_per_min": int(unknown_alert_threshold_per_min),
+                        "min_ratio_vs_active": float(unknown_alert_min_ratio),
                     },
                 )
             await asyncio.sleep(max(0.1, stats_interval_ms / 1000.0))
@@ -4784,14 +4818,41 @@ def _handle_startup_guard_result(
 ) -> bool:
     if guard_ok:
         return False
+    severity = "critical"
+    code = "FEED_NOT_WIRED"
+    if mode == "OBSERVE":
+        severity = "warning"
+        code = "FEED_NOT_WIRED_OBSERVE"
     db.append_alert(
         _now_ms(),
-        "critical",
-        "FEED_NOT_WIRED",
+        severity,
+        code,
         f"startup_feed_guard_failed mode={mode}",
         payload=guard_payload,
     )
     return mode in {"PAPER", "TRADE"}
+
+
+def _should_emit_unknown_ws_alert(
+    mode: str,
+    now_ms: int,
+    run_epoch_ms: int,
+    unknown_rate_per_min: float,
+    active_rate_per_min: float,
+    threshold_per_min: int,
+    min_ratio_vs_active: float,
+    startup_grace_ms: int,
+) -> bool:
+    # Noise suppression for OBSERVE: keep telemetry but avoid operational paging.
+    if mode not in {"PAPER", "TRADE"}:
+        return False
+    if int(now_ms - run_epoch_ms) < int(max(0, startup_grace_ms)):
+        return False
+    if float(unknown_rate_per_min) < float(max(1, threshold_per_min)):
+        return False
+    active = max(1.0, float(active_rate_per_min))
+    ratio = float(unknown_rate_per_min) / active
+    return ratio >= float(max(0.1, min_ratio_vs_active))
 
 
 def main() -> None:
