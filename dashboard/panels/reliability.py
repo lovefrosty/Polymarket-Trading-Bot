@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -11,7 +11,7 @@ except ModuleNotFoundError:  # pragma: no cover
     st = None  # type: ignore[assignment]
 
 from dashboard.contracts import DashboardFilters, HealthGateStatus, PanelDependency
-from dashboard.data_access import query_df, require_sources
+from dashboard.data_access import query_df, query_evidence_rows, require_sources
 from core.metrics import classify_reliability_rows
 
 HEALTH_DEP = PanelDependency(
@@ -37,7 +37,35 @@ LOGS_DEP = PanelDependency(
 )
 
 
-def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGateStatus], panel_budget_ms: int = 400) -> None:
+def _sanitize_df_for_view(
+    df: pd.DataFrame,
+    view_mode: str,
+    label_token_fn: Optional[Callable[[Any, Any], Dict[str, str]]] = None,
+    reason_humanizer: Optional[Callable[[Optional[str], Optional[str]], str]] = None,
+) -> pd.DataFrame:
+    if df.empty or str(view_mode).lower() == "developer":
+        return df
+    out = df.copy()
+    if "token_id" in out.columns:
+        if label_token_fn is not None:
+            out["Outcome"] = out["token_id"].apply(lambda token: label_token_fn(None, token).get("outcome_label", "Outcome"))
+            out["Market"] = out["token_id"].apply(lambda token: label_token_fn(None, token).get("market_label", "Unknown market"))
+        out = out.drop(columns=["token_id"], errors="ignore")
+    out = out.drop(columns=["decision_id", "order_id", "event_id"], errors="ignore")
+    if reason_humanizer is not None and "code" in out.columns:
+        out["reason"] = out.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
+    return out
+
+
+def render_health_panel(
+    filters: DashboardFilters,
+    gate_map: Dict[str, HealthGateStatus],
+    panel_budget_ms: int = 400,
+    view_mode: str = "developer",
+    label_token_fn: Optional[Callable[[Any, Any], Dict[str, str]]] = None,
+    reason_humanizer: Optional[Callable[[Optional[str], Optional[str]], str]] = None,
+    allow_widgets: bool = True,
+) -> None:
     assert st is not None
     t0 = perf_counter()
     ok, missing_required, missing_optional = require_sources(
@@ -72,7 +100,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not pstar.empty:
         pstar["ts"] = pd.to_datetime(pstar["ts_ms"], unit="ms", utc=True)
-    st.dataframe(pstar, use_container_width=True, height=200)
+    st.dataframe(_sanitize_df_for_view(pstar, view_mode, label_token_fn, reason_humanizer), width="stretch", height=200)
 
     st.subheader("B: Causality")
     causality = query_df(
@@ -87,7 +115,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not causality.empty:
         causality["ts"] = pd.to_datetime(causality["ts_ms"], unit="ms", utc=True)
-    st.dataframe(causality, use_container_width=True, height=180)
+    st.dataframe(_sanitize_df_for_view(causality, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
 
     st.subheader("C: Book")
     book = query_df(
@@ -100,7 +128,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not book.empty:
         book["ts"] = pd.to_datetime(book["ts_ms"], unit="ms", utc=True)
-    st.dataframe(book, use_container_width=True, height=180)
+    st.dataframe(_sanitize_df_for_view(book, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
 
     st.subheader("D: Hedge / one-leg risk")
     d_alerts = query_df(
@@ -115,7 +143,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not d_alerts.empty:
         d_alerts["ts"] = pd.to_datetime(d_alerts["ts_ms"], unit="ms", utc=True)
-    st.dataframe(d_alerts, use_container_width=True, height=160)
+    st.dataframe(_sanitize_df_for_view(d_alerts, view_mode, label_token_fn, reason_humanizer), width="stretch", height=160)
 
     st.subheader("E: Latency")
     lat = query_df(
@@ -129,7 +157,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not lat.empty:
         lat["ts"] = pd.to_datetime(lat["ts_ms"], unit="ms", utc=True)
-    st.dataframe(lat, use_container_width=True, height=200)
+    st.dataframe(_sanitize_df_for_view(lat, view_mode, label_token_fn, reason_humanizer), width="stretch", height=200)
 
     st.subheader("Critical alerts (latest 10)")
     critical = query_df(
@@ -143,7 +171,39 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not critical.empty:
         critical["ts"] = pd.to_datetime(critical["ts_ms"], unit="ms", utc=True)
-    st.dataframe(critical, use_container_width=True, height=180)
+    st.dataframe(_sanitize_df_for_view(critical, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
+
+    st.subheader("Reason Drilldown")
+    active_reasons_df = query_df(
+        """
+        SELECT code, severity, ts_ms
+        FROM alerts
+        ORDER BY ts_ms DESC
+        LIMIT 100
+        """
+    )
+    if not active_reasons_df.empty and "code" in active_reasons_df.columns:
+        codes = [str(code) for code in active_reasons_df["code"].dropna().astype(str).tolist()]
+        unique_codes = sorted(set(codes))
+        if allow_widgets:
+            selected_reason = st.selectbox("Active reason code", unique_codes, index=0, key="health_reason_drilldown")
+        else:
+            selected_reason = unique_codes[0]
+            st.caption(f"Reason drilldown: {selected_reason} (auto-refresh mode)")
+        reason_rows = active_reasons_df[active_reasons_df["code"] == selected_reason]
+        latest_ts = int(reason_rows["ts_ms"].max()) if not reason_rows.empty else int(pd.Timestamp.utcnow().timestamp() * 1000)
+        start_ts = int(max(0, latest_ts - filters.window_minutes * 60_000))
+        evidence = query_evidence_rows(start_ts_ms=start_ts, end_ts_ms=latest_ts, market=filters.selected_market, token_id=filters.selected_token, limit=200)
+        if not evidence.empty and "reason_code" in evidence.columns:
+            evidence = evidence[evidence["reason_code"].astype(str).str.contains(selected_reason, na=False)]
+        if evidence.empty:
+            st.caption(f"DEGRADED no evidence rows found for reason={selected_reason}")
+        else:
+            if "ts_ms" in evidence.columns:
+                evidence["ts"] = pd.to_datetime(evidence["ts_ms"], unit="ms", utc=True)
+            st.dataframe(_sanitize_df_for_view(evidence, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
+    else:
+        st.caption("DEGRADED no active reason codes available.")
 
     st.subheader("Execution quality")
     exec_quality = query_df(
@@ -157,7 +217,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not exec_quality.empty:
         exec_quality["ts"] = pd.to_datetime(exec_quality["ts_ms"], unit="ms", utc=True)
-    st.dataframe(exec_quality, use_container_width=True, height=180)
+    st.dataframe(_sanitize_df_for_view(exec_quality, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
 
     st.subheader("Queue / fill quality")
     queue_quality = query_df(
@@ -172,7 +232,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not queue_quality.empty:
         queue_quality["ts"] = pd.to_datetime(queue_quality["ts_ms"], unit="ms", utc=True)
-    st.dataframe(queue_quality, use_container_width=True, height=180)
+    st.dataframe(_sanitize_df_for_view(queue_quality, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
 
     st.subheader("Liveness")
     liveness = query_df(
@@ -186,7 +246,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not liveness.empty:
         liveness["ts"] = pd.to_datetime(liveness["ts_ms"], unit="ms", utc=True)
-    st.dataframe(liveness, use_container_width=True, height=180)
+    st.dataframe(_sanitize_df_for_view(liveness, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
 
     st.subheader("Quarantine / freeze timeline")
     quarantine = query_df(
@@ -205,14 +265,14 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     )
     if not quarantine.empty:
         quarantine["ts"] = pd.to_datetime(quarantine["ts_ms"], unit="ms", utc=True)
-    st.dataframe(quarantine, use_container_width=True, height=180)
+    st.dataframe(_sanitize_df_for_view(quarantine, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
 
     st.subheader("Reliability Scoreboard")
     scoreboard = compute_reliability_scoreboard(latency_df=lat)
     rows = scoreboard.get("rows") or []
     if rows:
         score_df = pd.DataFrame(rows)
-        st.dataframe(score_df, use_container_width=True, height=180)
+        st.dataframe(_sanitize_df_for_view(score_df, view_mode, label_token_fn, reason_humanizer), width="stretch", height=180)
         top = rows[0]
         st.markdown(
             f"<div class='warn'><b>Top degradation source:</b> {top.get('source')} | "
@@ -225,7 +285,7 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     trend = scoreboard.get("freeze_trend") or []
     st.subheader("Freeze trend (last 24h)")
     if trend:
-        st.dataframe(pd.DataFrame(trend), use_container_width=True, height=160)
+        st.dataframe(pd.DataFrame(trend), width="stretch", height=160)
     else:
         st.caption("DEGRADED freeze trend unavailable.")
 
@@ -234,7 +294,13 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
         st.caption(f"DEGRADED panel_over_budget_ms={elapsed:.1f} budget_ms={panel_budget_ms}")
 
 
-def render_logs_panel(filters: DashboardFilters, start_ts: int, panel_budget_ms: int = 400) -> None:
+def render_logs_panel(
+    filters: DashboardFilters,
+    start_ts: int,
+    panel_budget_ms: int = 400,
+    view_mode: str = "developer",
+    reason_humanizer: Optional[Callable[[Optional[str], Optional[str]], str]] = None,
+) -> None:
     assert st is not None
     t0 = perf_counter()
     ok, missing_required, missing_optional = require_sources(
@@ -263,7 +329,10 @@ def render_logs_panel(filters: DashboardFilters, start_ts: int, panel_budget_ms:
     if not alerts.empty:
         alerts["ts"] = pd.to_datetime(alerts["ts_ms"], unit="ms", utc=True)
     st.subheader("Recent WARN/ERROR alerts")
-    st.dataframe(alerts, use_container_width=True, height=220)
+    if reason_humanizer is not None and "code" in alerts.columns:
+        alerts["reason"] = alerts.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
+    alerts = _sanitize_df_for_view(alerts, view_mode, reason_humanizer=reason_humanizer)
+    st.dataframe(alerts, width="stretch", height=220)
 
     breaches = query_df(
         """
@@ -279,7 +348,10 @@ def render_logs_panel(filters: DashboardFilters, start_ts: int, panel_budget_ms:
     if not breaches.empty:
         breaches["ts"] = pd.to_datetime(breaches["ts_ms"], unit="ms", utc=True)
     st.subheader("Gate breaches timeline")
-    st.dataframe(breaches, use_container_width=True, height=180)
+    if reason_humanizer is not None and "code" in breaches.columns:
+        breaches["reason"] = breaches.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
+    breaches = _sanitize_df_for_view(breaches, view_mode, reason_humanizer=reason_humanizer)
+    st.dataframe(breaches, width="stretch", height=180)
 
     logs = query_df(
         """
@@ -294,7 +366,7 @@ def render_logs_panel(filters: DashboardFilters, start_ts: int, panel_budget_ms:
     if not logs.empty:
         logs["ts"] = pd.to_datetime(logs["ts_ms"], unit="ms", utc=True)
     st.subheader("Logs")
-    st.dataframe(logs, use_container_width=True, height=220)
+    st.dataframe(logs, width="stretch", height=220)
 
     manifest = logs[logs["msg"].str.contains("manifest", case=False, na=False)] if not logs.empty else pd.DataFrame()
     last_manifest_hash = "N/A"

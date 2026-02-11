@@ -4,6 +4,7 @@ import unittest
 from core.metrics import Metrics
 from core.order_book import OrderBook
 from data.polymarket_ws import MarketWSClient, WSConfig
+from scripts.run_system import _confirm_diag_summary
 
 
 class _DummyTape:
@@ -158,6 +159,17 @@ class TestMarketRolloverWSConfirm(unittest.IsolatedAsyncioTestCase):
         result = await task
         self.assertEqual(result.status, "committed")
         self.assertEqual(set(result.confirm_diag["counts_by_asset"].keys()), {"new_yes", "new_no"})
+
+    async def test_timeout_summary_reports_missing_assets_deterministically(self) -> None:
+        client = self._build_client()
+        result = await client.resubscribe(["new_yes", "new_no"], first_book_timeout_secs=0.05)
+        self.assertEqual(result.status, "abort_timeout_waiting_confirmation")
+        summary = _confirm_diag_summary(result.confirm_diag, result.confirm_wait_ms)
+        self.assertEqual(summary["required_updates_per_token"], 2)
+        self.assertEqual(summary["counts_by_asset"], {"new_no": 0, "new_yes": 0})
+        self.assertEqual(summary["missing_assets"], ["new_no", "new_yes"])
+        self.assertEqual(summary["rejects_by_asset"], {"new_no": 0, "new_yes": 0})
+        self.assertEqual(summary["reject_reasons_top"], [])
 
 
 if __name__ == "__main__":

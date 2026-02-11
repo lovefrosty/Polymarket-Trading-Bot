@@ -293,7 +293,15 @@ class MarketWSClient:
                 t_recv_wall_iso=recv_wall_iso,
                 t_recv_mono_ns=recv_mono_ns,
             )
-            self.metrics.record_message("market", None, recv_wall_ms, asset_id=None, sub_state="unknown")
+            self.metrics.record_message(
+                "market",
+                None,
+                recv_wall_ms,
+                asset_id=None,
+                sub_state="unknown",
+                unknown_class="unknown_schema",
+                unknown_signature="non_dict_message",
+            )
             return
         if not isinstance(msg, dict):
             self.tape.write(
@@ -308,7 +316,15 @@ class MarketWSClient:
                 t_recv_wall_iso=recv_wall_iso,
                 t_recv_mono_ns=recv_mono_ns,
             )
-            self.metrics.record_message("market", None, recv_wall_ms, asset_id=None, sub_state="unknown")
+            self.metrics.record_message(
+                "market",
+                None,
+                recv_wall_ms,
+                asset_id=None,
+                sub_state="unknown",
+                unknown_class="unknown_schema",
+                unknown_signature="non_dict_message",
+            )
             return
         await self._handle_dict_message(msg, recv_mono_ns, recv_wall_ms, recv_wall_iso)
 
@@ -320,6 +336,7 @@ class MarketWSClient:
         event_type = _extract_event_type(msg)
         market = _extract_market(msg)
         asset_id = _extract_asset_id(msg)
+        non_book_event = _is_last_trade_price(msg)
         seq_warning_preview = self._check_sequence(msg, update_state=False)
         out_of_order = False
         phases_seen: Set[str] = set()
@@ -430,6 +447,19 @@ class MarketWSClient:
                             seq_warning=seq_warning_preview,
                         )
                         self._record_pending_confirmation(change_asset, confirm_ok, reasons, recv_wall_ms)
+        elif non_book_event:
+            sub_id, phase = self._classify_asset(asset_id)
+            phases_seen.add(phase)
+            if sub_id is not None:
+                sub_ids_seen.add(sub_id)
+            if phase == "active" and asset_id is not None:
+                active_assets_seen.add(asset_id)
+            elif phase == "pending" and asset_id is not None:
+                pending_assets_seen.add(asset_id)
+            elif phase == "ignored_old":
+                parse_warnings.append("ignored_old_subscription_asset")
+            else:
+                parse_warnings.append("unknown_subscription_asset")
         else:
             parse_warnings.append("unknown_message_schema")
 
@@ -466,7 +496,29 @@ class MarketWSClient:
             t_recv_wall_iso=recv_wall_iso,
             t_recv_mono_ns=recv_mono_ns,
         )
-        self.metrics.record_message("market", t_event_ms, recv_wall_ms, asset_id=asset_id, sub_state=sub_state)
+        unknown_class = None
+        unknown_signature = None
+        if sub_state == "unknown":
+            warnings = set(parse_warnings)
+            if "unknown_message_schema" in warnings:
+                unknown_class = "unknown_schema"
+            elif "unknown_subscription_asset" in warnings:
+                unknown_class = "unknown_channel"
+            else:
+                unknown_class = "benign_heartbeat_misc"
+            warning_sig = ",".join(sorted(warnings)) if warnings else "none"
+            unknown_signature = f"{event_type}:{warning_sig}"
+
+        self.metrics.record_message(
+            "market",
+            t_event_ms,
+            recv_wall_ms,
+            asset_id=asset_id,
+            sub_state=sub_state,
+            unknown_class=unknown_class,
+            unknown_signature=unknown_signature,
+            count_for_health=not non_book_event,
+        )
 
     def _classify_asset(self, asset_id: Optional[str]) -> Tuple[Optional[int], str]:
         if asset_id is not None and asset_id in self._active_asset_set:
@@ -751,6 +803,11 @@ def _is_snapshot(msg: Dict[str, Any]) -> bool:
 
 def _is_price_change(msg: Dict[str, Any]) -> bool:
     return msg.get("event_type") == "price_change" or "price_changes" in msg
+
+
+def _is_last_trade_price(msg: Dict[str, Any]) -> bool:
+    event_type = _extract_event_type(msg).strip().lower()
+    return event_type == "last_trade_price"
 
 
 def _parse_snapshot_levels(msg: Dict[str, Any]) -> tuple[List[tuple[float, float]], List[tuple[float, float]]]:

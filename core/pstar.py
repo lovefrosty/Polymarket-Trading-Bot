@@ -25,6 +25,7 @@ class PStar:
     diagnostics: Dict[str, object]
     ts_recv_ms: Optional[int] = None
     invalid_reason: Optional[str] = None
+    state: str = "UNAVAILABLE"
 
 
 class PStarBuilder:
@@ -64,11 +65,13 @@ class PStarBuilder:
     def build(self, symbol: str, now_wall_ms: int) -> PStar:
         by_source = self._latest.get(symbol) or {}
         missing = sorted(self.required_sources - set(by_source.keys()))
+        state = "UNAVAILABLE"
         diagnostics: Dict[str, object] = {
             "symbol": symbol,
             "missing_sources": missing,
             "freeze_reason": None,
             "degraded": False,
+            "state": state,
             "age_ms": {},
             "disagreement_bps": None,
             "sources_available": sorted(by_source.keys()),
@@ -99,9 +102,11 @@ class PStarBuilder:
             if age is not None and age > self.max_age_ms
         ]
         if stale_sources:
+            state = "STALE"
             invalid_reason = f"stale_source:{','.join(sorted(stale_sources))}"
             diagnostics["freeze_reason"] = invalid_reason
             diagnostics["invalid_reason"] = invalid_reason
+            diagnostics["state"] = state
             return PStar(
                 symbol=symbol,
                 value=None,
@@ -112,6 +117,7 @@ class PStarBuilder:
                 diagnostics=diagnostics,
                 ts_recv_ms=None,
                 invalid_reason=invalid_reason,
+                state=state,
             )
 
         spot = by_source.get("spot")
@@ -123,8 +129,10 @@ class PStarBuilder:
         if spot is not None and perp is not None:
             mid = (spot.value + perp.value) / 2.0
             if mid <= 0:
+                state = "DIVERGED"
                 diagnostics["freeze_reason"] = "non_positive_reference"
                 diagnostics["invalid_reason"] = "non_positive_reference"
+                diagnostics["state"] = state
                 return PStar(
                     symbol=symbol,
                     value=None,
@@ -135,12 +143,15 @@ class PStarBuilder:
                     diagnostics=diagnostics,
                     ts_recv_ms=None,
                     invalid_reason="non_positive_reference",
+                    state=state,
                 )
             disagree_bps = abs(perp.value - spot.value) / mid * 10000.0
             diagnostics["disagreement_bps"] = disagree_bps
             if disagree_bps >= self.freeze_disagree_bps:
+                state = "DIVERGED"
                 diagnostics["freeze_reason"] = "pstar_disagreement_extreme"
                 diagnostics["invalid_reason"] = "pstar_disagreement_extreme"
+                diagnostics["state"] = state
                 return PStar(
                     symbol=symbol,
                     value=None,
@@ -151,16 +162,19 @@ class PStarBuilder:
                     diagnostics=diagnostics,
                     ts_recv_ms=None,
                     invalid_reason="pstar_disagreement_extreme",
+                    state=state,
                 )
             confidence = 1.0
             if disagree_bps > self.degrade_disagree_bps:
                 width = max(1.0, self.freeze_disagree_bps - self.degrade_disagree_bps)
                 x = min(1.0, (disagree_bps - self.degrade_disagree_bps) / width)
                 confidence = max(0.2, 1.0 - x)
+            state = "VALID"
             ts_event_ms = max(spot.ts_event_ms, perp.ts_event_ms)
             ts_recv_ms = max(spot.ts_recv_wall_ms, perp.ts_recv_wall_ms)
             diagnostics["pstar_recv_ts_ms"] = ts_recv_ms
             diagnostics["pstar_sourceset"] = ["perp", "spot"]
+            diagnostics["state"] = state
             return PStar(
                 symbol=symbol,
                 value=mid,
@@ -171,11 +185,14 @@ class PStarBuilder:
                 diagnostics=diagnostics,
                 ts_recv_ms=ts_recv_ms,
                 invalid_reason=None,
+                state=state,
             )
 
         if not self.allow_degraded_single_source:
+            state = "UNAVAILABLE"
             diagnostics["freeze_reason"] = "missing_required_sources"
             diagnostics["invalid_reason"] = "missing_required_sources"
+            diagnostics["state"] = state
             return PStar(
                 symbol=symbol,
                 value=None,
@@ -186,12 +203,15 @@ class PStarBuilder:
                 diagnostics=diagnostics,
                 ts_recv_ms=None,
                 invalid_reason="missing_required_sources",
+                state=state,
             )
 
         freshest = _freshest(by_source)
         if freshest is None:
+            state = "UNAVAILABLE"
             diagnostics["freeze_reason"] = "missing_required_sources"
             diagnostics["invalid_reason"] = "missing_required_sources"
+            diagnostics["state"] = state
             return PStar(
                 symbol=symbol,
                 value=None,
@@ -202,12 +222,15 @@ class PStarBuilder:
                 diagnostics=diagnostics,
                 ts_recv_ms=None,
                 invalid_reason="missing_required_sources",
+                state=state,
             )
+        state = "WARMING"
         diagnostics["degraded"] = True
         diagnostics["freeze_reason"] = None
         diagnostics["single_source"] = freshest.source
         diagnostics["pstar_recv_ts_ms"] = int(freshest.ts_recv_wall_ms)
         diagnostics["pstar_sourceset"] = [str(freshest.source)]
+        diagnostics["state"] = state
         return PStar(
             symbol=symbol,
             value=float(freshest.value),
@@ -218,6 +241,7 @@ class PStarBuilder:
             diagnostics=diagnostics,
             ts_recv_ms=int(freshest.ts_recv_wall_ms),
             invalid_reason=None,
+            state=state,
         )
 
 

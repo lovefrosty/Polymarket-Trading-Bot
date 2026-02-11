@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
 
@@ -33,9 +33,13 @@ def render_staleness_panel(
     start_ts: int,
     end_ts: int,
     panel_budget_ms: int = 300,
+    view_mode: str = "developer",
+    label_token_fn: Optional[Callable[[Any, Any], Dict[str, str]]] = None,
+    allow_widgets: bool = True,
 ) -> Optional[DrillthroughContext]:
     assert st is not None
     t0 = perf_counter()
+    is_dev = str(view_mode).lower() == "developer"
     ok, missing_required, missing_optional = require_sources(
         STALENESS_DEP.required_sources,
         STALENESS_DEP.optional_sources,
@@ -62,7 +66,7 @@ def render_staleness_panel(
     if not pstar.empty:
         pstar["ts"] = pd.to_datetime(pstar["ts_ms"], unit="ms", utc=True)
     st.subheader("Staleness explainer")
-    st.dataframe(pstar, use_container_width=True, height=180)
+    st.dataframe(pstar, width="stretch", height=180)
 
     book = query_df(
         """
@@ -76,9 +80,18 @@ def render_staleness_panel(
     )
     if not book.empty:
         book["ts"] = pd.to_datetime(book["ts_ms"], unit="ms", utc=True)
-    st.dataframe(book, use_container_width=True, height=160)
+    if not is_dev and not book.empty:
+        if label_token_fn is not None:
+            book["Outcome"] = book["token_id"].apply(lambda token: label_token_fn(None, token).get("outcome_label", "Outcome"))
+            book["Market"] = book["token_id"].apply(lambda token: label_token_fn(None, token).get("market_label", "Unknown market"))
+        book = book.drop(columns=["token_id"], errors="ignore")
+    st.dataframe(book, width="stretch", height=160)
 
-    selected_metric = st.selectbox("Metric inspector", METRIC_KEYS, index=0)
+    if allow_widgets:
+        selected_metric = st.selectbox("Metric inspector", METRIC_KEYS, index=0)
+    else:
+        selected_metric = METRIC_KEYS[0]
+        st.caption(f"Metric inspector: {selected_metric} (auto-refresh mode)")
     evidence = query_evidence_rows(
         start_ts_ms=start_ts,
         end_ts_ms=end_ts,
@@ -87,7 +100,9 @@ def render_staleness_panel(
         limit=200,
     )
     st.subheader("Evidence rows")
-    st.dataframe(evidence, use_container_width=True, height=220)
+    if not is_dev and not evidence.empty:
+        evidence = evidence.drop(columns=["token_id", "decision_id", "order_id"], errors="ignore")
+    st.dataframe(evidence, width="stretch", height=220)
 
     context = build_drillthrough_context(
         metric_key=selected_metric,

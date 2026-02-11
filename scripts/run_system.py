@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import traceback
 import sys
 import time
 import uuid
@@ -49,6 +50,13 @@ from core.sqlite_store import SQLiteStore
 from core.trade_tape import TradeTape
 from core.validators import OrderConstraints
 from data.polymarket_ws import MarketWSClient, ResubscribeResult, WSConfig
+
+ALERT_STATE_OK = "OK"
+ALERT_STATE_DEGRADED = "DEGRADED"
+ALERT_STATE_FROZEN = "FROZEN"
+FEED_READINESS_BOOTING = "BOOTING"
+FEED_READINESS_PARTIAL = "PARTIAL"
+FEED_READINESS_READY = "READY"
 
 
 def _now_ms() -> int:
@@ -196,6 +204,7 @@ class RuntimeEngine:
         run_epoch_ms: int,
         run_id: Optional[str] = None,
         readiness_config: Optional[MarketReadinessConfig] = None,
+        reference_poll_secs: Optional[float] = None,
     ) -> None:
         self.mode = mode
         self.db = db
@@ -334,6 +343,7 @@ class RuntimeEngine:
         self._mid_history_by_token: Dict[str, Deque[Tuple[int, float]]] = defaultdict(lambda: deque(maxlen=20000))
         self._latest_book_snapshot_by_token: Dict[str, BookSnapshot] = {}
         self._latest_pstar_by_symbol: Dict[str, PStar] = {}
+        self._last_pstar_stats_ts_by_symbol: Dict[str, int] = {}
         self.pstar_age_samples: Deque[float] = deque(maxlen=2000)
         self._pending_execution_quality: Dict[str, ExecutionAttributionPending] = {}
         self._order_submit_wall_by_order: Dict[str, int] = {}
@@ -362,6 +372,32 @@ class RuntimeEngine:
             details={},
         )
         self._rollover_guard_last_checked_ms: Optional[int] = None
+        self._observe_causality_freeze_after = int(
+            max(
+                1,
+                self.constitution.get("trading", {}).get("observe_causality_freeze_after", 3),
+            )
+        )
+        self._observe_causality_streak_by_token: Dict[str, int] = defaultdict(int)
+        self._startup_liveness_grace_ms = int(
+            max(
+                0,
+                self.constitution.get("trading", {}).get("startup_liveness_grace_ms", 0),
+            )
+        )
+        self._startup_readiness_state: str = FEED_READINESS_BOOTING
+        self._startup_readiness_reason_codes: List[str] = []
+        self._startup_readiness_payload: Dict[str, Any] = {}
+        self._alert_emit_cooldown_ms = int(
+            max(
+                500,
+                self.constitution.get("trading", {}).get("alert_emit_cooldown_ms", 10_000),
+            )
+        )
+        self._last_alert_emit_ts_by_key: Dict[str, int] = {}
+        self._reference_poll_secs: float = float(reference_poll_secs if reference_poll_secs is not None else 1.0)
+        self._pstar_state_by_symbol: Dict[str, str] = {}
+        self._pstar_transition_counts: Dict[str, int] = defaultdict(int)
 
     def on_reference(self, source: str, symbol: str, value: float, ts_event_ms: Optional[int], ts_recv_ms: int) -> None:
         event_ts = int(ts_event_ms if ts_event_ms is not None else ts_recv_ms)
@@ -441,6 +477,7 @@ class RuntimeEngine:
             reasons.append("A_PSTAR_INVALID")
             details["pstar"] = {
                 "symbol": None,
+                "state": "UNAVAILABLE",
                 "valid": False,
                 "value": None,
                 "pstar_age_ms": None,
@@ -452,12 +489,14 @@ class RuntimeEngine:
             pstar = self.pstar_builder.build(selected_symbol, int(now_ms))
             self._latest_pstar_by_symbol[selected_symbol] = pstar
             pstar_age_ms = _maybe_int(int(now_ms) - int(pstar.ts_event_ms)) if pstar.ts_event_ms is not None else None
+            pstar_state = self._pstar_state(pstar, int(now_ms))
             if not pstar.valid or pstar.value is None or pstar.ts_event_ms is None:
                 reasons.append("A_PSTAR_INVALID")
             elif pstar_age_ms is None or pstar_age_ms > int(cfg.pstar_max_age_ms):
                 reasons.append("A_PSTAR_STALE")
             details["pstar"] = {
                 "symbol": selected_symbol,
+                "state": str(pstar_state),
                 "valid": bool(pstar.valid),
                 "value": _maybe_float(pstar.value),
                 "pstar_age_ms": pstar_age_ms,
@@ -534,6 +573,8 @@ class RuntimeEngine:
         risk_padding_bps = float(self.constitution["execution"].get("risk_padding_bps", 5.0))
         is_frozen_any = False
         freeze_reasons: List[str] = []
+        degraded_reasons: List[str] = []
+        degraded_by_market: Dict[str, List[str]] = {}
 
         for token_id, book in self.books.items():
             meta = self.market_meta.get(token_id, {})
@@ -574,7 +615,8 @@ class RuntimeEngine:
                 await self._emergency_unwind(token_id, now_ms, constraint)
 
             fsm_state = fsm.status().state.value
-            feature_max_ts = int(pstar.ts_event_ms or 0)
+            raw_book_asof_ts = _maybe_int(snap.ts_event_ms)
+            raw_pstar_asof_ts = _maybe_int(pstar.ts_event_ms)
             # Guard against wall-clock and event-clock ms precision ties/skew.
             decision_ts_event_ms = int(
                 max(
@@ -583,15 +625,97 @@ class RuntimeEngine:
                     int(pstar.ts_event_ms or 0) + 1,
                 )
             )
-            signal_age_ms = int(max(0, now_ms - feature_max_ts)) if feature_max_ts else 10_000
+            pre_decision_cap = int(decision_ts_event_ms - 1)
+            clamped_book_asof_ts = min(int(raw_book_asof_ts), pre_decision_cap) if raw_book_asof_ts is not None else None
+            clamped_pstar_asof_ts = min(int(raw_pstar_asof_ts), pre_decision_cap) if raw_pstar_asof_ts is not None else None
+            feature_candidates = [int(ts) for ts in [clamped_book_asof_ts, clamped_pstar_asof_ts] if ts is not None]
+            feature_max_ts = max(feature_candidates) if feature_candidates else 0
+            signal_age_ms = (
+                int(max(0, int(decision_ts_event_ms) - int(feature_max_ts)))
+                if feature_max_ts
+                else int(max(10_000, self.policy_thresholds.max_signal_age_ms * 5))
+            )
             self.signal_age_samples.append(float(signal_age_ms))
             ack_p95 = _quantile(list(self.send_ack_samples), 0.95)
             causality_reasons = self._causality_violations(
                 decision_ts_event_ms=decision_ts_event_ms,
                 feature_max_ts_ms=feature_max_ts,
-                book_asof_ts_ms=snap.ts_event_ms,
-                pstar_asof_ts_ms=pstar.ts_event_ms,
+                book_asof_ts_ms=raw_book_asof_ts,
+                pstar_asof_ts_ms=raw_pstar_asof_ts,
             )
+            if causality_reasons:
+                self._observe_causality_streak_by_token[token_id] = int(
+                    self._observe_causality_streak_by_token.get(token_id, 0) + 1
+                )
+            else:
+                self._observe_causality_streak_by_token[token_id] = 0
+            causality_diag = {
+                "decision_ts_ms": int(decision_ts_event_ms),
+                "feature_max_ts_ms": int(feature_max_ts),
+                "book_asof_ts_raw_ms": _maybe_int(raw_book_asof_ts),
+                "book_asof_ts_clamped_ms": _maybe_int(clamped_book_asof_ts),
+                "pstar_asof_ts_raw_ms": _maybe_int(raw_pstar_asof_ts),
+                "pstar_asof_ts_clamped_ms": _maybe_int(clamped_pstar_asof_ts),
+                "book_delta_ms": _maybe_int(
+                    int(raw_book_asof_ts) - int(decision_ts_event_ms)
+                    if raw_book_asof_ts is not None
+                    else None
+                ),
+                "pstar_delta_ms": _maybe_int(
+                    int(raw_pstar_asof_ts) - int(decision_ts_event_ms)
+                    if raw_pstar_asof_ts is not None
+                    else None
+                ),
+            }
+            if causality_reasons:
+                offending: List[Dict[str, Any]] = []
+                if raw_book_asof_ts is not None and int(raw_book_asof_ts) >= int(decision_ts_event_ms):
+                    offending.append(
+                        {
+                            "feature": "book_asof_ts_ms",
+                            "feature_ts_ms": int(raw_book_asof_ts),
+                            "decision_ts_ms": int(decision_ts_event_ms),
+                            "delta_ms": int(raw_book_asof_ts) - int(decision_ts_event_ms),
+                        }
+                    )
+                if raw_pstar_asof_ts is not None and int(raw_pstar_asof_ts) >= int(decision_ts_event_ms):
+                    offending.append(
+                        {
+                            "feature": "pstar_asof_ts_ms",
+                            "feature_ts_ms": int(raw_pstar_asof_ts),
+                            "decision_ts_ms": int(decision_ts_event_ms),
+                            "delta_ms": int(raw_pstar_asof_ts) - int(decision_ts_event_ms),
+                        }
+                    )
+                if int(feature_max_ts) >= int(decision_ts_event_ms):
+                    offending.append(
+                        {
+                            "feature": "max_feature_ts_ms",
+                            "feature_ts_ms": int(feature_max_ts),
+                            "decision_ts_ms": int(decision_ts_event_ms),
+                            "delta_ms": int(feature_max_ts) - int(decision_ts_event_ms),
+                        }
+                    )
+                causality_diag["offending"] = offending
+                causality_is_hard = bool(
+                    self.mode in {"PAPER", "TRADE"}
+                    or int(self._observe_causality_streak_by_token.get(token_id, 0)) >= int(self._observe_causality_freeze_after)
+                )
+                self._emit_rate_limited_alert(
+                    now_ms,
+                    severity="critical" if causality_is_hard else "warning",
+                    code="B_CAUSALITY_VIOLATION",
+                    message=f"causality_violation token={token_id} reasons={','.join(causality_reasons)}",
+                    payload={
+                        "token_id": str(token_id),
+                        "state": ALERT_STATE_FROZEN if causality_is_hard else ALERT_STATE_DEGRADED,
+                        "reason_codes": list(causality_reasons),
+                        "offending": offending,
+                        "sustain_threshold": int(self._observe_causality_freeze_after),
+                        "streak": int(self._observe_causality_streak_by_token.get(token_id, 0)),
+                    },
+                    dedupe_key=f"B_CAUSALITY_VIOLATION:{token_id}",
+                )
 
             buy_ctx = PolicyContext(
                 market=str(meta.get("slug") or token_id),
@@ -659,6 +783,13 @@ class RuntimeEngine:
                 reasons = sorted(set(reasons + list(risk_reasons)))
             if self._liveness_reason_codes:
                 reasons = sorted(set(reasons + list(self._liveness_reason_codes)))
+            if (
+                self.mode == "OBSERVE"
+                and any(code.startswith("B_") for code in reasons)
+                and int(self._observe_causality_streak_by_token.get(token_id, 0))
+                >= int(self._observe_causality_freeze_after)
+            ):
+                reasons = sorted(set(reasons + ["B_CAUSALITY_SUSTAINED"]))
             guard_reasons = self.quote_guard_reasons(token_id=token_id, now_ms=now_ms)
             if guard_reasons:
                 reasons = sorted(set(reasons + guard_reasons))
@@ -668,14 +799,69 @@ class RuntimeEngine:
             elif bool(cap_diag.get("soft_breach", False)):
                 reasons.append("RISK_CAP_SOFT")
             reasons = sorted(set(reasons))
+            buy_verdict = self._normalize_verdict_for_mode(
+                PolicyVerdict(
+                    allow=buy_verdict.allow,
+                    action=buy_verdict.action,
+                    reason_codes=reasons,
+                    diagnostics={**buy_verdict.diagnostics, "cap_diag": cap_diag, "causality": causality_diag},
+                ),
+                reasons,
+                token_id,
+            )
+            sell_verdict = self._normalize_verdict_for_mode(
+                PolicyVerdict(
+                    allow=sell_verdict.allow,
+                    action=sell_verdict.action,
+                    reason_codes=reasons,
+                    diagnostics={**sell_verdict.diagnostics, "cap_diag": cap_diag, "causality": causality_diag},
+                ),
+                reasons,
+                token_id,
+            )
+            pstar_state = self._pstar_state(pstar, now_ms)
+            if "A_PSTAR_INVALID" in reasons or "A_PSTAR_STALE" in reasons:
+                pstar_reason = "A_PSTAR_INVALID" if "A_PSTAR_INVALID" in reasons else "A_PSTAR_STALE"
+                pstar_severity = "critical" if self.mode in {"PAPER", "TRADE"} else "warning"
+                self._emit_rate_limited_alert(
+                    now_ms,
+                    severity=pstar_severity,
+                    code=pstar_reason,
+                    message=f"pstar_state={pstar_state} token={token_id}",
+                    payload={
+                        "token_id": str(token_id),
+                        "state": str(pstar_state),
+                        "age_ms": _maybe_float(pstar_age_ms),
+                        "threshold_ms": int(self.pstar_builder.max_age_ms),
+                        "provider": ",".join(sorted(pstar.sources_used)),
+                        "invalid_reason": str(pstar.invalid_reason or ""),
+                    },
+                    dedupe_key=f"{token_id}:{pstar_reason}",
+                )
+            if "E_SIGNAL_AGE_HIGH" in reasons:
+                signal_severity = "critical" if self.mode in {"PAPER", "TRADE"} else "warning"
+                self._emit_rate_limited_alert(
+                    now_ms,
+                    severity=signal_severity,
+                    code="E_SIGNAL_AGE_HIGH",
+                    message=f"signal_age_high token={token_id}",
+                    payload={
+                        "token_id": str(token_id),
+                        "state": str(ALERT_STATE_FROZEN if signal_severity == "critical" else ALERT_STATE_DEGRADED),
+                        "age_ms": float(signal_age_ms),
+                        "threshold_ms": int(self.policy_thresholds.max_signal_age_ms),
+                        "provider": ",".join(sorted(pstar.sources_used)),
+                    },
+                    dedupe_key=f"{token_id}:E_SIGNAL_AGE_HIGH",
+                )
             force_freeze = bool(
                 book_health == BookHealthState.DOWN
-                or bool(causality_reasons)
                 or bool(cap_diag.get("hard_breach", False))
                 or bool(self._reconciliation_frozen and self.mode == "TRADE")
                 or bool(self._liveness_freeze_active and self.mode in {"PAPER", "TRADE"})
                 or bool(self._startup_unknown_order_quarantine and self.mode in {"PAPER", "TRADE"})
                 or bool(risk_critical and self.mode in {"PAPER", "TRADE"})
+                or bool(self.mode == "OBSERVE" and any(self._observe_reason_is_hard(code, token_id) for code in reasons))
             )
             if force_freeze:
                 buy_verdict = PolicyVerdict(
@@ -690,7 +876,7 @@ class RuntimeEngine:
                     reason_codes=reasons,
                     diagnostics={**sell_verdict.diagnostics, "cap_diag": cap_diag},
                 )
-            if guard_reasons:
+            if guard_reasons and not force_freeze:
                 buy_verdict = PolicyVerdict(
                     allow=False,
                     action="HOLD",
@@ -710,9 +896,12 @@ class RuntimeEngine:
                 freeze_reasons.extend(reasons)
                 self.pending_freeze[token_id] = reasons
             else:
+                self.pending_freeze.pop(token_id, None)
+                if reasons:
+                    degraded_reasons.extend(reasons)
+                    degraded_by_market[token_id] = list(reasons)
                 if fsm.status().state == ExecutionState.FROZEN and not reasons:
                     fsm.unfreeze()
-                    self.pending_freeze.pop(token_id, None)
             self._record_fsm_transition(
                 token_id=token_id,
                 prev_state=prev_fsm_state,
@@ -748,8 +937,8 @@ class RuntimeEngine:
                 expected_edge=0.0,
                 expected_cost=0.0,
                 decision_ts_event_ms=decision_ts_event_ms,
-                book_asof_ts_ms=snap.ts_event_ms,
-                pstar_asof_ts_ms=pstar.ts_event_ms,
+                book_asof_ts_ms=clamped_book_asof_ts,
+                pstar_asof_ts_ms=clamped_pstar_asof_ts,
                 max_feature_ts_ms=feature_max_ts,
                 policy_json={
                     "buy": buy_verdict.diagnostics,
@@ -758,6 +947,7 @@ class RuntimeEngine:
                     "cap_diag": cap_diag,
                     "codes": reasons,
                     "guard_reasons": guard_reasons,
+                    "causality": causality_diag,
                 },
                 fsm_state=fsm.status().state.value,
                 pstar_diag=pstar.diagnostics,
@@ -770,6 +960,8 @@ class RuntimeEngine:
                 max_feature_ts_ms=feature_max_ts,
                 snap=snap,
                 pstar=pstar,
+                book_asof_ts_ms=clamped_book_asof_ts,
+                pstar_asof_ts_ms=clamped_pstar_asof_ts,
                 ws_lag_ms=ws_lag_ms,
                 pstar_age_ms=pstar_age_ms,
                 signal_age_ms=float(signal_age_ms),
@@ -780,6 +972,7 @@ class RuntimeEngine:
                     "sell_action": sell_verdict.action,
                     "book_health_state": book_health.value,
                     "guard_reasons": guard_reasons,
+                    "causality": causality_diag,
                 },
             )
             self._record_microstructure(
@@ -803,12 +996,36 @@ class RuntimeEngine:
                     self.db.append_alert(now_ms, "critical", "BOOK_DOWN_FREEZE", f"{token_id}:health={book_health.value}")
             self._record_inventory(now_ms, token_id)
 
+        freeze_reason_codes = sorted(set(freeze_reasons))
+        degraded_reason_codes = sorted(set(degraded_reasons))
+        alert_state = ALERT_STATE_OK
+        state_reason_codes: List[str] = []
+        if is_frozen_any:
+            alert_state = ALERT_STATE_FROZEN
+            state_reason_codes = freeze_reason_codes
+        elif degraded_reason_codes:
+            alert_state = ALERT_STATE_DEGRADED
+            state_reason_codes = degraded_reason_codes
+        readiness_payload = {
+            "readiness_state": str(self._startup_readiness_state),
+            "readiness_reason_codes": list(self._startup_readiness_reason_codes),
+            "readiness_payload": dict(self._startup_readiness_payload),
+        }
+        a_pipeline_diag = self._a_pipeline_diag(now_ms=int(now_ms))
         self.db.upsert_system_state(
             as_of_ts=now_ms,
             is_frozen=is_frozen_any,
-            reasons=",".join(sorted(set(freeze_reasons))) if freeze_reasons else "",
+            reasons=",".join(state_reason_codes),
             mode=self.mode,
-            payload={"freeze_by_market": self.pending_freeze},
+            payload={
+                "alert_state": str(alert_state),
+                "freeze_by_market": self.pending_freeze,
+                "degraded_by_market": degraded_by_market,
+                "freeze_reasons": freeze_reason_codes,
+                "degraded_reasons": degraded_reason_codes,
+                "a_pipeline_diag": a_pipeline_diag,
+                **readiness_payload,
+            },
         )
 
     async def _apply_side(
@@ -834,11 +1051,18 @@ class RuntimeEngine:
                 if self.mode == "OBSERVE":
                     freeze_severity = "warning"
                     freeze_code = "POLICY_FREEZE_OBSERVE"
-                self.db.append_alert(
+                self._emit_rate_limited_alert(
                     now_ms,
-                    freeze_severity,
-                    freeze_code,
-                    f"{token_id}:{side}:{','.join(verdict.reason_codes)}",
+                    severity=freeze_severity,
+                    code=freeze_code,
+                    message=f"{token_id}:{side}:{','.join(verdict.reason_codes)}",
+                    payload={
+                        "token_id": str(token_id),
+                        "side": str(side),
+                        "state": ALERT_STATE_FROZEN if verdict.action == "FREEZE" else ALERT_STATE_DEGRADED,
+                        "reason_codes": list(verdict.reason_codes),
+                    },
+                    dedupe_key=f"policy_freeze:{token_id}:{side}",
                 )
             return
 
@@ -1435,8 +1659,16 @@ class RuntimeEngine:
             self.db.insert_many("market_data_book", rows)
 
     def _record_pstar(self, now_ms: int, symbol: str, pstar: PStar) -> None:
+        if not symbol:
+            return
         sources = ",".join(sorted(pstar.sources_used))
         self._latest_pstar_by_symbol[symbol] = pstar
+        state_now = str(self._pstar_state(pstar, int(now_ms)))
+        state_prev = self._pstar_state_by_symbol.get(symbol)
+        if state_prev and state_prev != state_now:
+            transition_key = f"{state_prev}->{state_now}"
+            self._pstar_transition_counts[transition_key] = int(self._pstar_transition_counts.get(transition_key, 0)) + 1
+        self._pstar_state_by_symbol[symbol] = state_now
         self.db.insert(
             "pstar",
             {
@@ -1449,9 +1681,17 @@ class RuntimeEngine:
                 "valid": 1 if pstar.valid else 0,
                 "invalid_reason": str(pstar.invalid_reason or ""),
                 "sources_used": sources,
-                "diagnostics_json": json.dumps(pstar.diagnostics, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+                "diagnostics_json": json.dumps(
+                    {**(pstar.diagnostics or {}), "state": state_now},
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
             },
         )
+        if int(self._last_pstar_stats_ts_by_symbol.get(symbol, -1)) == int(now_ms):
+            return
+        self._last_pstar_stats_ts_by_symbol[symbol] = int(now_ms)
         diag = pstar.diagnostics or {}
         age_ms = diag.get("age_ms") if isinstance(diag.get("age_ms"), dict) else {}
         self.db.insert(
@@ -1561,6 +1801,8 @@ class RuntimeEngine:
         max_feature_ts_ms: int,
         snap: BookSnapshot,
         pstar: PStar,
+        book_asof_ts_ms: Optional[int],
+        pstar_asof_ts_ms: Optional[int],
         ws_lag_ms: Optional[float],
         pstar_age_ms: Optional[float],
         signal_age_ms: float,
@@ -1576,13 +1818,13 @@ class RuntimeEngine:
                 "decision_ts_ms": int(decision_ts_ms),
                 "token_id": str(token_id),
                 "decision_id": str(decision_id),
-                "book_asof_ts_ms": _maybe_int(snap.book_asof_ts_ms),
+                "book_asof_ts_ms": _maybe_int(book_asof_ts_ms),
                 "book_recv_ts_ms": _maybe_int(snap.book_recv_ts_ms),
                 "book_seq": int(snap.book_seq),
                 "book_level_count": int(snap.book_level_count),
                 "book_health_state": str(snap.book_health_state or ""),
                 "pstar_value": _maybe_float(pstar.value),
-                "pstar_asof_ts_ms": _maybe_int(pstar.ts_event_ms),
+                "pstar_asof_ts_ms": _maybe_int(pstar_asof_ts_ms),
                 "pstar_recv_ts_ms": _maybe_int(pstar.ts_recv_ms),
                 "pstar_sourceset": json.dumps(sorted(pstar.sources_used), separators=(",", ":"), ensure_ascii=True),
                 "pstar_confidence": float(pstar.confidence),
@@ -1989,6 +2231,117 @@ class RuntimeEngine:
         if float(self._daily_loss_usdc) >= float(max(0.0, self._max_daily_loss_usdc)):
             reasons.append("RISK_DAILY_LOSS_KILLSWITCH")
         return sorted(set(reasons))
+
+    def _emit_rate_limited_alert(
+        self,
+        now_ms: int,
+        *,
+        severity: str,
+        code: str,
+        message: str,
+        payload: Optional[Dict[str, Any]] = None,
+        dedupe_key: Optional[str] = None,
+        cooldown_ms: Optional[int] = None,
+    ) -> bool:
+        key = str(dedupe_key or f"{code}")
+        cool_ms = int(max(1, cooldown_ms if cooldown_ms is not None else self._alert_emit_cooldown_ms))
+        prev = self._last_alert_emit_ts_by_key.get(key)
+        if prev is not None and int(now_ms - int(prev)) < cool_ms:
+            return False
+        self._last_alert_emit_ts_by_key[key] = int(now_ms)
+        self.db.append_alert(
+            int(now_ms),
+            str(severity),
+            str(code),
+            str(message),
+            payload=payload or {},
+        )
+        return True
+
+    def _observe_reason_is_hard(self, reason: str, token_id: str) -> bool:
+        code = str(reason or "")
+        if code in {
+            "C_BOOK_DOWN",
+            "D_HEDGE_TIMEOUT",
+            "RECONCILIATION_MISMATCH_CRITICAL",
+            "RISK_THROTTLE_CRITICAL",
+            "RISK_DAILY_LOSS_KILLSWITCH",
+            "E_LIVENESS_CRITICAL",
+            "RECON_UNKNOWN_ORDER_QUARANTINE",
+            "RISK_CAP_BREACH",
+            "B_CAUSALITY_SUSTAINED",
+        }:
+            return True
+        if code.startswith("B_"):
+            streak = int(self._observe_causality_streak_by_token.get(str(token_id), 0))
+            return streak >= int(self._observe_causality_freeze_after)
+        if code.startswith("D_"):
+            return code == "D_HEDGE_TIMEOUT"
+        if code.startswith("C_"):
+            return code == "C_BOOK_DOWN"
+        return False
+
+    def _normalize_verdict_for_mode(
+        self,
+        verdict: PolicyVerdict,
+        reason_codes: List[str],
+        token_id: str,
+    ) -> PolicyVerdict:
+        if self.mode != "OBSERVE":
+            return verdict
+        if verdict.action != "FREEZE":
+            return verdict
+        has_hard = any(self._observe_reason_is_hard(code, token_id) for code in reason_codes)
+        if has_hard:
+            return verdict
+        diagnostics = dict(verdict.diagnostics)
+        diagnostics["observe_downgraded"] = True
+        diagnostics["observe_freeze_reason_codes"] = sorted(set(reason_codes))
+        return PolicyVerdict(
+            allow=False,
+            action="SKIP",
+            reason_codes=sorted(set(reason_codes)),
+            diagnostics=diagnostics,
+        )
+
+    def _pstar_state(self, pstar: PStar, now_ms: int) -> str:
+        state = str(getattr(pstar, "state", "") or pstar.diagnostics.get("state") or "")
+        if state:
+            return state
+        if not pstar.valid:
+            reason = str(pstar.invalid_reason or "")
+            if reason.startswith("stale_source"):
+                return "STALE"
+            if "disagreement" in reason:
+                return "DIVERGED"
+            return "UNAVAILABLE"
+        if pstar.ts_event_ms is None:
+            return "UNAVAILABLE"
+        age = max(0, int(now_ms - int(pstar.ts_event_ms)))
+        if age > int(self.pstar_builder.max_age_ms):
+            return "STALE"
+        if len(pstar.sources_used) < 2:
+            return "WARMING"
+        return "VALID"
+
+    def _a_pipeline_diag(self, now_ms: int) -> Dict[str, Any]:
+        state_by_symbol: Dict[str, str] = {}
+        for symbol in sorted(self._latest_pstar_by_symbol.keys()):
+            pstar = self._latest_pstar_by_symbol[symbol]
+            state_by_symbol[str(symbol)] = str(self._pstar_state(pstar, int(now_ms)))
+        for symbol, state in self._pstar_state_by_symbol.items():
+            if symbol not in state_by_symbol:
+                state_by_symbol[str(symbol)] = str(state)
+        transition_counts = {
+            key: int(self._pstar_transition_counts.get(key, 0))
+            for key in sorted(self._pstar_transition_counts.keys())
+        }
+        return {
+            "reference_poll_secs": float(self._reference_poll_secs),
+            "pstar_max_age_ms": int(self.pstar_builder.max_age_ms),
+            "pstar_state_by_symbol": state_by_symbol,
+            "pstar_transition_counts": transition_counts,
+        }
 
     def _causality_violations(
         self,
@@ -2525,31 +2878,51 @@ class RuntimeEngine:
             liveness_reasons.append("E_WS_SEQUENCE_GAP")
         if active_market_lag_ms is not None and float(active_market_lag_ms) > float(self._ws_starvation_max_ms):
             liveness_reasons.append("E_ACTIVE_MARKET_LAG_HIGH")
+        freeze_candidate = bool(("E_CLOCK_DRIFT_HIGH" in liveness_reasons) or ("E_WS_STARVATION" in liveness_reasons))
+        startup_grace_active = bool(int(now_ms - self.run_epoch_ms) < int(self._startup_liveness_grace_ms))
         prev_liveness_frozen = bool(self._liveness_freeze_active)
-        self._liveness_freeze_active = bool(
-            ("E_CLOCK_DRIFT_HIGH" in liveness_reasons) or ("E_WS_STARVATION" in liveness_reasons)
-        )
+        self._liveness_freeze_active = bool(freeze_candidate and not startup_grace_active)
         self._liveness_reason_codes = sorted(set(liveness_reasons))
-        if self._liveness_freeze_active and not prev_liveness_frozen:
-            self.db.append_alert(
-                int(now_ms),
-                "critical",
-                "LIVENESS_FROZEN_EDGE",
-                f"liveness_freeze_reasons={','.join(self._liveness_reason_codes)}",
+        if freeze_candidate and startup_grace_active:
+            self._emit_rate_limited_alert(
+                now_ms,
+                severity="warning",
+                code="LIVENESS_DEGRADED_STARTUP",
+                message="startup_liveness_grace_active",
                 payload={
+                    "state": ALERT_STATE_DEGRADED,
+                    "clock_drift_ms": _maybe_float(clock_drift_ms),
+                    "starved_tokens": list(starved_tokens),
+                    "startup_grace_ms": int(self._startup_liveness_grace_ms),
+                    "reasons": list(self._liveness_reason_codes),
+                },
+                dedupe_key="LIVENESS_DEGRADED_STARTUP",
+                cooldown_ms=max(5_000, int(self._startup_liveness_grace_ms // 2 or 5_000)),
+            )
+        if self._liveness_freeze_active and not prev_liveness_frozen:
+            self._emit_rate_limited_alert(
+                int(now_ms),
+                severity="critical",
+                code="LIVENESS_FROZEN_EDGE",
+                message=f"liveness_freeze_reasons={','.join(self._liveness_reason_codes)}",
+                payload={
+                    "state": ALERT_STATE_FROZEN,
                     "clock_drift_ms": _maybe_float(clock_drift_ms),
                     "starved_tokens": list(starved_tokens),
                     "sequence_gap_rate_per_min": _maybe_float(sequence_gap_rate_per_min),
                     "active_market_lag_ms": _maybe_float(active_market_lag_ms),
                 },
+                dedupe_key="LIVENESS_FROZEN_EDGE",
             )
         elif (not self._liveness_freeze_active) and prev_liveness_frozen:
-            self.db.append_alert(
+            self._emit_rate_limited_alert(
                 int(now_ms),
-                "info",
-                "LIVENESS_UNFROZEN_EDGE",
-                "liveness_freeze_cleared",
-                payload={},
+                severity="info",
+                code="LIVENESS_UNFROZEN_EDGE",
+                message="liveness_freeze_cleared",
+                payload={"state": ALERT_STATE_OK},
+                dedupe_key="LIVENESS_UNFROZEN_EDGE",
+                cooldown_ms=1_000,
             )
         self.db.insert(
             "liveness_stats",
@@ -2570,6 +2943,8 @@ class RuntimeEngine:
                         "starved_tokens": starved_tokens,
                         "starvation_by_token_ms": starvation_by_token,
                         "corrected_execution_rows": int(corrected_execution_rows),
+                        "freeze_candidate": bool(freeze_candidate),
+                        "startup_grace_active": bool(startup_grace_active),
                     },
                     separators=(",", ":"),
                     ensure_ascii=True,
@@ -2592,6 +2967,9 @@ class RuntimeEngine:
         max_book_age_ms: int,
         max_pstar_age_ms: int,
     ) -> Tuple[bool, Dict[str, Any]]:
+        self._startup_readiness_state = FEED_READINESS_BOOTING
+        self._startup_readiness_reason_codes = []
+        self._startup_readiness_payload = {}
         deadline = time.monotonic() + float(max_wait_secs)
         while time.monotonic() < deadline:
             now_ms = _now_ms()
@@ -2622,8 +3000,20 @@ class RuntimeEngine:
                     "pstar_age_ms": pstar_age,
                     "invalid_reason": str(pstar.invalid_reason or ""),
                     "wired": wired,
+                    "state": str(self._pstar_state(pstar, now_ms)),
+                    "provider": ",".join(sorted(pstar.sources_used)),
                 }
                 symbol_ok = symbol_ok and wired
+
+            token_wired_count = int(sum(1 for status in token_status.values() if bool(status.get("wired"))))
+            symbol_wired_count = int(sum(1 for status in symbol_status.values() if bool(status.get("wired"))))
+            token_total = int(len(token_status))
+            symbol_total = int(len(symbol_status))
+            readiness_state = FEED_READINESS_BOOTING
+            if token_ok and symbol_ok:
+                readiness_state = FEED_READINESS_READY
+            elif token_wired_count > 0 or symbol_wired_count > 0:
+                readiness_state = FEED_READINESS_PARTIAL
 
             payload = {
                 "token_status": token_status,
@@ -2631,9 +3021,22 @@ class RuntimeEngine:
                 "max_book_age_ms": int(max_book_age_ms),
                 "max_pstar_age_ms": int(max_pstar_age_ms),
                 "required_updates": int(min_updates_per_token),
+                "readiness_state": str(readiness_state),
+                "token_wired_count": token_wired_count,
+                "token_total": token_total,
+                "symbol_wired_count": symbol_wired_count,
+                "symbol_total": symbol_total,
+                "mode": str(mode),
+                "a_pipeline_diag": self._a_pipeline_diag(now_ms=int(now_ms)),
             }
             if token_ok and symbol_ok:
+                self._startup_readiness_state = FEED_READINESS_READY
+                self._startup_readiness_reason_codes = []
+                self._startup_readiness_payload = dict(payload)
                 return True, payload
+            self._startup_readiness_state = str(readiness_state)
+            self._startup_readiness_reason_codes = ["DEGRADED_STARTUP"]
+            self._startup_readiness_payload = dict(payload)
             await asyncio.sleep(1.0)
 
         failure_payload = {
@@ -2666,7 +3069,12 @@ class RuntimeEngine:
                 for symbol in sorted({s for s in tracked_symbols if s})
             },
             "mode": mode,
+            "readiness_state": str(self._startup_readiness_state or FEED_READINESS_BOOTING),
+            "a_pipeline_diag": self._a_pipeline_diag(now_ms=int(_now_ms())),
         }
+        self._startup_readiness_state = str(failure_payload.get("readiness_state") or FEED_READINESS_BOOTING)
+        self._startup_readiness_reason_codes = ["DEGRADED_STARTUP"]
+        self._startup_readiness_payload = dict(failure_payload)
         return False, failure_payload
 
     async def prepare_rollover(self, next_token_ids: List[str], now_ms: int) -> Dict[str, Any]:
@@ -3532,6 +3940,7 @@ def _append_discovery_request_rows(
     discovery_requests: List[Dict[str, Any]],
 ) -> None:
     for payload in discovery_requests:
+        status = _discovery_status_from_payload(payload)
         counts = {
             "n_total": _maybe_int(payload.get("n_total")),
             "n_btc_15m": _maybe_int(payload.get("n_btc_15m")),
@@ -3543,14 +3952,56 @@ def _append_discovery_request_rows(
             requested_symbol=str(payload.get("requested_symbol", "")),
             requested_horizon=str(payload.get("requested_horizon", "")),
             mode=str(payload.get("requested_mode", "")),
+            status=status,
             now_ms=int(_maybe_int(payload.get("now_wall_ms")) or ts_ms),
             selected_slug=_coerce_optional_str(payload.get("selected_slug")),
             end_ts_ms=_maybe_int(payload.get("selected_end_ts_ms")),
             end_ts_source=_coerce_optional_str(payload.get("selected_end_ts_source")),
             reason_code=_coerce_optional_str(payload.get("error_code")),
+            retry_index=_maybe_int(payload.get("retry_index")),
+            next_retry_ts_ms=_maybe_int(payload.get("next_retry_ts_ms")),
             counts=counts,
             payload=payload,
         )
+
+
+def _discovery_status_from_payload(payload: Dict[str, Any]) -> str:
+    explicit = _coerce_optional_str(payload.get("status"))
+    if explicit:
+        return explicit
+    if _coerce_optional_str(payload.get("error_code")) == "NO_ACTIVE_BTC_15M":
+        return "NONE_FOUND"
+    if _coerce_optional_str(payload.get("selected_slug")):
+        return "SELECTED"
+    return "ERROR"
+
+
+def _discovery_none_found_retry_delay_ms(retry_index: int) -> int:
+    idx = max(0, int(retry_index))
+    schedule_ms = (1_000, 2_000, 5_000)
+    if idx < len(schedule_ms):
+        return int(schedule_ms[idx])
+    return 10_000
+
+
+def _discovery_effective_next_retry_ts_ms(
+    now_ms: int,
+    retry_index: int,
+    discovery_period_ms: int,
+) -> int:
+    schedule_due_ms = int(now_ms) + int(_discovery_none_found_retry_delay_ms(retry_index))
+    throttle_due_ms = int(now_ms) + int(max(0, discovery_period_ms))
+    return int(max(schedule_due_ms, throttle_due_ms))
+
+
+def _discovery_none_found_deadline_exceeded(
+    start_ts_ms: Optional[int],
+    now_ms: int,
+    deadline_ms: int,
+) -> bool:
+    if start_ts_ms is None:
+        return False
+    return int(max(0, int(now_ms) - int(start_ts_ms))) >= int(max(0, deadline_ms))
 
 
 def _coerce_optional_str(value: Any) -> Optional[str]:
@@ -3558,6 +4009,53 @@ def _coerce_optional_str(value: Any) -> Optional[str]:
         return None
     parsed = str(value).strip()
     return parsed if parsed else None
+
+
+def _confirm_diag_summary(
+    confirm_diag: Optional[Dict[str, Any]],
+    confirm_wait_ms: Optional[float],
+) -> Dict[str, Any]:
+    diag = confirm_diag if isinstance(confirm_diag, dict) else {}
+    required_updates = max(1, int(_maybe_int(diag.get("required_updates_per_token")) or 1))
+    counts_in = diag.get("counts_by_asset")
+    rejects_in = diag.get("rejects_by_asset")
+    counts_raw = counts_in if isinstance(counts_in, dict) else {}
+    rejects_raw = rejects_in if isinstance(rejects_in, dict) else {}
+    pending_assets = diag.get("pending_asset_ids")
+    assets: Set[str] = set()
+    assets.update(str(key) for key in counts_raw.keys())
+    assets.update(str(key) for key in rejects_raw.keys())
+    if isinstance(pending_assets, list):
+        assets.update(str(item) for item in pending_assets if item)
+    ordered_assets = sorted(asset for asset in assets if asset)
+    counts_by_asset = {
+        asset: int(_maybe_int(counts_raw.get(asset)) or 0)
+        for asset in ordered_assets
+    }
+    rejects_by_asset = {
+        asset: int(_maybe_int(rejects_raw.get(asset)) or 0)
+        for asset in ordered_assets
+    }
+    reasons = diag.get("reasons")
+    reason_counts: Dict[str, int] = {}
+    for raw_reason in reasons if isinstance(reasons, list) else []:
+        reason = str(raw_reason)
+        reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+    reject_reasons_top = [
+        {"reason": reason, "count": int(reason_counts[reason])}
+        for reason in sorted(reason_counts.keys(), key=lambda key: (-int(reason_counts[key]), key))
+    ]
+    missing_assets = [
+        asset for asset in ordered_assets if int(counts_by_asset.get(asset, 0)) < int(required_updates)
+    ]
+    return {
+        "required_updates_per_token": int(required_updates),
+        "counts_by_asset": counts_by_asset,
+        "rejects_by_asset": rejects_by_asset,
+        "reject_reasons_top": reject_reasons_top,
+        "missing_assets": missing_assets,
+        "confirm_wait_ms": _maybe_float(confirm_wait_ms),
+    }
 
 
 def _candidate_tradability(
@@ -3664,9 +4162,10 @@ async def _run() -> None:
     constitution = _load_constitution(constitution_path)
     trading_cfg = constitution.get("trading", {}) if isinstance(constitution, dict) else {}
     policy_cfg = constitution.get("policy", {}) if isinstance(constitution, dict) else {}
-    mode = (args.mode or settings.trading_mode or trading_cfg.get("mode_default") or "OBSERVE").upper()
+    mode_raw = (args.mode or settings.trading_mode or trading_cfg.get("mode_default") or "OBSERVE").upper()
+    mode, observe_live_alias = _resolve_runtime_mode(mode_raw)
     if mode not in {"OBSERVE", "PAPER", "TRADE"}:
-        raise ValueError(f"unsupported_mode:{mode}")
+        raise ValueError(f"unsupported_mode:{mode_raw}")
 
     effective_auto_discover = _effective_auto_discover(
         cli_auto_discover=bool(args.auto_discover),
@@ -3829,6 +4328,7 @@ async def _run() -> None:
         run_epoch_ms=run_epoch_ms,
         run_id=run_id,
         readiness_config=readiness_config,
+        reference_poll_secs=float(settings.reference_poll_secs),
     )
 
     if mode in {"PAPER", "TRADE"} and broker is not None:
@@ -3922,10 +4422,37 @@ async def _run() -> None:
     quote_interval_ms = int(args.quote_interval_ms or trading_cfg.get("quote_interval_ms", settings.quote_interval_ms))
     stats_interval_ms = int(args.stats_interval_ms or trading_cfg.get("stats_interval_ms", settings.stats_interval_ms))
     rollover_quiet_window_ms = int(trading_cfg.get("rollover_quiet_window_ms", 500))
-    unknown_alert_threshold_per_min = int(trading_cfg.get("rollover_unknown_alert_threshold_per_min", 120))
-    unknown_alert_cooldown_ms = int(trading_cfg.get("rollover_unknown_alert_cooldown_ms", 60_000))
-    unknown_alert_min_ratio = float(trading_cfg.get("rollover_unknown_alert_min_ratio_vs_active", 2.0))
-    unknown_alert_startup_grace_ms = int(trading_cfg.get("rollover_unknown_alert_startup_grace_ms", 180_000))
+    unknown_alert_policy_cfg = trading_cfg.get("unknown_alert_policy", {}) if isinstance(trading_cfg, dict) else {}
+    unknown_alert_threshold_per_min = int(
+        unknown_alert_policy_cfg.get(
+            "threshold_per_min",
+            trading_cfg.get("rollover_unknown_alert_threshold_per_min", 120),
+        )
+    )
+    unknown_alert_cooldown_ms = int(
+        float(
+            unknown_alert_policy_cfg.get(
+                "cooldown_secs",
+                float(trading_cfg.get("rollover_unknown_alert_cooldown_ms", 60_000)) / 1000.0,
+            )
+        )
+        * 1000.0
+    )
+    unknown_alert_min_ratio = float(
+        unknown_alert_policy_cfg.get(
+            "min_ratio_vs_active",
+            trading_cfg.get("rollover_unknown_alert_min_ratio_vs_active", 2.0),
+        )
+    )
+    unknown_alert_startup_grace_ms = int(
+        unknown_alert_policy_cfg.get(
+            "startup_grace_ms",
+            trading_cfg.get("rollover_unknown_alert_startup_grace_ms", 180_000),
+        )
+    )
+    unknown_alert_min_samples = int(unknown_alert_policy_cfg.get("min_samples", 20))
+    unknown_alert_sustain_windows = int(unknown_alert_policy_cfg.get("sustain_windows", 2))
+    unknown_alert_clear_windows = int(unknown_alert_policy_cfg.get("clear_windows", 2))
     reference_sources = args.reference_source or settings.reference_source or "poll_coinbase,poll_binance_perp"
 
     stop_event = asyncio.Event()
@@ -3995,102 +4522,198 @@ async def _run() -> None:
         trade_tape.close()
         db.close()
         raise RuntimeError("feed_not_wired_for_live_mode")
+    db.append_log(
+        _now_ms(),
+        "INFO",
+        "startup_a_pipeline_diag",
+        runtime._a_pipeline_diag(now_ms=_now_ms()),
+    )
     runtime_lock = asyncio.Lock()
 
     async def _quote_loop() -> None:
         while not stop_event.is_set():
             now_ms = int(time_mapper.wall_ms(time.monotonic_ns()))
-            async with runtime_lock:
-                await runtime.run_quote_cycle(now_ms)
+            try:
+                async with runtime_lock:
+                    await runtime.run_quote_cycle(now_ms)
+            except Exception as exc:
+                db.append_alert(
+                    now_ms,
+                    "critical",
+                    "QUOTE_LOOP_ERROR",
+                    f"quote_loop_exception={type(exc).__name__}",
+                    payload={
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+                db.append_log(
+                    now_ms,
+                    "ERROR",
+                    "quote_loop_exception",
+                    {"error": str(exc), "traceback": traceback.format_exc()},
+                )
             await asyncio.sleep(max(0.05, quote_interval_ms / 1000.0))
 
     async def _stats_loop() -> None:
         last_unknown_alert_ms: int = 0
+        unknown_breach_streak = 0
+        unknown_clear_streak = 0
+        unknown_alert_active = False
+        last_a_pipeline_diag_log_ms: int = 0
         while not stop_event.is_set():
             now_ms = int(time_mapper.wall_ms(time.monotonic_ns()))
-            wall_now_ms = _now_ms()
-            active_recv_wall_ms = market_client.active_last_book_recv_wall_ms()
-            active_market_lag_ms = (
-                float(max(0, now_ms - int(active_recv_wall_ms)))
-                if active_recv_wall_ms is not None
-                else None
-            )
-            liveness_inputs = {
-                "clock_drift_ms": float(abs(int(wall_now_ms) - int(now_ms))),
-                "sequence_gap_rate_per_min": float(metrics.sequence_gap_rate_per_min(now_ms)),
-                "sequence_gap_count_1m": int(metrics.sequence_gap_count(now_ms)),
-                "active_market_lag_ms": _maybe_float(active_market_lag_ms),
-            }
-            async with runtime_lock:
-                await runtime.run_stats_cycle(now_ms, liveness_inputs=liveness_inputs)
-                guard_state = runtime.rollover_guard_status(now_ms)
-            unknown_count = metrics.market_unknown_count()
-            unknown_rate = metrics.market_unknown_rate_per_min(now_ms)
-            ignored_old_rate = metrics.market_ignored_old_rate_per_min(now_ms)
-            active_rate = metrics.market_active_rate_per_min(now_ms)
-            current_market_slug = rollover_manager.current.market_slug if rollover_manager is not None else None
-            current_selection_key = rollover_manager.current.selection_key if rollover_manager is not None else None
-            current_end_source = rollover_manager.current.market_end_source if rollover_manager is not None else None
-            db.append_rollover_metric(
-                ts_ms=now_ms,
-                metric_name="unknown_msg_count",
-                metric_value=float(unknown_count),
-                market_slug=current_market_slug,
-                selection_key=current_selection_key,
-                payload={
-                    "unknown_rate_per_min": unknown_rate,
-                    "active_rate_per_min": active_rate,
-                },
-            )
-            db.append_rollover_metric(
-                ts_ms=now_ms,
-                metric_name="ignored_old_rate_per_min",
-                metric_value=float(ignored_old_rate),
-                market_slug=current_market_slug,
-                selection_key=current_selection_key,
-                payload={"unknown_msg_count": unknown_count},
-            )
-            db.append_rollover_status(
-                ts_ms=now_ms,
-                event_type="GUARD_HEARTBEAT",
-                market_slug=current_market_slug,
-                selection_key=current_selection_key,
-                end_ts_source=current_end_source,
-                readiness_ok=bool(guard_state.get("last_ready", True)),
-                readiness_reason_codes=[str(code) for code in guard_state.get("last_reason_codes", [])],
-                confirm_wait_ms=None,
-                commit_block_ms=None,
-                unsubscribe_ms=None,
-                unknown_msg_count=int(unknown_count),
-                ignored_old_rate_per_min=float(ignored_old_rate),
-                payload=guard_state,
-            )
-            if (
-                _should_emit_unknown_ws_alert(
-                    mode=mode,
-                    now_ms=now_ms,
-                    run_epoch_ms=runtime.run_epoch_ms,
-                    unknown_rate_per_min=float(unknown_rate),
-                    active_rate_per_min=float(active_rate),
-                    threshold_per_min=int(unknown_alert_threshold_per_min),
-                    min_ratio_vs_active=float(unknown_alert_min_ratio),
-                    startup_grace_ms=int(unknown_alert_startup_grace_ms),
+            try:
+                wall_now_ms = _now_ms()
+                active_recv_wall_ms = market_client.active_last_book_recv_wall_ms()
+                active_market_lag_ms = (
+                    float(max(0, now_ms - int(active_recv_wall_ms)))
+                    if active_recv_wall_ms is not None
+                    else None
                 )
-                and int(now_ms - last_unknown_alert_ms) >= int(max(1, unknown_alert_cooldown_ms))
-            ):
-                last_unknown_alert_ms = int(now_ms)
-                db.append_alert(
+                liveness_inputs = {
+                    "clock_drift_ms": float(abs(int(wall_now_ms) - int(now_ms))),
+                    "sequence_gap_rate_per_min": float(metrics.sequence_gap_rate_per_min(now_ms)),
+                    "sequence_gap_count_1m": int(metrics.sequence_gap_count(now_ms)),
+                    "active_market_lag_ms": _maybe_float(active_market_lag_ms),
+                }
+                async with runtime_lock:
+                    await runtime.run_stats_cycle(now_ms, liveness_inputs=liveness_inputs)
+                    guard_state = runtime.rollover_guard_status(now_ms)
+                unknown_count = metrics.market_unknown_count()
+                unknown_rate = metrics.market_unknown_rate_per_min(now_ms)
+                unknown_breakdown = metrics.market_unknown_breakdown_per_min(now_ms)
+                unknown_top_signatures = metrics.market_unknown_signature_top(now_ms, limit=5)
+                unknown_samples = metrics.market_unknown_sample_count(now_ms)
+                ignored_old_rate = metrics.market_ignored_old_rate_per_min(now_ms)
+                active_rate = metrics.market_active_rate_per_min(now_ms)
+                current_market_slug = rollover_manager.current.market_slug if rollover_manager is not None else None
+                current_selection_key = rollover_manager.current.selection_key if rollover_manager is not None else None
+                current_end_source = rollover_manager.current.market_end_source if rollover_manager is not None else None
+                db.append_rollover_metric(
                     ts_ms=now_ms,
-                    severity="warning",
-                    code="WS_UNKNOWN_RATE_HIGH",
-                    message=f"unknown_market_msgs_per_min={unknown_rate:.1f}",
+                    metric_name="unknown_msg_count",
+                    metric_value=float(unknown_count),
+                    market_slug=current_market_slug,
+                    selection_key=current_selection_key,
                     payload={
-                        "unknown_msg_count": int(unknown_count),
-                        "unknown_rate_per_min": float(unknown_rate),
-                        "active_rate_per_min": float(active_rate),
-                        "threshold_per_min": int(unknown_alert_threshold_per_min),
-                        "min_ratio_vs_active": float(unknown_alert_min_ratio),
+                        "unknown_rate_per_min": unknown_rate,
+                        "active_rate_per_min": active_rate,
+                        "unknown_breakdown_per_min": unknown_breakdown,
+                        "unknown_sample_count": int(unknown_samples),
                     },
+                )
+                db.append_rollover_metric(
+                    ts_ms=now_ms,
+                    metric_name="ignored_old_rate_per_min",
+                    metric_value=float(ignored_old_rate),
+                    market_slug=current_market_slug,
+                    selection_key=current_selection_key,
+                    payload={"unknown_msg_count": unknown_count},
+                )
+                db.append_rollover_status(
+                    ts_ms=now_ms,
+                    event_type="GUARD_HEARTBEAT",
+                    market_slug=current_market_slug,
+                    selection_key=current_selection_key,
+                    end_ts_source=current_end_source,
+                    readiness_ok=bool(guard_state.get("last_ready", True)),
+                    readiness_reason_codes=[str(code) for code in guard_state.get("last_reason_codes", [])],
+                    confirm_wait_ms=None,
+                    commit_block_ms=None,
+                    unsubscribe_ms=None,
+                    unknown_msg_count=int(unknown_count),
+                    ignored_old_rate_per_min=float(ignored_old_rate),
+                    payload=guard_state,
+                )
+                if (
+                    _should_emit_unknown_ws_alert(
+                        mode=mode,
+                        now_ms=now_ms,
+                        run_epoch_ms=runtime.run_epoch_ms,
+                        unknown_rate_per_min=float(unknown_rate),
+                        unknown_sample_count=int(unknown_samples),
+                        active_rate_per_min=float(active_rate),
+                        threshold_per_min=int(unknown_alert_threshold_per_min),
+                        min_samples=int(unknown_alert_min_samples),
+                        min_ratio_vs_active=float(unknown_alert_min_ratio),
+                        startup_grace_ms=int(unknown_alert_startup_grace_ms),
+                    )
+                ):
+                    unknown_breach_streak += 1
+                    unknown_clear_streak = 0
+                else:
+                    unknown_clear_streak += 1
+                    unknown_breach_streak = 0
+                if (
+                    unknown_breach_streak >= int(max(1, unknown_alert_sustain_windows))
+                    and int(now_ms - last_unknown_alert_ms) >= int(max(1, unknown_alert_cooldown_ms))
+                ):
+                    last_unknown_alert_ms = int(now_ms)
+                    unknown_alert_active = True
+                    runtime._emit_rate_limited_alert(
+                        now_ms,
+                        severity="warning",
+                        code="WS_UNKNOWN_RATE_HIGH",
+                        message=f"unknown_market_msgs_per_min={unknown_rate:.1f}",
+                        payload={
+                            "state": ALERT_STATE_DEGRADED,
+                            "unknown_msg_count": int(unknown_count),
+                            "unknown_rate_per_min": float(unknown_rate),
+                            "unknown_sample_count": int(unknown_samples),
+                            "unknown_breakdown_per_min": unknown_breakdown,
+                            "active_rate_per_min": float(active_rate),
+                            "threshold_per_min": int(unknown_alert_threshold_per_min),
+                            "min_samples": int(unknown_alert_min_samples),
+                            "sustain_windows": int(unknown_alert_sustain_windows),
+                            "clear_windows": int(unknown_alert_clear_windows),
+                            "min_ratio_vs_active": float(unknown_alert_min_ratio),
+                            "top_signatures": unknown_top_signatures,
+                            "window_secs": 60,
+                        },
+                        dedupe_key="WS_UNKNOWN_RATE_HIGH",
+                        cooldown_ms=unknown_alert_cooldown_ms,
+                    )
+                if unknown_alert_active and unknown_clear_streak >= int(max(1, unknown_alert_clear_windows)):
+                    unknown_alert_active = False
+                    runtime._emit_rate_limited_alert(
+                        now_ms,
+                        severity="info",
+                        code="WS_UNKNOWN_RATE_RECOVERED",
+                        message="unknown_market_rate_recovered",
+                        payload={
+                            "state": ALERT_STATE_OK,
+                            "unknown_rate_per_min": float(unknown_rate),
+                            "unknown_sample_count": int(unknown_samples),
+                            "clear_windows": int(unknown_alert_clear_windows),
+                        },
+                        dedupe_key="WS_UNKNOWN_RATE_RECOVERED",
+                        cooldown_ms=1_000,
+                    )
+                if int(now_ms - last_a_pipeline_diag_log_ms) >= 60_000:
+                    last_a_pipeline_diag_log_ms = int(now_ms)
+                    db.append_log(
+                        now_ms,
+                        "INFO",
+                        "a_pipeline_diag",
+                        runtime._a_pipeline_diag(now_ms=int(now_ms)),
+                    )
+            except Exception as exc:
+                db.append_alert(
+                    now_ms,
+                    "critical",
+                    "STATS_LOOP_ERROR",
+                    f"stats_loop_exception={type(exc).__name__}",
+                    payload={
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+                db.append_log(
+                    now_ms,
+                    "ERROR",
+                    "stats_loop_exception",
+                    {"error": str(exc), "traceback": traceback.format_exc()},
                 )
             await asyncio.sleep(max(0.1, stats_interval_ms / 1000.0))
 
@@ -4113,6 +4736,12 @@ async def _run() -> None:
         readiness_pass_count = 0
         readiness_fail_count = 0
         readiness_last_reasons: List[str] = []
+        none_found_retry_index = 0
+        none_found_next_retry_ts_ms: Optional[int] = None
+        none_found_start_ts_ms: Optional[int] = None
+        none_found_deadline_alerted = False
+        none_found_quotes_canceled = False
+        none_found_deadline_ms = int(trading_cfg.get("rollover_none_found_deadline_ms", 180_000))
 
         def _emit_rollover_abort(
             *,
@@ -4215,6 +4844,9 @@ async def _run() -> None:
             if health_gate.is_frozen(now_ms):
                 await asyncio.sleep(check_period_secs)
                 continue
+            if none_found_next_retry_ts_ms is not None and int(now_ms) < int(none_found_next_retry_ts_ms):
+                await asyncio.sleep(check_period_secs)
+                continue
             last_book_recv_mono_ns = market_client.active_last_book_recv_mono_ns()
             last_book_recv_wall_ms = (
                 int(time_mapper.wall_ms(last_book_recv_mono_ns)) if last_book_recv_mono_ns > 0 else None
@@ -4298,15 +4930,50 @@ async def _run() -> None:
                     discovery_requests=_discovery_requests_from_summary(discovery_summary),
                 )
             except NoActiveMarketError as exc:
+                if none_found_start_ts_ms is None:
+                    none_found_start_ts_ms = int(now_ms)
+                elapsed_none_found_ms = int(max(0, int(now_ms) - int(none_found_start_ts_ms)))
+                next_retry_ts_ms = _discovery_effective_next_retry_ts_ms(
+                    now_ms=int(now_ms),
+                    retry_index=int(none_found_retry_index),
+                    discovery_period_ms=int(rollover_manager.config.discovery_period_ms),
+                )
+                retry_delay_ms = int(max(0, int(next_retry_ts_ms) - int(now_ms)))
+                retry_index = int(none_found_retry_index)
+                none_found_retry_index += 1
+                none_found_next_retry_ts_ms = int(next_retry_ts_ms)
+
                 discovery_requests = _discovery_requests_from_summary(discovery_summary)
                 if exc.request_payload:
-                    discovery_requests.append(dict(exc.request_payload))
+                    payload = dict(exc.request_payload)
+                    payload["status"] = "NONE_FOUND"
+                    payload["retry_index"] = int(retry_index)
+                    payload["retry_delay_ms"] = int(retry_delay_ms)
+                    payload["next_retry_ts_ms"] = int(next_retry_ts_ms)
+                    payload["none_found_elapsed_ms"] = int(elapsed_none_found_ms)
+                    payload["none_found_deadline_ms"] = int(none_found_deadline_ms)
+                    discovery_requests.append(payload)
                 discovery_requests = _dedupe_discovery_requests(discovery_requests)
                 _append_discovery_request_rows(
                     db=db,
                     ts_ms=now_ms,
                     discovery_requests=discovery_requests,
                 )
+                if mode in {"PAPER", "TRADE"} and not none_found_quotes_canceled:
+                    async with runtime_lock:
+                        canceled_count = await runtime._cancel_all_open_quotes(
+                            now_ms=int(now_ms),
+                            reason="discovery_none_found",
+                        )
+                    none_found_quotes_canceled = True
+                else:
+                    canceled_count = 0
+                async with runtime_lock:
+                    runtime.activate_rollover_guard(
+                        token_ids=list(current_state.token_ids),
+                        quiet_until_ms=int(next_retry_ts_ms),
+                        require_readiness=True,
+                    )
                 db.append_alert(
                     ts_ms=now_ms,
                     severity="warning",
@@ -4316,8 +4983,37 @@ async def _run() -> None:
                         "error": str(exc),
                         "diagnostics": dict(exc.diagnostics),
                         "discovery_requests": discovery_requests,
+                        "retry_index": int(retry_index),
+                        "retry_delay_ms": int(retry_delay_ms),
+                        "next_retry_ts_ms": int(next_retry_ts_ms),
+                        "none_found_elapsed_ms": int(elapsed_none_found_ms),
+                        "cancelled_quotes": int(canceled_count),
+                        "status": "NONE_FOUND",
                     },
                 )
+                if (
+                    not none_found_deadline_alerted
+                    and _discovery_none_found_deadline_exceeded(
+                        start_ts_ms=none_found_start_ts_ms,
+                        now_ms=int(now_ms),
+                        deadline_ms=int(none_found_deadline_ms),
+                    )
+                ):
+                    none_found_deadline_alerted = True
+                    db.append_alert(
+                        ts_ms=now_ms,
+                        severity="critical",
+                        code="DISCOVERY_NONE_FOUND_DEADLINE_EXCEEDED",
+                        message="No active BTC 15m market found beyond deadline; continuing deterministic retries",
+                        payload={
+                            "none_found_start_ts_ms": int(none_found_start_ts_ms),
+                            "none_found_elapsed_ms": int(elapsed_none_found_ms),
+                            "none_found_deadline_ms": int(none_found_deadline_ms),
+                            "retry_index": int(retry_index),
+                            "next_retry_ts_ms": int(next_retry_ts_ms),
+                            "status": "NONE_FOUND",
+                        },
+                    )
                 _emit_rollover_abort(
                     now_ms=now_ms,
                     current_state=current_state,
@@ -4328,6 +5024,12 @@ async def _run() -> None:
                         "diagnostics": dict(exc.diagnostics),
                         "discovery_summary": discovery_summary,
                         "discovery_requests": discovery_requests,
+                        "retry_index": int(retry_index),
+                        "retry_delay_ms": int(retry_delay_ms),
+                        "next_retry_ts_ms": int(next_retry_ts_ms),
+                        "none_found_elapsed_ms": int(elapsed_none_found_ms),
+                        "none_found_deadline_ms": int(none_found_deadline_ms),
+                        "status": "NONE_FOUND",
                     },
                     log_level="WARNING",
                     log_code="rollover_abort_discovery_no_active_market",
@@ -4352,6 +5054,12 @@ async def _run() -> None:
                 )
                 await asyncio.sleep(check_period_secs)
                 continue
+
+            none_found_retry_index = 0
+            none_found_next_retry_ts_ms = None
+            none_found_start_ts_ms = None
+            none_found_deadline_alerted = False
+            none_found_quotes_canceled = False
 
             candidate_state = _resolve_primary_market_state(discovered_markets, discovered_asset_meta)
             if candidate_state is None:
@@ -4454,6 +5162,10 @@ async def _run() -> None:
                     new_asset_ids=list(candidate_state.token_ids),
                     first_book_timeout_secs=confirm_timeout_secs,
                 )
+                confirm_diag_summary = _confirm_diag_summary(
+                    switch_result.confirm_diag,
+                    _maybe_float(switch_result.confirm_wait_ms),
+                )
                 if switch_result.status != "committed":
                     market_client.set_books(runtime.books)
                     db.append_rollover_metric(
@@ -4472,6 +5184,27 @@ async def _run() -> None:
                         selection_key=candidate_state.selection_key,
                         payload={"status": switch_result.status, "abort": True},
                     )
+                    db.append_rollover_metric(
+                        ts_ms=now_ms,
+                        metric_name="rollover_confirm_missing_assets",
+                        metric_value=float(len(confirm_diag_summary.get("missing_assets", []))),
+                        market_slug=candidate_state.market_slug,
+                        selection_key=candidate_state.selection_key,
+                        payload=confirm_diag_summary,
+                    )
+                    db.append_rollover_metric(
+                        ts_ms=now_ms,
+                        metric_name="rollover_confirm_reject_total",
+                        metric_value=float(
+                            sum(
+                                int(value)
+                                for value in (confirm_diag_summary.get("rejects_by_asset") or {}).values()
+                            )
+                        ),
+                        market_slug=candidate_state.market_slug,
+                        selection_key=candidate_state.selection_key,
+                        payload=confirm_diag_summary,
+                    )
                     _emit_rollover_abort(
                         now_ms=now_ms,
                         current_state=current_state,
@@ -4480,6 +5213,7 @@ async def _run() -> None:
                         extra_payload={
                             **candidate_payload,
                             "confirm_diag": switch_result.confirm_diag,
+                            "confirm_diag_summary": confirm_diag_summary,
                             "switch_status": switch_result.status,
                             "active_subscription_id_after": int(switch_result.active_subscription_id),
                             "prepare_diag": prepare_diag,
@@ -4503,6 +5237,10 @@ async def _run() -> None:
                     active_subscription_id=market_client.active_subscription_id(),
                     confirm_diag={},
                 )
+                confirm_diag_summary = _confirm_diag_summary(
+                    switch_result.confirm_diag,
+                    _maybe_float(switch_result.confirm_wait_ms),
+                )
                 committed_books = dict(runtime.books)
 
             db.append_rollover_status(
@@ -4521,6 +5259,7 @@ async def _run() -> None:
                 payload={
                     "status": switch_result.status,
                     "confirm_diag": switch_result.confirm_diag,
+                    "confirm_diag_summary": confirm_diag_summary,
                     "active_subscription_id": int(switch_result.active_subscription_id),
                 },
             )
@@ -4598,6 +5337,7 @@ async def _run() -> None:
                         **readiness_payload,
                         "prepare_diag": prepare_diag,
                         "confirm_diag": switch_result.confirm_diag,
+                        "confirm_diag_summary": confirm_diag_summary,
                         "switch_status": switch_result.status,
                         "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
                         "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
@@ -4637,6 +5377,7 @@ async def _run() -> None:
                     **candidate_payload,
                     "prepare_diag": prepare_diag,
                     "confirm_diag": switch_result.confirm_diag,
+                    "confirm_diag_summary": confirm_diag_summary,
                     "switch_status": switch_result.status,
                     "active_subscription_id_after": int(switch_result.active_subscription_id),
                     "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
@@ -4673,6 +5414,7 @@ async def _run() -> None:
                 "rollover_count": int(rollover_manager.rollover_count),
                 "prepare_diag": prepare_diag,
                 "confirm_diag": switch_result.confirm_diag,
+                "confirm_diag_summary": confirm_diag_summary,
                 "switch_status": switch_result.status,
                 "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
                 "commit_block_ms": _maybe_float(commit_block_ms),
@@ -4711,6 +5453,27 @@ async def _run() -> None:
                 market_slug=candidate_state.market_slug,
                 selection_key=candidate_state.selection_key,
                 payload={"status": switch_result.status},
+            )
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="rollover_confirm_missing_assets",
+                metric_value=float(len(confirm_diag_summary.get("missing_assets", []))),
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                payload=confirm_diag_summary,
+            )
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="rollover_confirm_reject_total",
+                metric_value=float(
+                    sum(
+                        int(value)
+                        for value in (confirm_diag_summary.get("rejects_by_asset") or {}).values()
+                    )
+                ),
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                payload=confirm_diag_summary,
             )
             db.append_rollover_status(
                 ts_ms=now_ms,
@@ -4779,7 +5542,21 @@ async def _run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown)
 
-    db.append_log(_now_ms(), "INFO", f"run_system_started mode={mode}", {"run_id": run_id})
+    db.append_log(
+        _now_ms(),
+        "INFO",
+        f"run_system_started mode={mode}",
+        {
+            "run_id": run_id,
+            "mode_requested": mode_raw,
+            "mode_effective": mode,
+            "observe_live_alias": bool(observe_live_alias),
+            "order_actions_enabled": bool(mode in {"PAPER", "TRADE"}),
+            "reference_poll_secs": float(settings.reference_poll_secs),
+            "pstar_max_age_ms": int(pstar_builder.max_age_ms),
+            "a_pipeline_diag": runtime._a_pipeline_diag(now_ms=_now_ms()),
+        },
+    )
     await stop_event.wait()
     for task in tasks:
         task.cancel()
@@ -4793,7 +5570,7 @@ async def _run() -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Polymarket V1 dual-loop system runner")
-    parser.add_argument("--mode", default=None, help="OBSERVE|PAPER|TRADE")
+    parser.add_argument("--mode", default=None, help="OBSERVE|OBSERVE_LIVE|PAPER|TRADE")
     parser.add_argument("--markets", default=None, help="Path to markets config")
     parser.add_argument("--log-dir", default=None, help="Directory for JSONL compatibility tapes")
     parser.add_argument("--db-path", default=None, help="SQLite path")
@@ -4810,6 +5587,14 @@ def _effective_auto_discover(cli_auto_discover: bool, settings_auto_discover: bo
     return bool(cli_auto_discover or settings_auto_discover)
 
 
+def _resolve_runtime_mode(mode_raw: str) -> Tuple[str, bool]:
+    mode_upper = str(mode_raw or "OBSERVE").upper()
+    if mode_upper == "OBSERVE_LIVE":
+        # Explicit live-feed/no-order operator mode alias.
+        return "OBSERVE", True
+    return mode_upper, False
+
+
 def _handle_startup_guard_result(
     db: SQLiteStore,
     mode: str,
@@ -4818,19 +5603,24 @@ def _handle_startup_guard_result(
 ) -> bool:
     if guard_ok:
         return False
+    readiness_state = str(guard_payload.get("readiness_state") or FEED_READINESS_BOOTING).upper()
     severity = "critical"
     code = "FEED_NOT_WIRED"
+    state = ALERT_STATE_FROZEN
     if mode == "OBSERVE":
         severity = "warning"
         code = "FEED_NOT_WIRED_OBSERVE"
+        state = ALERT_STATE_DEGRADED
     db.append_alert(
         _now_ms(),
         severity,
         code,
-        f"startup_feed_guard_failed mode={mode}",
-        payload=guard_payload,
+        f"startup_feed_guard_failed mode={mode} readiness_state={readiness_state}",
+        payload={**guard_payload, "state": state, "readiness_state": readiness_state},
     )
-    return mode in {"PAPER", "TRADE"}
+    if mode in {"PAPER", "TRADE"}:
+        return readiness_state != FEED_READINESS_READY
+    return False
 
 
 def _should_emit_unknown_ws_alert(
@@ -4838,8 +5628,10 @@ def _should_emit_unknown_ws_alert(
     now_ms: int,
     run_epoch_ms: int,
     unknown_rate_per_min: float,
+    unknown_sample_count: int,
     active_rate_per_min: float,
     threshold_per_min: int,
+    min_samples: int,
     min_ratio_vs_active: float,
     startup_grace_ms: int,
 ) -> bool:
@@ -4847,6 +5639,8 @@ def _should_emit_unknown_ws_alert(
     if mode not in {"PAPER", "TRADE"}:
         return False
     if int(now_ms - run_epoch_ms) < int(max(0, startup_grace_ms)):
+        return False
+    if int(unknown_sample_count) < int(max(1, min_samples)):
         return False
     if float(unknown_rate_per_min) < float(max(1, threshold_per_min)):
         return False

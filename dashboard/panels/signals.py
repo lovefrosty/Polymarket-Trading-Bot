@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Callable
+from typing import Callable, Optional
 
 try:
     import streamlit as st
@@ -23,6 +23,9 @@ def render_signals_panel(
     start_ts: int,
     apply_decision_filters: Callable,
     panel_budget_ms: int = 400,
+    view_mode: str = "developer",
+    build_signals_view: Optional[Callable] = None,
+    allow_widgets: bool = True,
 ) -> None:
     assert st is not None
     t0 = perf_counter()
@@ -48,28 +51,38 @@ def render_signals_panel(
     )
     dec = apply_decision_filters(dec, filters)
 
-    display_cols = [
-        col
-        for col in ["ts", "decision_id", "market", "token_id", "action", "strategy", "p_hat", "ev", "gate_result", "reason_codes"]
-        if col in dec.columns
-    ]
-    st.dataframe(dec[display_cols], use_container_width=True, height=300)
+    display = build_signals_view(dec) if build_signals_view is not None else dec
+    if display.empty:
+        st.info("No signals right now - widen filters / check degraded state.")
+    else:
+        st.dataframe(display, width="stretch", height=300)
 
     st.subheader("Decision Drill-down")
     if dec.empty:
         st.info("No signals for current filters.")
         return
 
-    ids = dec["decision_id"].astype(str).tolist()
-    selected_decision_id = st.selectbox("Decision ID", ids, index=0)
-    row = dec[dec["decision_id"].astype(str) == selected_decision_id].head(1)
-    if row.empty:
-        st.info("Decision not found.")
-        return
-
-    payload = safe_json(row.iloc[0].get("policy_json"))
-    st.json(payload)
+    if is_dev and allow_widgets:
+        ids = dec["decision_id"].astype(str).tolist()
+        selected_decision_id = st.selectbox("Decision ID", ids, index=0)
+        row = dec[dec["decision_id"].astype(str) == selected_decision_id].head(1)
+        if row.empty:
+            st.info("Decision not found.")
+            return
+        payload = safe_json(row.iloc[0].get("policy_json"))
+        st.json(payload)
+    else:
+        latest = dec.head(1)
+        payload = safe_json(latest.iloc[0].get("policy_json")) if not latest.empty else {}
+        summary = {
+            "strategy": latest.iloc[0].get("strategy") if not latest.empty else "N/A",
+            "gate_result": latest.iloc[0].get("gate_result") if not latest.empty else "N/A",
+            "reason_codes": latest.iloc[0].get("reason_codes") if not latest.empty else "",
+            "has_policy_payload": bool(payload),
+        }
+        st.json(summary)
 
     elapsed = (perf_counter() - t0) * 1000.0
     if elapsed > panel_budget_ms:
         st.caption(f"DEGRADED panel_over_budget_ms={elapsed:.1f} budget_ms={panel_budget_ms}")
+    is_dev = str(view_mode).lower() == "developer"

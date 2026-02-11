@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence
+
+
+ViewMode = Literal["trader", "developer"]
 
 
 @dataclass(frozen=True)
@@ -27,7 +30,9 @@ class RefreshPolicy:
 class TopBarMetrics:
     mode: str
     is_frozen: bool
+    alert_state: str
     freeze_reasons: List[str]
+    readiness_state: str
     market_slug: str
     token_ids: List[str]
     time_to_window_end: str
@@ -88,3 +93,48 @@ class ReplayMismatchRow:
     reasons_replay: str
     p_exec_delta_bps: float
     evidence_refs: List[str]
+
+
+@dataclass(frozen=True)
+class PositionRow:
+    as_of_ts_ms: int
+    token_id: str
+    market_slug: Optional[str]
+    symbol: Optional[str]
+    yes_qty: float
+    no_qty: float
+    net_shares: float
+    avg_entry: Optional[float]
+    mark_source: str
+    mark: Optional[float]
+    unrealized_pnl: Optional[float]
+
+
+@dataclass(frozen=True)
+class OpenOrderRow:
+    as_of_ts_ms: int
+    ts_ms: int
+    order_id: str
+    token_id: str
+    market_slug: Optional[str]
+    side: Optional[str]
+    price: Optional[float]
+    size: Optional[float]
+    status: Optional[str]
+    client_order_id: Optional[str]
+    quote_group_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class TradeRow:
+    ts_ms: int
+    event_id: str
+    order_id: str
+    token_id: str
+    market_slug: Optional[str]
+    side: Optional[str]
+    fill_price: Optional[float]
+    fill_qty: Optional[float]
+    realized_spread_bps: Optional[float]
+    markout_5s_bps: Optional[float]
+    net_edge_bps: Optional[float]

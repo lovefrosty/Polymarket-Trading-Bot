@@ -57,7 +57,7 @@ def render_replay_diff_panel(filters: DashboardFilters, start_ts: int, p_exec_de
     frame["reason_attribution_ts"] = frame["evidence_refs"].apply(
         lambda refs: ",".join([str(item).replace("ts:", "") for item in refs if str(item).startswith("ts:")])
     )
-    st.dataframe(frame, use_container_width=True, height=240)
+    st.dataframe(frame, width="stretch", height=240)
 
     elapsed = (perf_counter() - t0) * 1000.0
     if elapsed > panel_budget_ms:

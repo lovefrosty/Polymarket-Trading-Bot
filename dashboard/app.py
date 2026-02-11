@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import math
 from pathlib import Path
 from time import perf_counter
 import sys
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import altair as alt
@@ -24,10 +25,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core.market_time import window_start_end_ms
-from dashboard.contracts import DashboardFilters, HealthGateStatus, RefreshPolicy, TopBarMetrics
+from dashboard.contracts import DashboardFilters, HealthGateStatus, RefreshPolicy, TopBarMetrics, ViewMode
 from dashboard import data_access as da
 from dashboard.panels.export import render_export_panel
 from dashboard.panels.market_context import render_market_context_panel
+from dashboard.panels.portfolio import render_portfolio_panel
+from dashboard.panels.rollover import render_rollover_panel
 from dashboard.panels.reliability import render_health_panel, render_logs_panel
 from dashboard.panels.replay_diff import render_replay_diff_panel
 from dashboard.panels.signals import render_signals_panel
@@ -37,7 +40,7 @@ from dashboard.panels.staleness import render_staleness_panel
 TERMINAL_CSS = """
 <style>
 :root {
-  --bg:#0b0f14;
+  --bg:#000000;
   --panel:transparent;
   --muted:#9aa4b2;
   --text:#e6edf3;
@@ -67,7 +70,9 @@ body::before {
 .block-container { padding-top: 0.8rem; }
 div[data-testid="stMetric"], div[data-testid="stMetric"] > div,
 div[data-testid="stContainer"], div[data-testid="stVerticalBlock"],
-div[data-testid="stHorizontalBlock"], section[data-testid="stSidebar"] {
+div[data-testid="stHorizontalBlock"], div[data-testid="stTable"],
+div[data-testid="stMarkdownContainer"], section[data-testid="stSidebar"],
+[data-testid="stAppViewBlockContainer"] {
   background: transparent !important;
   box-shadow: none !important;
 }
@@ -81,6 +86,14 @@ div[data-testid="stDataFrame"] {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 4px;
+}
+div[data-testid="stDataFrame"] * {
+  background: transparent !important;
+  color: var(--text) !important;
+}
+div[data-testid="stMetricLabel"] p,
+div[data-testid="stMetricValue"] {
+  color: var(--text) !important;
 }
 section[data-testid="stSidebar"] { border-right: 1px solid var(--border); }
 h1,h2,h3 { color: var(--text) !important; }
@@ -109,6 +122,24 @@ hr { border: none; border-top: 1px solid var(--border); }
 """
 
 
+CODE_TO_HUMAN = {
+    "A_PSTAR_INVALID": "Price feed invalid",
+    "A_PSTAR_STALE": "Price feed stale",
+    "A_PSTAR_DIVERGED": "Spot/perp disagreement high",
+    "B_BOOK_TIME_LEAK": "Book causality violation",
+    "C_SPREAD_TOO_WIDE": "Spread too wide",
+    "C_BOOK_STALE": "Order book stale",
+    "C_NO_EXECUTION_PRICE": "Execution price unavailable",
+    "D_ONE_LEG_TIMEOUT": "Hedge incomplete timeout",
+    "D_HEDGE_INCOMPLETE": "Hedge incomplete",
+    "E_SIGNAL_AGE_HIGH": "Signal too old",
+    "E_WS_LAG_HIGH": "Websocket lag high",
+    "E_ACK_LATENCY_HIGH": "Order ack latency high",
+    "WS_UNKNOWN_RATE_HIGH": "Unknown websocket payload rate high",
+    "FEED_NOT_WIRED": "Feed wiring incomplete",
+}
+
+
 DB_PATH = da.resolve_db_path()
 
 
@@ -130,6 +161,329 @@ def _fmt_ms(value: Optional[float]) -> str:
 
 def _fmt_ratio(value: float) -> str:
     return f"{value * 100.0:.1f}%"
+
+
+def _normalize_view_mode(raw: str) -> ViewMode:
+    return "developer" if str(raw).strip().lower() == "developer" else "trader"
+
+
+def is_developer_mode(view_mode: ViewMode) -> bool:
+    return view_mode == "developer"
+
+
+def _market_label_from_slug(slug: Optional[str]) -> str:
+    if not slug:
+        return "Unknown market"
+    text = str(slug)
+    parts = text.split("-")
+    if len(parts) >= 3 and parts[1] == "updown":
+        symbol = parts[0].upper()
+        horizon = parts[2]
+        return f"{symbol} {horizon} Up/Down"
+    return text
+
+
+def _short_token(token_id: Optional[str]) -> str:
+    token = str(token_id or "")
+    if not token:
+        return "N/A"
+    if len(token) <= 10:
+        return token
+    return f"{token[:4]}...{token[-4:]}"
+
+
+def _normalize_outcome_label(raw: Optional[str]) -> str:
+    if raw is None:
+        return "Outcome"
+    text = str(raw).strip().lower()
+    if text in {"yes", "up", "true", "long", "bull"}:
+        return "YES"
+    if text in {"no", "down", "false", "short", "bear"}:
+        return "NO"
+    return str(raw).strip().upper() or "Outcome"
+
+
+def _outcome_fallback(rank: int) -> str:
+    return "Outcome A" if rank == 0 else "Outcome B"
+
+
+def _load_resolved_market_rows() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    root = Path.cwd()
+    candidates: List[Path] = []
+    for pattern in (
+        "logs/resolved_markets*.json",
+        "logs/*/resolved_markets*.json",
+        "tmp/*/resolved_markets*.json",
+        "tmp/*/logs/resolved_markets*.json",
+    ):
+        candidates.extend(root.glob(pattern))
+    candidates = [path for path in candidates if path.exists()]
+    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    for path in candidates[:8]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict) and payload.get("schema_version") == "resolved_markets_v1":
+            markets = payload.get("markets", [])
+        elif isinstance(payload, list):
+            markets = payload
+        else:
+            markets = payload.get("resolved", []) if isinstance(payload, dict) else []
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            rows.append(
+                {
+                    "market_slug": market.get("slug"),
+                    "token_ids": list(market.get("token_ids") or []),
+                    "outcomes": list(market.get("outcomes") or []),
+                    "outcome_by_token": dict(market.get("outcome_by_token") or {}),
+                }
+            )
+    return rows
+
+
+def _build_label_registry_from_records(
+    resolved_rows: Sequence[Dict[str, Any]],
+    discovery_payload_rows: Sequence[Dict[str, Any]],
+    decision_rows: pd.DataFrame,
+) -> Dict[str, Dict[str, Any]]:
+    registry: Dict[str, Dict[str, Any]] = {}
+
+    def ensure_market(market_slug: str) -> Dict[str, Any]:
+        entry = registry.get(market_slug)
+        if entry is None:
+            entry = {
+                "market_label": _market_label_from_slug(market_slug),
+                "token_to_outcome": {},
+                "seen_tokens": set(),
+            }
+            registry[market_slug] = entry
+        return entry
+
+    for row in resolved_rows:
+        slug = str(row.get("market_slug") or "").strip()
+        if not slug:
+            continue
+        entry = ensure_market(slug)
+        token_to_outcome: Dict[str, str] = {}
+        explicit = row.get("outcome_by_token") or {}
+        if isinstance(explicit, dict):
+            for token_id, outcome in explicit.items():
+                token = str(token_id)
+                if token:
+                    token_to_outcome[token] = _normalize_outcome_label(outcome)
+        token_ids = [str(token) for token in row.get("token_ids") or [] if str(token)]
+        outcomes = [str(outcome) for outcome in row.get("outcomes") or []]
+        if token_ids and outcomes and len(token_ids) == len(outcomes):
+            for token_id, outcome in zip(token_ids, outcomes):
+                token_to_outcome.setdefault(token_id, _normalize_outcome_label(outcome))
+        for token_id, outcome in token_to_outcome.items():
+            entry["token_to_outcome"].setdefault(token_id, outcome)
+            entry["seen_tokens"].add(token_id)
+
+    for item in discovery_payload_rows:
+        if not isinstance(item, dict):
+            continue
+        raw_payload = item.get("payload_json")
+        payload = da.safe_json(raw_payload)
+        slug = str(payload.get("selected_slug") or "").strip()
+        if not slug:
+            continue
+        entry = ensure_market(slug)
+        tokens = [str(token) for token in payload.get("selected_clobTokenIds") or [] if str(token)]
+        for rank, token_id in enumerate(tokens):
+            entry["token_to_outcome"].setdefault(token_id, _outcome_fallback(rank))
+            entry["seen_tokens"].add(token_id)
+
+    if not decision_rows.empty:
+        for _, row in decision_rows.iterrows():
+            slug = str(row.get("market") or "").strip()
+            token = str(row.get("token_id") or "").strip()
+            if not slug or not token:
+                continue
+            entry = ensure_market(slug)
+            entry["seen_tokens"].add(token)
+            payload = da.safe_json(row.get("policy_json"))
+            by_token = payload.get("outcome_by_token")
+            if isinstance(by_token, dict):
+                for token_id, outcome in by_token.items():
+                    token_text = str(token_id or "").strip()
+                    if not token_text:
+                        continue
+                    entry["token_to_outcome"].setdefault(token_text, _normalize_outcome_label(outcome))
+            chosen = payload.get("chosen_action")
+            if isinstance(chosen, dict):
+                chosen_token = str(chosen.get("token_id") or "").strip()
+                chosen_outcome = chosen.get("outcome")
+                if chosen_token and chosen_outcome is not None:
+                    entry["token_to_outcome"].setdefault(chosen_token, _normalize_outcome_label(chosen_outcome))
+
+    for slug, entry in registry.items():
+        tokens_sorted = sorted(str(token) for token in entry.get("seen_tokens") or set())
+        for rank, token_id in enumerate(tokens_sorted):
+            entry["token_to_outcome"].setdefault(token_id, _outcome_fallback(rank if rank < 2 else 1))
+        entry.pop("seen_tokens", None)
+        entry["market_label"] = _market_label_from_slug(slug)
+    return registry
+
+
+def _build_label_registry_uncached(selected_market: str) -> Dict[str, Dict[str, Any]]:
+    where = ""
+    params: Tuple[Any, ...] = ()
+    if selected_market != "ALL":
+        where = "WHERE market = ?"
+        params = (selected_market,)
+    decision_rows = query_df(
+        f"""
+        SELECT market, token_id, policy_json
+        FROM decisions
+        {where}
+        ORDER BY ts_ms DESC
+        LIMIT 5000
+        """,
+        params,
+    )
+    discovery_rows = query_df(
+        """
+        SELECT payload_json
+        FROM discovery_requests
+        ORDER BY ts_ms DESC
+        LIMIT 300
+        """
+    )
+    resolved_rows = _load_resolved_market_rows()
+    return _build_label_registry_from_records(
+        resolved_rows=resolved_rows,
+        discovery_payload_rows=discovery_rows.to_dict("records"),
+        decision_rows=decision_rows,
+    )
+
+
+if st is not None and hasattr(st, "cache_data"):
+
+    @st.cache_data(ttl=5, show_spinner=False)
+    def _build_label_registry_cached(selected_market: str, db_sig: str) -> Dict[str, Dict[str, Any]]:
+        _ = db_sig
+        return _build_label_registry_uncached(selected_market)
+
+else:
+
+    def _build_label_registry_cached(selected_market: str, db_sig: str) -> Dict[str, Dict[str, Any]]:
+        _ = db_sig
+        return _build_label_registry_uncached(selected_market)
+
+
+def build_label_registry(selected_market: str) -> Dict[str, Dict[str, Any]]:
+    db_sig = "missing"
+    if DB_PATH.exists():
+        db_sig = f"{DB_PATH}:{int(DB_PATH.stat().st_mtime_ns)}"
+    return _build_label_registry_cached(selected_market, db_sig)
+
+
+def label_token(label_registry: Dict[str, Dict[str, Any]], market_slug: Optional[str], token_id: Optional[str]) -> Dict[str, str]:
+    slug = str(market_slug or "")
+    token = str(token_id or "")
+    if (not slug or slug not in label_registry) and token:
+        for candidate_slug in sorted(label_registry.keys()):
+            token_map = (label_registry.get(candidate_slug) or {}).get("token_to_outcome") or {}
+            if token in token_map:
+                slug = candidate_slug
+                break
+    entry = label_registry.get(slug, {})
+    token_map = entry.get("token_to_outcome") or {}
+    outcome = token_map.get(token)
+    if outcome is None:
+        outcome = _outcome_fallback(0)
+    return {
+        "market_label": str(entry.get("market_label") or _market_label_from_slug(slug)),
+        "outcome_label": str(outcome),
+        "token_short": _short_token(token),
+    }
+
+
+def human_reason(code: Optional[str], message: Optional[str], view_mode: ViewMode) -> str:
+    code_text = str(code or "").strip()
+    base = CODE_TO_HUMAN.get(code_text, code_text if code_text else "Unknown")
+    msg = str(message or "").strip()
+    if is_developer_mode(view_mode):
+        if code_text:
+            return f"{base} [{code_text}]"
+        return base
+    if msg and msg.lower() not in base.lower():
+        return f"{base} ({msg[:72]})"
+    return base
+
+
+def build_signals_table_for_view(
+    signal_df: pd.DataFrame,
+    view_mode: ViewMode,
+    label_registry: Dict[str, Dict[str, Any]],
+) -> pd.DataFrame:
+    if signal_df.empty:
+        if is_developer_mode(view_mode):
+            return signal_df
+        return pd.DataFrame(columns=["Market", "Action", "EV", "Suggested->Current", "Size cap", "Confidence", "Why blocked"])
+
+    out = signal_df.copy()
+    labels = out.apply(lambda row: label_token(label_registry, row.get("market"), row.get("token_id")), axis=1)
+    out["market_label"] = labels.apply(lambda item: item.get("market_label"))
+    out["outcome_label"] = labels.apply(lambda item: item.get("outcome_label"))
+
+    def action_text(row: pd.Series) -> str:
+        action = str(row.get("action") or "").upper()
+        side = row.get("outcome_label") or "Outcome"
+        if action in {"BUY", "BUY_YES"}:
+            return f"Buy {side}"
+        if action in {"SELL", "SELL_NO"}:
+            return f"Sell {side}"
+        if action in {"HOLD", "SKIP", "NO_ACTION"}:
+            return "Hold"
+        return action.title()
+
+    out["action_label"] = out.apply(action_text, axis=1)
+    def _suggested_current(row: pd.Series) -> str:
+        value = row.get("p_hat")
+        if value is None or pd.isna(value):
+            return "N/A"
+        try:
+            px = float(value)
+            return f"{px:.3f}->{px:.3f}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    out["suggested_current"] = out.apply(_suggested_current, axis=1)
+    out["size_cap"] = "N/A"
+    out["confidence"] = out.get("ev", pd.Series(dtype=float)).apply(
+        lambda value: "High" if pd.notna(value) and float(value) >= 0.03 else ("Med" if pd.notna(value) and float(value) >= 0.01 else "Low")
+    )
+    out["why_blocked"] = out.apply(
+        lambda row: "" if str(row.get("gate_result") or "").upper() == "ALLOW" else human_reason(str(row.get("reason_codes") or ""), None, view_mode),
+        axis=1,
+    )
+
+    if is_developer_mode(view_mode):
+        cols = [
+            col
+            for col in ["ts", "decision_id", "market", "market_label", "token_id", "outcome_label", "action", "strategy", "p_hat", "ev", "gate_result", "reason_codes"]
+            if col in out.columns
+        ]
+        return out[cols]
+
+    slim = pd.DataFrame(
+        {
+            "Market": out["market_label"],
+            "Action": out["action_label"],
+            "EV": out["ev"],
+            "Suggested->Current": out["suggested_current"],
+            "Size cap": out["size_cap"],
+            "Confidence": out["confidence"],
+            "Why blocked": out["why_blocked"],
+        }
+    )
+    return slim
 
 
 def _runtime_schema_missing() -> bool:
@@ -240,11 +594,16 @@ def _time_to_window_end(slug: str) -> str:
 
 def compute_topbar_metrics(filters: DashboardFilters) -> TopBarMetrics:
     state = query_df(
-        "SELECT as_of_ts, is_frozen, reasons, mode FROM system_state ORDER BY as_of_ts DESC LIMIT 1"
+        "SELECT as_of_ts, is_frozen, reasons, mode, payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1"
     )
     mode = str(safe_first(state, "mode", "OBSERVE")).upper()
     frozen = bool(int(safe_first(state, "is_frozen", 0) or 0))
     reasons = _parse_reasons(safe_first(state, "reasons", ""))
+    state_payload = da.safe_json(safe_first(state, "payload_json", "{}"))
+    alert_state = str(state_payload.get("alert_state") or ("FROZEN" if frozen else "OK")).upper()
+    if alert_state not in {"OK", "DEGRADED", "FROZEN"}:
+        alert_state = "FROZEN" if frozen else ("DEGRADED" if reasons else "OK")
+    readiness_state = str(state_payload.get("readiness_state") or ("READY" if alert_state == "OK" else "BOOTING")).upper()
 
     market_slug = filters.selected_market
     if market_slug == "ALL":
@@ -374,7 +733,9 @@ def compute_topbar_metrics(filters: DashboardFilters) -> TopBarMetrics:
     return TopBarMetrics(
         mode=mode,
         is_frozen=frozen,
+        alert_state=alert_state,
         freeze_reasons=reasons,
+        readiness_state=readiness_state,
         market_slug=market_slug,
         token_ids=token_ids,
         time_to_window_end=_time_to_window_end(market_slug),
@@ -538,9 +899,18 @@ def should_refresh_heavy(tick: int, policy: RefreshPolicy) -> bool:
     return tick % max(policy.heavy_every_ticks, 1) == 0
 
 
-def _build_filters() -> Tuple[DashboardFilters, RefreshPolicy]:
+def _build_filters() -> Tuple[DashboardFilters, RefreshPolicy, ViewMode]:
     assert st is not None
     st.sidebar.header("Controls")
+    stored_view = _normalize_view_mode(str(st.session_state.get("view_mode", "trader")))
+    selected_view = st.sidebar.radio(
+        "View Mode",
+        ["Trader", "Developer"],
+        index=0 if stored_view == "trader" else 1,
+        horizontal=True,
+    )
+    view_mode: ViewMode = _normalize_view_mode(selected_view)
+    st.session_state["view_mode"] = view_mode
 
     markets_df = query_df(
         "SELECT market, MAX(ts_ms) AS max_ts FROM decisions GROUP BY market ORDER BY max_ts DESC"
@@ -582,7 +952,7 @@ def _build_filters() -> Tuple[DashboardFilters, RefreshPolicy]:
         allow_only=allow_only,
         strategy_filter=strategy_filter.strip(),
     )
-    return filters, policy
+    return filters, policy, view_mode
 
 
 def _next_tick(policy: RefreshPolicy) -> Tuple[int, bool]:
@@ -611,20 +981,26 @@ def _apply_decision_filters(df: pd.DataFrame, filters: DashboardFilters) -> pd.D
     return out
 
 
-def _render_topbar(metrics: TopBarMetrics) -> None:
+def _render_topbar(metrics: TopBarMetrics, view_mode: ViewMode, label_registry: Dict[str, Dict[str, Any]]) -> None:
     assert st is not None
-    freeze_class = "alert" if metrics.is_frozen else "ok"
-    freeze_label = "FROZEN" if metrics.is_frozen else "OK"
-    reasons = ", ".join(metrics.freeze_reasons) if metrics.freeze_reasons else "none"
+    freeze_class = "ok"
+    if metrics.alert_state == "FROZEN":
+        freeze_class = "alert"
+    elif metrics.alert_state == "DEGRADED":
+        freeze_class = "warn"
+    freeze_label = metrics.alert_state
+    reasons = ", ".join(human_reason(reason, None, view_mode) for reason in metrics.freeze_reasons) if metrics.freeze_reasons else "none"
+    market_label = label_token(label_registry, metrics.market_slug, None)["market_label"]
 
     st.markdown('<div class="topbar">', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="{freeze_class}"><b>Mode:</b> {metrics.mode} &nbsp; <b>Freeze:</b> {freeze_label} &nbsp; <b>Reasons:</b> {reasons}</div>',
+        f'<div class="{freeze_class}"><b>Mode:</b> {metrics.mode} &nbsp; <b>State:</b> {freeze_label} '
+        f'&nbsp; <b>Readiness:</b> {metrics.readiness_state} &nbsp; <b>Reasons:</b> {reasons}</div>',
         unsafe_allow_html=True,
     )
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Market", metrics.market_slug)
+    c1.metric("Market", market_label if not is_developer_mode(view_mode) else metrics.market_slug)
     c2.metric("Tokens", str(len(metrics.token_ids)))
     c3.metric("Window End ETA", metrics.time_to_window_end)
     c4.metric("P*_age_ms cur/p95", f"{_fmt_ms(metrics.pstar_age_current_ms)}/{_fmt_ms(metrics.pstar_age_p95_5m_ms)}")
@@ -643,12 +1019,18 @@ def _render_topbar(metrics: TopBarMetrics) -> None:
     i1.metric("net YES", f"{metrics.net_yes:.3f}")
     i2.metric("net NO", f"{metrics.net_no:.3f}")
     i3.metric("net USD exposure", f"{metrics.net_usd_exposure:.3f}")
-    token_preview = ", ".join(metrics.token_ids[:6]) if metrics.token_ids else "N/A"
-    st.caption(f"Token IDs: {token_preview}")
+    if is_developer_mode(view_mode):
+        token_preview = ", ".join(metrics.token_ids[:6]) if metrics.token_ids else "N/A"
+        st.caption(f"Token IDs: {token_preview}")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def _render_overview(filters: DashboardFilters, heavy_refresh: bool) -> None:
+def _render_overview(
+    filters: DashboardFilters,
+    heavy_refresh: bool,
+    view_mode: ViewMode,
+    label_registry: Dict[str, Dict[str, Any]],
+) -> None:
     assert st is not None
     start_ts, _ = _time_filter(filters.window_minutes)
 
@@ -739,17 +1121,32 @@ def _render_overview(filters: DashboardFilters, heavy_refresh: bool) -> None:
         feed_df = feed_df.sort_values("ts_ms", ascending=False).head(100)
         feed_df["ts"] = pd.to_datetime(feed_df["ts_ms"], unit="ms", utc=True)
     st.subheader("Live Feed")
-    st.dataframe(feed_df, use_container_width=True, height=260)
+    if not feed_df.empty:
+        feed_df["ts"] = pd.to_datetime(feed_df["ts_ms"], unit="ms", utc=True)
+        labels = feed_df.apply(lambda row: label_token(label_registry, row.get("market"), row.get("token_id")), axis=1)
+        feed_df["Market"] = labels.apply(lambda item: item.get("market_label"))
+        feed_df["Side"] = labels.apply(lambda item: item.get("outcome_label"))
+        if not is_developer_mode(view_mode):
+            feed_df["details"] = feed_df["details"].apply(
+                lambda value: human_reason(str(value).split(",")[0].strip(), None, view_mode) if value else ""
+            )
+    if is_developer_mode(view_mode):
+        st.dataframe(feed_df, width="stretch", height=260)
+    else:
+        trader_cols = [col for col in ["ts", "type", "Market", "Side", "event", "details", "ev", "strategy"] if col in feed_df.columns]
+        if feed_df.empty:
+            st.info("No live events yet.")
+        else:
+            st.dataframe(feed_df[trader_cols], width="stretch", height=260)
 
     st.subheader("Top Signals")
     signal_df = _apply_decision_filters(decisions, filters)
     signal_df = signal_df.sort_values("ts_ms", ascending=False).head(filters.lookback_rows)
-    top_cols = [
-        col
-        for col in ["ts", "market", "token_id", "action", "p_hat", "ev", "strategy", "gate_result", "reason_codes"]
-        if col in signal_df.columns
-    ]
-    st.dataframe(signal_df[top_cols], use_container_width=True, height=240)
+    display_signals = build_signals_table_for_view(signal_df, view_mode, label_registry)
+    if display_signals.empty:
+        st.info("No signals right now - widen filters / check degraded state.")
+    else:
+        st.dataframe(display_signals, width="stretch", height=240)
 
     ev_df = _heavy_df(
         "overview_ev_hist",
@@ -777,10 +1174,15 @@ def _render_overview(filters: DashboardFilters, heavy_refresh: bool) -> None:
                 x=alt.X("mid:Q", title="EV"),
                 y=alt.Y("n:Q", title="count"),
             ).properties(height=160)
-            st.altair_chart(_style_chart(chart), use_container_width=True)
+            st.altair_chart(_style_chart(chart), width="stretch")
 
 
-def _render_inventory_quotes(filters: DashboardFilters, heavy_refresh: bool) -> None:
+def _render_inventory_quotes(
+    filters: DashboardFilters,
+    heavy_refresh: bool,
+    view_mode: ViewMode,
+    label_registry: Dict[str, Dict[str, Any]],
+) -> None:
     assert st is not None
     inv = query_df(
         """
@@ -797,8 +1199,48 @@ def _render_inventory_quotes(filters: DashboardFilters, heavy_refresh: bool) -> 
     if not inv.empty:
         inv["net_qty"] = inv["yes_qty"].fillna(0) - inv["no_qty"].fillna(0)
         inv["ts"] = pd.to_datetime(inv["ts_ms"], unit="ms", utc=True)
-    st.subheader("Inventory per token")
-    st.dataframe(inv, use_container_width=True, height=230)
+    st.subheader("Inventory")
+    if inv.empty:
+        st.info("No open positions")
+    elif is_developer_mode(view_mode):
+        st.dataframe(inv, width="stretch", height=230)
+    else:
+        rows: List[Dict[str, Any]] = []
+        for _, row in inv.iterrows():
+            labels = label_token(label_registry, filters.selected_market if filters.selected_market != "ALL" else None, row.get("token_id"))
+            yes_qty = float(row.get("yes_qty") or 0.0)
+            no_qty = float(row.get("no_qty") or 0.0)
+            if yes_qty != 0:
+                rows.append(
+                    {
+                        "Market": labels["market_label"],
+                        "Side": "YES",
+                        "Qty": yes_qty,
+                        "Entry": "N/A",
+                        "Current": "N/A",
+                        "PnL ($)": "N/A",
+                        "PnL (%)": "N/A",
+                        "Status": "open",
+                    }
+                )
+            if no_qty != 0:
+                rows.append(
+                    {
+                        "Market": labels["market_label"],
+                        "Side": "NO",
+                        "Qty": no_qty,
+                        "Entry": "N/A",
+                        "Current": "N/A",
+                        "PnL ($)": "N/A",
+                        "PnL (%)": "N/A",
+                        "Status": "open",
+                    }
+                )
+        trader_inv = pd.DataFrame(rows)
+        if trader_inv.empty:
+            st.info("No open positions")
+        else:
+            st.dataframe(trader_inv, width="stretch", height=230)
 
     st.subheader("Active/Open orders")
     orders = adapt_orders(
@@ -814,12 +1256,32 @@ def _render_inventory_quotes(filters: DashboardFilters, heavy_refresh: bool) -> 
             (filters.lookback_rows,),
         )
     )
-    cols = [
-        col
-        for col in ["ts", "order_id", "token_id", "side", "price", "qty", "post_only", "status", "event_kind", "age_s"]
-        if col in orders.columns
-    ]
-    st.dataframe(orders[cols], use_container_width=True, height=220)
+    if orders.empty:
+        st.info("No active orders")
+    elif is_developer_mode(view_mode):
+        cols = [
+            col
+            for col in ["ts", "order_id", "token_id", "side", "price", "qty", "post_only", "status", "event_kind", "age_s"]
+            if col in orders.columns
+        ]
+        st.dataframe(orders[cols], width="stretch", height=220)
+    else:
+        rows = []
+        for _, row in orders.iterrows():
+            labels = label_token(label_registry, filters.selected_market if filters.selected_market != "ALL" else None, row.get("token_id"))
+            side = str(row.get("side") or "").lower()
+            rows.append(
+                {
+                    "Market": labels["market_label"],
+                    "Side": "YES" if side == "buy" else ("NO" if side == "sell" else side.upper()),
+                    "Price": row.get("price"),
+                    "Qty": row.get("qty"),
+                    "Post-only": row.get("post_only"),
+                    "Status": row.get("status"),
+                    "Age (s)": row.get("age_s"),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), width="stretch", height=220)
 
     st.subheader("Quote skew view")
     skew = _heavy_df(
@@ -853,13 +1315,35 @@ def _render_inventory_quotes(filters: DashboardFilters, heavy_refresh: bool) -> 
         (_now_ms() - 60 * 60_000,),
         heavy_refresh,
     )
-    st.dataframe(skew, use_container_width=True, height=180)
+    if is_developer_mode(view_mode):
+        st.dataframe(skew, width="stretch", height=180)
+    else:
+        if skew.empty:
+            st.info("No quote skew telemetry yet.")
+        else:
+            rows = []
+            for _, row in skew.iterrows():
+                labels = label_token(label_registry, filters.selected_market if filters.selected_market != "ALL" else None, row.get("token_id"))
+                rows.append(
+                    {
+                        "Market": labels["market_label"],
+                        "Bid offset": row.get("bid_offset"),
+                        "Ask offset": row.get("ask_offset"),
+                        "Mid": row.get("mid"),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), width="stretch", height=180)
 
     st.markdown('<div class="readonly-btn"><b>READ ONLY:</b> Cancel all quotes</div>', unsafe_allow_html=True)
     st.button("Cancel all quotes", disabled=True, help="Dashboard is read-only unless explicitly enabled in a future ops phase.")
 
 
-def _render_microstructure(filters: DashboardFilters, heavy_refresh: bool) -> None:
+def _render_microstructure(
+    filters: DashboardFilters,
+    heavy_refresh: bool,
+    view_mode: ViewMode,
+    label_registry: Dict[str, Dict[str, Any]],
+) -> None:
     assert st is not None
     start_ts, _ = _time_filter(filters.window_minutes)
     micro = _heavy_df(
@@ -879,26 +1363,40 @@ def _render_microstructure(filters: DashboardFilters, heavy_refresh: bool) -> No
         micro["ts"] = pd.to_datetime(micro["ts_ms"], unit="ms", utc=True)
 
     st.subheader("Microstructure table")
-    st.dataframe(micro, use_container_width=True, height=260)
+    if not micro.empty:
+        labels = micro.apply(lambda row: label_token(label_registry, filters.selected_market if filters.selected_market != "ALL" else None, row.get("token_id")), axis=1)
+        micro["market_label"] = labels.apply(lambda item: item.get("market_label"))
+        micro["outcome_label"] = labels.apply(lambda item: item.get("outcome_label"))
+    if micro.empty:
+        st.info("No microstructure telemetry yet.")
+    elif is_developer_mode(view_mode):
+        st.dataframe(micro, width="stretch", height=260)
+    else:
+        show_cols = [
+            col
+            for col in ["ts", "market_label", "outcome_label", "spread_bps", "depth_at_qty_buy", "depth_at_qty_sell", "book_health"]
+            if col in micro.columns
+        ]
+        st.dataframe(micro[show_cols], width="stretch", height=260)
 
     if not micro.empty and alt is not None:
         spread_chart = alt.Chart(micro).mark_line().encode(
             x="ts:T",
             y="spread_bps:Q",
-            color="token_id:N",
-            tooltip=["ts", "token_id", "spread_bps"],
+            color=("token_id:N" if is_developer_mode(view_mode) else "outcome_label:N"),
+            tooltip=(["ts", "token_id", "spread_bps"] if is_developer_mode(view_mode) else ["ts", "outcome_label", "spread_bps"]),
         ).properties(height=160)
-        st.altair_chart(_style_chart(spread_chart), use_container_width=True)
+        st.altair_chart(_style_chart(spread_chart), width="stretch")
 
         depth = micro.copy()
         depth["depth_at_qty"] = (depth["depth_at_qty_buy"].fillna(0) + depth["depth_at_qty_sell"].fillna(0)) / 2.0
         depth_chart = alt.Chart(depth).mark_line().encode(
             x="ts:T",
             y="depth_at_qty:Q",
-            color="token_id:N",
-            tooltip=["ts", "token_id", "depth_at_qty"],
+            color=("token_id:N" if is_developer_mode(view_mode) else "outcome_label:N"),
+            tooltip=(["ts", "token_id", "depth_at_qty"] if is_developer_mode(view_mode) else ["ts", "outcome_label", "depth_at_qty"]),
         ).properties(height=160)
-        st.altair_chart(_style_chart(depth_chart), use_container_width=True)
+        st.altair_chart(_style_chart(depth_chart), width="stretch")
 
     fill_latency = _heavy_df(
         "micro_fill_latency",
@@ -914,7 +1412,16 @@ def _render_microstructure(filters: DashboardFilters, heavy_refresh: bool) -> No
         heavy_refresh,
     )
     st.subheader("Fill latency distribution")
-    st.dataframe(fill_latency, use_container_width=True, height=180)
+    if fill_latency.empty:
+        st.info("No fills yet.")
+    elif is_developer_mode(view_mode):
+        st.dataframe(fill_latency, width="stretch", height=180)
+    else:
+        labels = fill_latency.apply(lambda row: label_token(label_registry, filters.selected_market if filters.selected_market != "ALL" else None, row.get("token_id")), axis=1)
+        fill_latency["Market"] = labels.apply(lambda item: item.get("market_label"))
+        fill_latency["Side"] = labels.apply(lambda item: item.get("outcome_label"))
+        cols = [col for col in ["ts_ms", "Market", "Side", "fill_latency_ms"] if col in fill_latency.columns]
+        st.dataframe(fill_latency[cols], width="stretch", height=180)
 
 
 def _render_panel(name: str, fn, budget_ms: int = 400) -> None:
@@ -947,50 +1454,140 @@ def render_dashboard() -> None:
             unsafe_allow_html=True,
         )
 
-    filters, policy = _build_filters()
+    filters, policy, view_mode = _build_filters()
 
-    def _render_live() -> None:
-        tick, heavy_refresh = _next_tick(policy)
-        metrics = compute_topbar_metrics(filters)
-        health = compute_health_a_to_e(filters)
-        _render_topbar(metrics)
-        st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())}")
+    topbar_slot = st.empty()
+    status_slot = st.empty()
 
-        start_ts, end_ts = _time_filter(filters.window_minutes)
+    if is_developer_mode(view_mode):
+        tab_overview, tab_rollover, tab_health, tab_signals, tab_inventory, tab_portfolio, tab_micro, tab_logs = st.tabs(
+            ["Overview", "Rollover", "Health (A-E)", "Signals", "Inventory & Quotes", "Portfolio", "Microstructure", "Logs"]
+        )
+    else:
         tab_overview, tab_health, tab_signals, tab_inventory, tab_micro, tab_logs = st.tabs(
             ["Overview", "Health (A-E)", "Signals", "Inventory & Quotes", "Microstructure", "Logs"]
         )
+        tab_rollover = None
+        tab_portfolio = None
 
-        with tab_overview:
-            _render_panel("market_context", lambda: render_market_context_panel(filters, metrics), budget_ms=200)
-            _render_panel("overview", lambda: _render_overview(filters, heavy_refresh), budget_ms=450)
+    with tab_overview:
+        overview_slot = st.empty()
+    with tab_health:
+        health_slot = st.empty()
+    with tab_signals:
+        signals_slot = st.empty()
+    with tab_inventory:
+        inventory_slot = st.empty()
+    with tab_micro:
+        micro_slot = st.empty()
+    with tab_logs:
+        logs_slot = st.empty()
+    rollover_slot = None
+    portfolio_slot = None
+    if tab_rollover is not None:
+        with tab_rollover:
+            rollover_slot = st.empty()
+    if tab_portfolio is not None:
+        with tab_portfolio:
+            portfolio_slot = st.empty()
 
-        with tab_health:
-            _render_panel("health", lambda: render_health_panel(filters, health), budget_ms=500)
-            context = render_staleness_panel(filters, start_ts, end_ts)
+    use_fragment = bool(policy.auto_refresh and hasattr(st, "fragment"))
+
+    def _render_live() -> None:
+        allow_panel_widgets = not use_fragment
+        tick, heavy_refresh = _next_tick(policy)
+        label_registry = build_label_registry(filters.selected_market)
+        metrics = compute_topbar_metrics(filters)
+        health = compute_health_a_to_e(filters)
+
+        with topbar_slot.container():
+            _render_topbar(metrics, view_mode, label_registry)
+        with status_slot.container():
+            st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
+
+        start_ts, end_ts = _time_filter(filters.window_minutes)
+
+        with overview_slot.container():
+            _render_panel(
+                "market_context",
+                lambda: render_market_context_panel(filters, metrics, view_mode=view_mode, label_token_fn=lambda market, token: label_token(label_registry, market, token)),
+                budget_ms=200,
+            )
+            _render_panel("overview", lambda: _render_overview(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
+
+        if rollover_slot is not None:
+            with rollover_slot.container():
+                _render_panel("rollover", lambda: render_rollover_panel(filters), budget_ms=350)
+
+        with health_slot.container():
+            _render_panel(
+                "health",
+                lambda: render_health_panel(
+                    filters,
+                    health,
+                    view_mode=view_mode,
+                    label_token_fn=lambda market, token: label_token(label_registry, market, token),
+                    reason_humanizer=lambda code, msg: human_reason(code, msg, view_mode),
+                    allow_widgets=allow_panel_widgets,
+                ),
+                budget_ms=500,
+            )
+            context = render_staleness_panel(
+                filters,
+                start_ts,
+                end_ts,
+                view_mode=view_mode,
+                label_token_fn=lambda market, token: label_token(label_registry, market, token),
+                allow_widgets=allow_panel_widgets,
+            )
             if context is not None:
                 st.session_state["drillthrough_context"] = context
 
-        with tab_signals:
+        with signals_slot.container():
             _render_panel(
                 "signals",
-                lambda: render_signals_panel(filters, start_ts, _apply_decision_filters),
+                lambda: render_signals_panel(
+                    filters,
+                    start_ts,
+                    _apply_decision_filters,
+                    view_mode=view_mode,
+                    build_signals_view=lambda df: build_signals_table_for_view(df, view_mode, label_registry),
+                    allow_widgets=allow_panel_widgets,
+                ),
                 budget_ms=450,
             )
+            if is_developer_mode(view_mode):
+                _render_panel(
+                    "replay_diff",
+                    lambda: render_replay_diff_panel(filters, start_ts),
+                    budget_ms=300,
+                )
+
+        with inventory_slot.container():
+            _render_panel("inventory", lambda: _render_inventory_quotes(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
+
+        if portfolio_slot is not None:
+            with portfolio_slot.container():
+                _render_panel(
+                    "portfolio",
+                    lambda: render_portfolio_panel(filters, start_ts, end_ts),
+                    budget_ms=450,
+                )
+
+        with micro_slot.container():
+            _render_panel("microstructure", lambda: _render_microstructure(filters, heavy_refresh, view_mode, label_registry), budget_ms=500)
+
+        with logs_slot.container():
             _render_panel(
-                "replay_diff",
-                lambda: render_replay_diff_panel(filters, start_ts),
-                budget_ms=300,
+                "logs",
+                lambda: render_logs_panel(
+                    filters,
+                    start_ts,
+                    view_mode=view_mode,
+                    reason_humanizer=lambda code, msg: human_reason(code, msg, view_mode),
+                ),
+                budget_ms=450,
             )
-
-        with tab_inventory:
-            _render_panel("inventory", lambda: _render_inventory_quotes(filters, heavy_refresh), budget_ms=450)
-
-        with tab_micro:
-            _render_panel("microstructure", lambda: _render_microstructure(filters, heavy_refresh), budget_ms=500)
-
-        with tab_logs:
-            _render_panel("logs", lambda: render_logs_panel(filters, start_ts), budget_ms=450)
             drillthrough_context = st.session_state.get("drillthrough_context")
             _render_panel(
                 "incident_export",
@@ -998,7 +1595,7 @@ def render_dashboard() -> None:
                 budget_ms=250,
             )
 
-    if policy.auto_refresh and hasattr(st, "fragment"):
+    if use_fragment:
         refresh_seconds = max(1, int(round(policy.topbar_refresh_ms / 1000.0)))
 
         @st.fragment(run_every=f"{refresh_seconds}s")

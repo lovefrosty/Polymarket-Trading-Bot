@@ -807,6 +807,7 @@ def _resolve_latest_active_btc_15m_selection(
     except NoActiveMarketError as exc:
         error_payload = {
             **payload_base,
+            "status": "NONE_FOUND",
             "error_code": "NO_ACTIVE_BTC_15M",
             "closest_candidates": diagnostics.get("closest_candidates", []),
         }
@@ -829,6 +830,7 @@ def _resolve_latest_active_btc_15m_selection(
     selection_key = deterministic_market_selection_key_str(selected_raw)
     success_payload = {
         **payload_base,
+        "status": "SELECTED",
         "selected_slug": selected_resolved.slug,
         "selected_end_ts_ms": selected_resolved.end_ts_ms,
         "selected_end_ts_source": selected_resolved.end_ts_source,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -45,6 +45,8 @@ class Metrics:
         self._market_unknown_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
         self._market_ignored_old_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
         self._market_active_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
+        self._market_unknown_by_class_recv_ts_ms: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=20_000))
+        self._market_unknown_signature_recv: Deque[tuple[int, str]] = deque(maxlen=40_000)
         self._sequence_gap_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
         self._sequence_out_of_order_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
 
@@ -58,22 +60,30 @@ class Metrics:
         t_recv_wall_ms: Optional[int],
         asset_id: Optional[str] = None,
         sub_state: Optional[str] = None,
+        unknown_class: Optional[str] = None,
+        unknown_signature: Optional[str] = None,
+        count_for_health: bool = True,
     ) -> None:
         self._message_counts[channel] += 1
         self._message_counts_total[channel] += 1
         state = str(sub_state or "unknown")
-        self._message_counts_by_sub_state[f"{channel}:{state}"] += 1
-        self._message_counts_total_by_sub_state[f"{channel}:{state}"] += 1
-        if channel == "market" and t_recv_wall_ms is not None:
+        if channel != "market" or bool(count_for_health):
+            self._message_counts_by_sub_state[f"{channel}:{state}"] += 1
+            self._message_counts_total_by_sub_state[f"{channel}:{state}"] += 1
+        if channel == "market" and t_recv_wall_ms is not None and bool(count_for_health):
             recv_ms = int(t_recv_wall_ms)
             if state == "unknown":
                 self._market_unknown_recv_ts_ms.append(recv_ms)
+                klass = str(unknown_class or "unknown_schema")
+                self._market_unknown_by_class_recv_ts_ms[klass].append(recv_ms)
+                signature = str(unknown_signature or "unknown")
+                self._market_unknown_signature_recv.append((recv_ms, signature))
             elif state == "ignored_old":
                 self._market_ignored_old_recv_ts_ms.append(recv_ms)
             elif state == "active":
                 self._market_active_recv_ts_ms.append(recv_ms)
         # Only active market traffic contributes to lag health.
-        include_lag = channel != "market" or state == "active"
+        include_lag = bool(count_for_health) and (channel != "market" or state == "active")
         if include_lag and t_event_ms is not None and t_recv_wall_ms is not None:
             self._ws_lag_samples.append(t_recv_wall_ms - t_event_ms)
 
@@ -87,6 +97,27 @@ class Metrics:
         now_ms = int(now_wall_ms)
         self._prune_recent(self._market_unknown_recv_ts_ms, now_ms)
         return float(len(self._market_unknown_recv_ts_ms))
+
+    def market_unknown_sample_count(self, now_wall_ms: int) -> int:
+        return int(self.market_unknown_rate_per_min(now_wall_ms))
+
+    def market_unknown_breakdown_per_min(self, now_wall_ms: int) -> Dict[str, float]:
+        now_ms = int(now_wall_ms)
+        out: Dict[str, float] = {}
+        for key, values in self._market_unknown_by_class_recv_ts_ms.items():
+            self._prune_recent(values, now_ms)
+            out[str(key)] = float(len(values))
+        return out
+
+    def market_unknown_signature_top(self, now_wall_ms: int, limit: int = 5) -> Dict[str, int]:
+        now_ms = int(now_wall_ms)
+        cutoff = int(now_ms - 60_000)
+        while self._market_unknown_signature_recv and int(self._market_unknown_signature_recv[0][0]) < cutoff:
+            self._market_unknown_signature_recv.popleft()
+        counts: Counter[str] = Counter()
+        for _, signature in self._market_unknown_signature_recv:
+            counts[str(signature)] += 1
+        return dict(counts.most_common(max(1, int(limit))))
 
     def market_ignored_old_rate_per_min(self, now_wall_ms: int) -> float:
         now_ms = int(now_wall_ms)

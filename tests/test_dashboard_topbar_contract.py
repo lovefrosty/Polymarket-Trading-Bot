@@ -9,7 +9,9 @@ class TestDashboardTopbarContract(unittest.TestCase):
         required = {
             "mode",
             "is_frozen",
+            "alert_state",
             "freeze_reasons",
+            "readiness_state",
             "market_slug",
             "token_ids",
             "time_to_window_end",

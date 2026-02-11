@@ -424,11 +424,14 @@ _SCHEMA = [
         requested_symbol TEXT NOT NULL,
         requested_horizon TEXT NOT NULL,
         mode TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'UNKNOWN',
         now_ms INTEGER NOT NULL,
         selected_slug TEXT,
         end_ts_ms INTEGER,
         end_ts_source TEXT,
         reason_code TEXT,
+        retry_index INTEGER,
+        next_retry_ts_ms INTEGER,
         counts_json TEXT NOT NULL,
         payload_json TEXT NOT NULL
     )
@@ -748,11 +751,14 @@ class SQLiteStore:
         requested_symbol: str,
         requested_horizon: str,
         mode: str,
+        status: str,
         now_ms: int,
         selected_slug: Optional[str],
         end_ts_ms: Optional[int],
         end_ts_source: Optional[str],
         reason_code: Optional[str],
+        retry_index: Optional[int] = None,
+        next_retry_ts_ms: Optional[int] = None,
         counts: Optional[Dict[str, Any]] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -764,11 +770,14 @@ class SQLiteStore:
                 "requested_symbol": str(requested_symbol),
                 "requested_horizon": str(requested_horizon),
                 "mode": str(mode),
+                "status": str(status),
                 "now_ms": int(now_ms),
                 "selected_slug": str(selected_slug) if selected_slug is not None else None,
                 "end_ts_ms": _maybe_int(end_ts_ms),
                 "end_ts_source": str(end_ts_source) if end_ts_source is not None else None,
                 "reason_code": str(reason_code) if reason_code is not None else None,
+                "retry_index": _maybe_int(retry_index),
+                "next_retry_ts_ms": _maybe_int(next_retry_ts_ms),
                 "counts_json": _as_json(counts or {}),
                 "payload_json": _as_json(payload or {}),
             },
@@ -857,6 +866,14 @@ class SQLiteStore:
                     "mode": "TEXT",
                     "price": "REAL",
                     "size": "REAL",
+                },
+            )
+            self._ensure_columns(
+                "discovery_requests",
+                {
+                    "status": "TEXT",
+                    "retry_index": "INTEGER",
+                    "next_retry_ts_ms": "INTEGER",
                 },
             )
             self._cx.execute(

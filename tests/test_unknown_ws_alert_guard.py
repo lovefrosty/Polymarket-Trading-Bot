@@ -11,8 +11,10 @@ class TestUnknownWsAlertGuard(unittest.TestCase):
                 now_ms=1_000_000,
                 run_epoch_ms=0,
                 unknown_rate_per_min=500.0,
+                unknown_sample_count=500,
                 active_rate_per_min=10.0,
                 threshold_per_min=120,
+                min_samples=20,
                 min_ratio_vs_active=2.0,
                 startup_grace_ms=180_000,
             )
@@ -25,8 +27,10 @@ class TestUnknownWsAlertGuard(unittest.TestCase):
                 now_ms=100_000,
                 run_epoch_ms=0,
                 unknown_rate_per_min=500.0,
+                unknown_sample_count=500,
                 active_rate_per_min=100.0,
                 threshold_per_min=120,
+                min_samples=20,
                 min_ratio_vs_active=2.0,
                 startup_grace_ms=180_000,
             )
@@ -37,8 +41,10 @@ class TestUnknownWsAlertGuard(unittest.TestCase):
                 now_ms=500_000,
                 run_epoch_ms=0,
                 unknown_rate_per_min=180.0,
+                unknown_sample_count=180,
                 active_rate_per_min=120.0,
                 threshold_per_min=120,
+                min_samples=20,
                 min_ratio_vs_active=2.0,
                 startup_grace_ms=180_000,
             )
@@ -49,8 +55,26 @@ class TestUnknownWsAlertGuard(unittest.TestCase):
                 now_ms=500_000,
                 run_epoch_ms=0,
                 unknown_rate_per_min=300.0,
+                unknown_sample_count=300,
                 active_rate_per_min=100.0,
                 threshold_per_min=120,
+                min_samples=20,
+                min_ratio_vs_active=2.0,
+                startup_grace_ms=180_000,
+            )
+        )
+
+    def test_requires_minimum_sample_count(self) -> None:
+        self.assertFalse(
+            _should_emit_unknown_ws_alert(
+                mode="PAPER",
+                now_ms=500_000,
+                run_epoch_ms=0,
+                unknown_rate_per_min=300.0,
+                unknown_sample_count=5,
+                active_rate_per_min=50.0,
+                threshold_per_min=120,
+                min_samples=20,
                 min_ratio_vs_active=2.0,
                 startup_grace_ms=180_000,
             )

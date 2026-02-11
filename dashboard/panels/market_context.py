@@ -23,6 +23,8 @@ def render_market_context_panel(
     filters: DashboardFilters,
     topbar: TopBarMetrics,
     panel_budget_ms: int = 250,
+    view_mode: str = "developer",
+    label_token_fn=None,
 ) -> None:
     assert st is not None
     t0 = perf_counter()
@@ -39,19 +41,31 @@ def render_market_context_panel(
     if missing_optional:
         st.caption(f"DEGRADED optional missing: {', '.join(missing_optional)}")
 
+    is_dev = str(view_mode).lower() == "developer"
+    market_label = topbar.market_slug
+    if label_token_fn is not None:
+        try:
+            market_label = label_token_fn(topbar.market_slug, None).get("market_label", topbar.market_slug)
+        except Exception:
+            market_label = topbar.market_slug
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Resolved market", topbar.market_slug)
+    c1.metric("Resolved market", topbar.market_slug if is_dev else market_label)
     c2.metric("Token count", str(len(topbar.token_ids)))
     c3.metric("Window end ETA", topbar.time_to_window_end)
 
-    token_preview = ", ".join(topbar.token_ids) if topbar.token_ids else "N/A"
-    st.caption(f"Token IDs: {token_preview}")
+    if is_dev:
+        token_preview = ", ".join(topbar.token_ids) if topbar.token_ids else "N/A"
+        st.caption(f"Token IDs: {token_preview}")
+    else:
+        st.caption("Outcomes: YES / NO")
 
     reqs = query_df(
         """
         SELECT ts_ms, requested_symbol, requested_horizon, mode,
+               status,
                selected_slug, end_ts_ms, end_ts_source,
-               reason_code, counts_json
+               reason_code, retry_index, next_retry_ts_ms, counts_json
         FROM discovery_requests
         ORDER BY ts_ms DESC
         LIMIT 50
@@ -59,8 +73,10 @@ def render_market_context_panel(
     )
     if not reqs.empty:
         reqs["ts"] = pd.to_datetime(reqs["ts_ms"], unit="ms", utc=True)
+        if "next_retry_ts_ms" in reqs.columns:
+            reqs["next_retry_ts"] = pd.to_datetime(reqs["next_retry_ts_ms"], unit="ms", utc=True, errors="coerce")
         st.subheader("Market discovery evidence")
-        st.dataframe(reqs, use_container_width=True, height=220)
+        st.dataframe(reqs, width="stretch", height=220)
 
     elapsed = (perf_counter() - t0) * 1000.0
     if elapsed > panel_budget_ms:

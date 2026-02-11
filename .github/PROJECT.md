@@ -44,6 +44,9 @@ Source: `config/constitution.yaml`
 - Complete dataset/export/label/walk-forward expanded metrics path.
 - Execute conservative promotion pipeline and soak gates.
 
+## Recent Reliability Milestone
+- Alert/Bottleneck stabilization (mode-aware): `audit/milestones/M_alert_bottleneck_stabilization.md`
+
 ## Blockers That Halt Autonomous Progress
 - Missing or invalid exchange credentials.
 - Requested changes to locked promotion thresholds.

@@ -25,6 +25,8 @@ def main() -> None:
     env["RUNTIME_DB_PATH"] = str(Path(args.db_path).resolve())
 
     cmd = [
+        sys.executable,
+        "-m",
         "streamlit",
         "run",
         str(app_path),

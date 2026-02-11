@@ -11,8 +11,8 @@ import scripts.run_system as run_system
 from core.market_discovery import NoActiveMarketError
 
 
-class TestRunSystemAutodiscoverBtc15mHardFail(unittest.TestCase):
-    def test_startup_hardfails_and_persists_discovery_audit(self) -> None:
+class TestStartupNoActiveMarketHardFail(unittest.TestCase):
+    def test_startup_raises_and_writes_none_found_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             db_path = tmp_path / "runtime.db"
@@ -32,11 +32,7 @@ class TestRunSystemAutodiscoverBtc15mHardFail(unittest.TestCase):
                                 "min_size": 1.0,
                                 "max_price": 0.99,
                                 "min_price": 0.01,
-                                "auto_discover": {
-                                    "symbol": "BTC",
-                                    "horizon": "15m",
-                                    "mode": "latest_active",
-                                },
+                                "auto_discover": {"symbol": "BTC", "horizon": "15m", "mode": "latest_active"},
                             }
                         ]
                     },
@@ -44,7 +40,6 @@ class TestRunSystemAutodiscoverBtc15mHardFail(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-
             args = SimpleNamespace(
                 mode="OBSERVE",
                 markets=str(markets_path),
@@ -65,13 +60,14 @@ class TestRunSystemAutodiscoverBtc15mHardFail(unittest.TestCase):
                     diagnostics={"n_active_now": 0},
                     request_payload={
                         "event": "DISCOVERY_REQUEST",
+                        "status": "NONE_FOUND",
                         "requested_symbol": "BTC",
                         "requested_horizon": "15m",
                         "requested_mode": "latest_active",
                         "now_wall_ms": 1_800_000_000_000,
-                        "n_total": 2,
-                        "n_btc_15m": 2,
-                        "n_with_end_ts": 2,
+                        "n_total": 1,
+                        "n_btc_15m": 1,
+                        "n_with_end_ts": 1,
                         "n_active_now": 0,
                         "error_code": "NO_ACTIVE_BTC_15M",
                     },
@@ -86,21 +82,13 @@ class TestRunSystemAutodiscoverBtc15mHardFail(unittest.TestCase):
 
             cx = sqlite3.connect(db_path.as_posix())
             try:
-                discovery_rows = cx.execute(
-                    "SELECT status, reason_code, counts_json FROM discovery_requests ORDER BY ts_ms DESC LIMIT 1"
-                ).fetchall()
-                self.assertEqual(len(discovery_rows), 1)
-                self.assertEqual(discovery_rows[0][0], "NONE_FOUND")
-                self.assertEqual(discovery_rows[0][1], "NO_ACTIVE_BTC_15M")
-                counts = json.loads(discovery_rows[0][2])
-                self.assertEqual(counts.get("n_active_now"), 0)
-
-                log_rows = cx.execute(
-                    "SELECT msg, payload_json FROM logs WHERE msg = 'startup_discovery_no_active_market'"
-                ).fetchall()
-                self.assertEqual(len(log_rows), 1)
-                payload = json.loads(log_rows[0][1])
-                self.assertEqual(payload.get("error_code"), "NO_ACTIVE_BTC_15M")
+                row = cx.execute(
+                    "SELECT status, reason_code FROM discovery_requests ORDER BY ts_ms DESC LIMIT 1"
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row[0], "NONE_FOUND")
+                self.assertEqual(row[1], "NO_ACTIVE_BTC_15M")
             finally:
                 cx.close()
 

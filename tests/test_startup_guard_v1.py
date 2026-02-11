@@ -102,6 +102,30 @@ class TestStartupGuardV1(unittest.TestCase):
             runtime.decision_tape.close()
             runtime.db.close()
 
+    def test_partial_readiness_state_when_book_wired_but_reference_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.db"
+            runtime = self._build_runtime(db_path)
+            now_ms = int(time.time() * 1000)
+            runtime.books["token-1"].last_event_ts_ms = now_ms - 10
+            runtime.books["token-1"].last_recv_mono_ns = time.monotonic_ns()
+            ok, payload = asyncio.run(
+                runtime.startup_feed_guard(
+                    mode="OBSERVE",
+                    tracked_symbols=["BTC"],
+                    max_wait_secs=1,
+                    min_updates_per_token=1,
+                    max_book_age_ms=2000,
+                    max_pstar_age_ms=3000,
+                )
+            )
+            self.assertFalse(ok)
+            self.assertEqual(str(payload.get("readiness_state")), "PARTIAL")
+            self.assertFalse(_handle_startup_guard_result(runtime.db, "OBSERVE", ok, payload))
+            runtime.trade_tape.close()
+            runtime.decision_tape.close()
+            runtime.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -163,7 +163,7 @@ def load_settings() -> Settings:
         depth_at_notional_target=float(os.getenv("DEPTH_AT_NOTIONAL_TARGET", "10")),
         reference_enabled=_parse_bool(os.getenv("REFERENCE_ENABLED"), False),
         reference_source=os.getenv("REFERENCE_SOURCE", "none"),
-        reference_poll_secs=float(os.getenv("REFERENCE_POLL_SECS", "5")),
+        reference_poll_secs=float(os.getenv("REFERENCE_POLL_SECS", "1")),
         reference_staleness_ms=int(os.getenv("REFERENCE_STALENESS_MS", "5000")),
         reference_lag_guard_ms=int(os.getenv("REFERENCE_LAG_GUARD_MS", "0")),
         reference_disagreement_bps=ref_disagree_bps,

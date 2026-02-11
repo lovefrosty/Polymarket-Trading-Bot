@@ -1,7 +1,8 @@
 import asyncio
+import os
 import unittest
 
-from config.settings import AutoDiscoverSpec, MarketConfig, load_markets, validate_markets_config
+from config.settings import AutoDiscoverSpec, MarketConfig, load_markets, load_settings, validate_markets_config
 from core.market_discovery import resolve_markets
 from pathlib import Path
 import json
@@ -9,6 +10,31 @@ import tempfile
 
 
 class TestConfigValidation(unittest.TestCase):
+    def test_reference_poll_default_is_one_second(self) -> None:
+        prior = os.environ.get("REFERENCE_POLL_SECS")
+        try:
+            if "REFERENCE_POLL_SECS" in os.environ:
+                del os.environ["REFERENCE_POLL_SECS"]
+            settings = load_settings()
+            self.assertEqual(float(settings.reference_poll_secs), 1.0)
+        finally:
+            if prior is None:
+                os.environ.pop("REFERENCE_POLL_SECS", None)
+            else:
+                os.environ["REFERENCE_POLL_SECS"] = prior
+
+    def test_reference_poll_env_override_still_wins(self) -> None:
+        prior = os.environ.get("REFERENCE_POLL_SECS")
+        try:
+            os.environ["REFERENCE_POLL_SECS"] = "2.5"
+            settings = load_settings()
+            self.assertEqual(float(settings.reference_poll_secs), 2.5)
+        finally:
+            if prior is None:
+                os.environ.pop("REFERENCE_POLL_SECS", None)
+            else:
+                os.environ["REFERENCE_POLL_SECS"] = prior
+
     def test_missing_ids_without_discovery_raises(self) -> None:
         markets = [
             MarketConfig(
