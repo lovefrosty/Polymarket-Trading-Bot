@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import math
 from pathlib import Path
 from time import perf_counter
+import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -17,6 +18,10 @@ try:
     import streamlit as st
 except ModuleNotFoundError:  # pragma: no cover
     st = None  # type: ignore[assignment]
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from core.market_time import window_start_end_ms
 from dashboard.contracts import DashboardFilters, HealthGateStatus, RefreshPolicy, TopBarMetrics

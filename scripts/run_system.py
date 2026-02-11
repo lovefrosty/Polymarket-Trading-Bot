@@ -97,6 +97,22 @@ class OpenQuote:
 
 
 @dataclass
+class ExecutionAttributionPending:
+    event_id: str
+    token_id: str
+    order_id: str
+    side: str
+    fill_ts_ms: int
+    fill_price: float
+    fill_qty: float
+    fee_bps: float
+    mid_at_send: Optional[float]
+    mid_at_ack: Optional[float]
+    mid_at_fill: Optional[float]
+    due_ts_ms: int
+
+
+@dataclass
 class RolloverHealthGate:
     abort_threshold: int = 3
     abort_window_ms: int = 10 * 60_000
@@ -290,6 +306,16 @@ class RuntimeEngine:
                 recon_cfg.get("usdc_scale", 1_000_000),
             )
         )
+        self._max_orders_per_min = int(trading_cfg.get("max_orders_per_min", 30))
+        self._max_cancels_per_min = int(trading_cfg.get("max_cancels_per_min", 60))
+        self._max_daily_loss_usdc = float(trading_cfg.get("max_daily_loss_usdc", 100.0))
+        self._max_daily_notional_usdc = float(trading_cfg.get("max_daily_notional_usdc", 2000.0))
+        self._clock_drift_max_ms = float(trading_cfg.get("clock_drift_max_ms", 250.0))
+        self._ws_starvation_max_ms = float(trading_cfg.get("ws_starvation_max_ms", 5000.0))
+        self._econ_min_net_edge_p50_bps = float(trading_cfg.get("econ_min_net_edge_p50_bps", 0.0))
+        self._econ_max_adverse_markout_5s_p95_bps = float(
+            trading_cfg.get("econ_max_adverse_markout_5s_p95_bps", 20.0)
+        )
         self._next_reconcile_due_ms: int = 0
         self._consecutive_mismatch_cycles: int = 0
         self._consecutive_onchain_disagree_cycles: int = 0
@@ -297,14 +323,35 @@ class RuntimeEngine:
         self._reconciliation_frozen: bool = False
         self._reconciliation_freeze_reason: str = ""
         self._seen_reconcile_fill_ids: Set[str] = set()
+        self._startup_unknown_order_quarantine: List[Dict[str, Any]] = []
+        self._liveness_freeze_active: bool = False
+        self._liveness_reason_codes: List[str] = []
         self._book_seq_by_token: Dict[str, int] = defaultdict(int)
         self._book_update_count_by_token: Dict[str, int] = defaultdict(int)
         self._last_book_recv_mono_by_token: Dict[str, int] = defaultdict(int)
         self._book_recv_ts_ms_by_token: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=5000))
         self._book_age_samples_by_token: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=2000))
+        self._mid_history_by_token: Dict[str, Deque[Tuple[int, float]]] = defaultdict(lambda: deque(maxlen=20000))
         self._latest_book_snapshot_by_token: Dict[str, BookSnapshot] = {}
         self._latest_pstar_by_symbol: Dict[str, PStar] = {}
         self.pstar_age_samples: Deque[float] = deque(maxlen=2000)
+        self._pending_execution_quality: Dict[str, ExecutionAttributionPending] = {}
+        self._order_submit_wall_by_order: Dict[str, int] = {}
+        self._order_submit_price_by_order: Dict[str, float] = {}
+        self._order_submit_qty_by_order: Dict[str, float] = {}
+        self._order_submit_token_by_order: Dict[str, str] = {}
+        self._first_fill_seen_by_order: Set[str] = set()
+        self._time_to_first_fill_samples_by_token: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=4000))
+        self._partial_fill_ts_by_token: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=4000))
+        self._submit_event_ts: Deque[int] = deque(maxlen=20000)
+        self._cancel_event_ts: Deque[int] = deque(maxlen=20000)
+        self._fill_event_ts: Deque[int] = deque(maxlen=20000)
+        self._submit_event_ts_by_token: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=5000))
+        self._cancel_event_ts_by_token: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=5000))
+        self._fill_event_ts_by_token: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=5000))
+        self._daily_bucket_utc: Optional[str] = None
+        self._daily_notional_usdc: float = 0.0
+        self._daily_loss_usdc: float = 0.0
         self.readiness_config = readiness_config or MarketReadinessConfig()
         self._rollover_guard_token_ids: Set[str] = set()
         self._rollover_guard_quiet_until_ms: int = 0
@@ -558,6 +605,10 @@ class RuntimeEngine:
                 depth_at_qty=depth_buy,
                 book_health_state=book_health.value,
                 reconciliation_mismatch_critical=bool(self._reconciliation_frozen and self.mode == "TRADE"),
+                risk_throttle_critical=False,
+                liveness_critical=bool(self._liveness_freeze_active),
+                unknown_order_quarantine=bool(self._startup_unknown_order_quarantine and self.mode in {"PAPER", "TRADE"}),
+                daily_loss_critical=False,
             )
             sell_ctx = PolicyContext(
                 market=str(meta.get("slug") or token_id),
@@ -578,11 +629,29 @@ class RuntimeEngine:
                 depth_at_qty=depth_sell,
                 book_health_state=book_health.value,
                 reconciliation_mismatch_critical=bool(self._reconciliation_frozen and self.mode == "TRADE"),
+                risk_throttle_critical=False,
+                liveness_critical=bool(self._liveness_freeze_active),
+                unknown_order_quarantine=bool(self._startup_unknown_order_quarantine and self.mode in {"PAPER", "TRADE"}),
+                daily_loss_critical=False,
             )
+            risk_reasons = self._risk_budget_reasons(now_ms)
+            risk_critical = bool(risk_reasons)
+            daily_loss_critical = "RISK_DAILY_LOSS_KILLSWITCH" in risk_reasons
+            if risk_critical:
+                buy_ctx = PolicyContext(
+                    **{**buy_ctx.__dict__, "risk_throttle_critical": True, "daily_loss_critical": bool(daily_loss_critical)}
+                )
+                sell_ctx = PolicyContext(
+                    **{**sell_ctx.__dict__, "risk_throttle_critical": True, "daily_loss_critical": bool(daily_loss_critical)}
+                )
             buy_verdict = evaluate_policy(buy_ctx, self.policy_thresholds)
             sell_verdict = evaluate_policy(sell_ctx, self.policy_thresholds)
 
             reasons = sorted(set(buy_verdict.reason_codes + sell_verdict.reason_codes + causality_reasons))
+            if risk_reasons:
+                reasons = sorted(set(reasons + list(risk_reasons)))
+            if self._liveness_reason_codes:
+                reasons = sorted(set(reasons + list(self._liveness_reason_codes)))
             guard_reasons = self.quote_guard_reasons(token_id=token_id, now_ms=now_ms)
             if guard_reasons:
                 reasons = sorted(set(reasons + guard_reasons))
@@ -597,6 +666,9 @@ class RuntimeEngine:
                 or bool(causality_reasons)
                 or bool(cap_diag.get("hard_breach", False))
                 or bool(self._reconciliation_frozen and self.mode == "TRADE")
+                or bool(self._liveness_freeze_active and self.mode in {"PAPER", "TRADE"})
+                or bool(self._startup_unknown_order_quarantine and self.mode in {"PAPER", "TRADE"})
+                or bool(risk_critical and self.mode in {"PAPER", "TRADE"})
             )
             if force_freeze:
                 buy_verdict = PolicyVerdict(
@@ -754,6 +826,23 @@ class RuntimeEngine:
             return
 
         if self.mode == "OBSERVE" or self.broker is None:
+            return
+
+        risk_reasons = self._risk_budget_reasons(now_ms)
+        if risk_reasons:
+            self.db.append_alert(
+                int(now_ms),
+                "critical",
+                "RISK_THROTTLE_CRITICAL",
+                f"{token_id}:{side}:{','.join(sorted(set(risk_reasons)))}",
+                payload={
+                    "risk_reasons": sorted(set(risk_reasons)),
+                    "orders_per_min": int(self._count_recent(self._submit_event_ts, now_ms)),
+                    "cancels_per_min": int(self._count_recent(self._cancel_event_ts, now_ms)),
+                    "daily_notional_usdc": float(self._daily_notional_usdc),
+                    "daily_loss_usdc": float(self._daily_loss_usdc),
+                },
+            )
             return
 
         needs_replace = current is not None and (abs(current.price - price) >= max(constraint.min_tick, 1e-6) or abs(current.qty - qty) > 1e-9)
@@ -1059,6 +1148,12 @@ class RuntimeEngine:
         if event.event_type == "order_submit":
             send_ts = int(event.payload.get("t_send_wall_ms") or ts_ms)
             self.send_ts_by_order[event.order_id] = send_ts
+            self._order_submit_wall_by_order[event.order_id] = int(send_ts)
+            self._order_submit_price_by_order[event.order_id] = float(event.payload.get("price") or 0.0)
+            self._order_submit_qty_by_order[event.order_id] = float(event.payload.get("size") or 0.0)
+            self._order_submit_token_by_order[event.order_id] = str(token_id)
+            self._submit_event_ts.append(int(ts_ms))
+            self._submit_event_ts_by_token[token_id].append(int(ts_ms))
         elif event.event_type == "order_ack":
             ack_ts = int(event.payload.get("t_ack_wall_ms") or ts_ms)
             self.ack_ts_by_order[event.order_id] = ack_ts
@@ -1079,10 +1174,14 @@ class RuntimeEngine:
                         "payload_json": "{}",
                     },
                 )
+        elif event.event_type == "order_cancel":
+            self._cancel_event_ts.append(int(ts_ms))
+            self._cancel_event_ts_by_token[token_id].append(int(ts_ms))
         elif event.event_type == "order_fill":
             fill_ts = int(event.payload.get("t_fill_wall_ms") or ts_ms)
             fill_qty = float(event.payload.get("fill_size") or 0.0)
             fill_price = float(event.payload.get("fill_price") or 0.0)
+            fee_bps = float(event.payload.get("fees_bps") or 0.0)
             fill_key = str(event.payload.get("fill_event_id") or f"{event.order_id}:{fill_ts}:{fill_qty:.8f}:{side}")
             self._seen_reconcile_fill_ids.add(fill_key)
             self.db.mark_fill_event_seen(
@@ -1108,11 +1207,38 @@ class RuntimeEngine:
                     "side": side,
                     "fill_price": fill_price,
                     "fill_qty": fill_qty,
-                    "fee": float(event.payload.get("fees_bps") or 0.0),
+                    "fee": fee_bps,
                     "liquidity": "maker" if str(event.payload.get("mode") or "").upper() == "MAKE" else "taker",
                     "payload_json": json.dumps(event.payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
                 },
             )
+            self._fill_event_ts.append(int(fill_ts))
+            self._fill_event_ts_by_token[token_id].append(int(fill_ts))
+            submit_qty = float(self._order_submit_qty_by_order.get(event.order_id, fill_qty))
+            if submit_qty > 0 and fill_qty < submit_qty - 1e-9:
+                self._partial_fill_ts_by_token[token_id].append(int(fill_ts))
+            if event.order_id not in self._first_fill_seen_by_order:
+                submit_ts = self._order_submit_wall_by_order.get(event.order_id)
+                if submit_ts is not None:
+                    time_to_first_fill_s = max(0.0, float(fill_ts - int(submit_ts)) / 1000.0)
+                    self._time_to_first_fill_samples_by_token[token_id].append(float(time_to_first_fill_s))
+                self._first_fill_seen_by_order.add(event.order_id)
+            self._queue_execution_quality(
+                token_id=token_id,
+                side=side,
+                order_id=event.order_id,
+                fill_ts_ms=fill_ts,
+                fill_price=fill_price,
+                fill_qty=fill_qty,
+                fee_bps=fee_bps,
+            )
+            fill_notional = abs(float(fill_price) * float(fill_qty))
+            self._reset_daily_counters_if_needed(fill_ts)
+            self._daily_notional_usdc += float(fill_notional)
+            mid_ref = self._mid_nearest(token_id, fill_ts)
+            signed_edge_bps = self._signed_edge_bps(side, fill_price, mid_ref)
+            if signed_edge_bps is not None and signed_edge_bps < 0:
+                self._daily_loss_usdc += abs(fill_notional * (float(signed_edge_bps) / 10_000.0))
             ack_ts = self.ack_ts_by_order.get(event.order_id)
             if ack_ts is not None:
                 ack_fill_ms = float(max(0, fill_ts - ack_ts))
@@ -1441,6 +1567,9 @@ class RuntimeEngine:
         age_ms = snap.age_ms(now_ms)
         if age_ms is not None:
             self._book_age_samples_by_token[token_id].append(float(age_ms))
+        mid = snap.mid()
+        if mid is not None:
+            self._mid_history_by_token[token_id].append((int(now_ms), float(mid)))
         self._latest_book_snapshot_by_token[token_id] = snap
         return snap
 
@@ -1529,6 +1658,271 @@ class RuntimeEngine:
                 "post_only_reject_rate": reject_rate,
             },
         )
+
+    @staticmethod
+    def _prune_recent_ts(values: Deque[int], now_ms: int, window_ms: int = 60_000) -> None:
+        cutoff = int(now_ms - int(window_ms))
+        while values and int(values[0]) < cutoff:
+            values.popleft()
+
+    @staticmethod
+    def _count_recent(values: Deque[int], now_ms: int, window_ms: int = 60_000) -> int:
+        RuntimeEngine._prune_recent_ts(values, now_ms=now_ms, window_ms=window_ms)
+        return int(len(values))
+
+    @staticmethod
+    def _signed_edge_bps(side: str, fill_price: float, ref_price: Optional[float]) -> Optional[float]:
+        if ref_price is None:
+            return None
+        if fill_price <= 0:
+            return None
+        side_norm = str(side or "").lower()
+        if side_norm == "buy":
+            return float((float(ref_price) - float(fill_price)) / float(fill_price) * 10_000.0)
+        return float((float(fill_price) - float(ref_price)) / float(fill_price) * 10_000.0)
+
+    def _mid_nearest(self, token_id: str, target_ts_ms: int) -> Optional[float]:
+        history = self._mid_history_by_token.get(token_id)
+        if not history:
+            return None
+        target = int(target_ts_ms)
+        best_mid: Optional[float] = None
+        best_dist: Optional[int] = None
+        for ts_ms, mid in history:
+            dist = abs(int(ts_ms) - target)
+            if best_dist is None or dist < best_dist or (dist == best_dist and int(ts_ms) < target):
+                best_mid = float(mid)
+                best_dist = dist
+        return best_mid
+
+    def _queue_execution_quality(
+        self,
+        *,
+        token_id: str,
+        side: str,
+        order_id: str,
+        fill_ts_ms: int,
+        fill_price: float,
+        fill_qty: float,
+        fee_bps: float,
+    ) -> None:
+        send_ts = _maybe_int(self.send_ts_by_order.get(order_id))
+        ack_ts = _maybe_int(self.ack_ts_by_order.get(order_id))
+        pending = ExecutionAttributionPending(
+            event_id=uuid.uuid4().hex,
+            token_id=str(token_id),
+            order_id=str(order_id),
+            side=str(side),
+            fill_ts_ms=int(fill_ts_ms),
+            fill_price=float(fill_price),
+            fill_qty=float(fill_qty),
+            fee_bps=float(fee_bps),
+            mid_at_send=self._mid_nearest(str(token_id), int(send_ts)) if send_ts is not None else None,
+            mid_at_ack=self._mid_nearest(str(token_id), int(ack_ts)) if ack_ts is not None else None,
+            mid_at_fill=self._mid_nearest(str(token_id), int(fill_ts_ms)),
+            due_ts_ms=int(fill_ts_ms + 30_000),
+        )
+        self._pending_execution_quality[pending.event_id] = pending
+
+    def _flush_execution_quality(self, now_ms: int) -> int:
+        due_ids = [
+            event_id
+            for event_id, pending in self._pending_execution_quality.items()
+            if int(pending.due_ts_ms) <= int(now_ms)
+        ]
+        if not due_ids:
+            return 0
+        inserted = 0
+        for event_id in sorted(
+            due_ids,
+            key=lambda item: (
+                int(self._pending_execution_quality[item].fill_ts_ms),
+                str(item),
+            ),
+        ):
+            pending = self._pending_execution_quality.pop(event_id, None)
+            if pending is None:
+                continue
+            mid_1s = self._mid_nearest(pending.token_id, int(pending.fill_ts_ms + 1_000))
+            mid_5s = self._mid_nearest(pending.token_id, int(pending.fill_ts_ms + 5_000))
+            mid_30s = self._mid_nearest(pending.token_id, int(pending.fill_ts_ms + 30_000))
+            realized_ref = pending.mid_at_ack if pending.mid_at_ack is not None else pending.mid_at_fill
+            realized_spread_bps = self._signed_edge_bps(
+                pending.side,
+                pending.fill_price,
+                realized_ref,
+            )
+            markout_1s = self._signed_edge_bps(pending.side, pending.fill_price, mid_1s)
+            markout_5s = self._signed_edge_bps(pending.side, pending.fill_price, mid_5s)
+            markout_30s = self._signed_edge_bps(pending.side, pending.fill_price, mid_30s)
+            net_edge_bps = None
+            if realized_spread_bps is not None:
+                net_edge_bps = float(realized_spread_bps - float(pending.fee_bps))
+            payload = {
+                "pending_due_ts_ms": int(pending.due_ts_ms),
+                "mid_missing": {
+                    "mid_at_send": pending.mid_at_send is None,
+                    "mid_at_ack": pending.mid_at_ack is None,
+                    "mid_at_fill": pending.mid_at_fill is None,
+                    "mid_1s": mid_1s is None,
+                    "mid_5s": mid_5s is None,
+                    "mid_30s": mid_30s is None,
+                },
+            }
+            self.db.insert(
+                "execution_quality",
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": str(pending.event_id),
+                    "run_id": self.run_id,
+                    "mode": self.mode,
+                    "token_id": pending.token_id,
+                    "order_id": pending.order_id,
+                    "side": pending.side,
+                    "fill_ts_ms": int(pending.fill_ts_ms),
+                    "fill_price": float(pending.fill_price),
+                    "fill_qty": float(pending.fill_qty),
+                    "fee_bps": float(pending.fee_bps),
+                    "mid_at_send": _maybe_float(pending.mid_at_send),
+                    "mid_at_ack": _maybe_float(pending.mid_at_ack),
+                    "mid_at_fill": _maybe_float(pending.mid_at_fill),
+                    "mid_1s": _maybe_float(mid_1s),
+                    "mid_5s": _maybe_float(mid_5s),
+                    "mid_30s": _maybe_float(mid_30s),
+                    "realized_spread_bps": _maybe_float(realized_spread_bps),
+                    "markout_1s_bps": _maybe_float(markout_1s),
+                    "markout_5s_bps": _maybe_float(markout_5s),
+                    "markout_30s_bps": _maybe_float(markout_30s),
+                    "net_edge_bps": _maybe_float(net_edge_bps),
+                    "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+                },
+            )
+            inserted += 1
+        return inserted
+
+    def _record_execution_quality_stats(self, now_ms: int) -> None:
+        rows = self.db.query(
+            """
+            SELECT token_id, realized_spread_bps, markout_1s_bps, markout_5s_bps, markout_30s_bps, net_edge_bps
+            FROM execution_quality
+            WHERE ts_ms >= ?
+            ORDER BY ts_ms
+            """,
+            [int(now_ms - 3_600_000)],
+        )
+        grouped: Dict[str, Dict[str, List[float]]] = defaultdict(
+            lambda: {
+                "realized_spread_bps": [],
+                "markout_1s_bps": [],
+                "markout_5s_bps": [],
+                "markout_30s_bps": [],
+                "net_edge_bps": [],
+            }
+        )
+        for token_id, realized, m1, m5, m30, net in rows:
+            token_key = str(token_id or "__all__")
+            for key, value in (
+                ("realized_spread_bps", realized),
+                ("markout_1s_bps", m1),
+                ("markout_5s_bps", m5),
+                ("markout_30s_bps", m30),
+                ("net_edge_bps", net),
+            ):
+                if value is None:
+                    continue
+                grouped[token_key][key].append(float(value))
+                grouped["__all__"][key].append(float(value))
+
+        for token_key in sorted(grouped.keys()):
+            series = grouped[token_key]
+            sample_count = max(len(series["net_edge_bps"]), len(series["realized_spread_bps"]))
+            self.db.insert(
+                "execution_quality_stats",
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": uuid.uuid4().hex,
+                    "token_id": str(token_key),
+                    "sample_count": int(sample_count),
+                    "p50_realized_spread_bps": _maybe_float(_quantile(series["realized_spread_bps"], 0.50)),
+                    "p95_realized_spread_bps": _maybe_float(_quantile(series["realized_spread_bps"], 0.95)),
+                    "p50_markout_1s_bps": _maybe_float(_quantile(series["markout_1s_bps"], 0.50)),
+                    "p95_markout_1s_bps": _maybe_float(_quantile(series["markout_1s_bps"], 0.95)),
+                    "p50_markout_5s_bps": _maybe_float(_quantile(series["markout_5s_bps"], 0.50)),
+                    "p95_markout_5s_bps": _maybe_float(_quantile(series["markout_5s_bps"], 0.95)),
+                    "p50_markout_30s_bps": _maybe_float(_quantile(series["markout_30s_bps"], 0.50)),
+                    "p95_markout_30s_bps": _maybe_float(_quantile(series["markout_30s_bps"], 0.95)),
+                    "p50_net_edge_bps": _maybe_float(_quantile(series["net_edge_bps"], 0.50)),
+                    "p95_net_edge_bps": _maybe_float(_quantile(series["net_edge_bps"], 0.95)),
+                },
+            )
+
+    def _record_queue_quality_stats(self, now_ms: int) -> None:
+        for token_id in sorted(self.books.keys()):
+            submits = self._submit_event_ts_by_token[token_id]
+            cancels = self._cancel_event_ts_by_token[token_id]
+            fills = self._fill_event_ts_by_token[token_id]
+            self._prune_recent_ts(submits, now_ms)
+            self._prune_recent_ts(cancels, now_ms)
+            self._prune_recent_ts(fills, now_ms)
+            fill_count = int(len(fills))
+            cancel_count = int(len(cancels))
+            submit_count = int(len(submits))
+            cancel_to_fill_ratio = float(cancel_count / fill_count) if fill_count > 0 else None
+            ttf = list(self._time_to_first_fill_samples_by_token[token_id])
+            partials = self._partial_fill_ts_by_token[token_id]
+            self._prune_recent_ts(partials, now_ms)
+            attempts = max(0, int(self._post_only_attempts_by_token.get(token_id, 0)))
+            rejects = max(0, int(self._post_only_rejects_by_token.get(token_id, 0)))
+            reject_rate = float(rejects / attempts) if attempts > 0 else 0.0
+            self.db.insert(
+                "queue_quality_stats",
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": uuid.uuid4().hex,
+                    "token_id": str(token_id),
+                    "post_only_reject_rate": reject_rate,
+                    "cancel_to_fill_ratio": _maybe_float(cancel_to_fill_ratio),
+                    "time_to_first_fill_p50_s": _maybe_float(_quantile(ttf, 0.50)),
+                    "time_to_first_fill_p95_s": _maybe_float(_quantile(ttf, 0.95)),
+                    "partial_fill_count": int(len(partials)),
+                    "orders_per_min": float(submit_count),
+                    "cancels_per_min": float(cancel_count),
+                    "fills_per_min": float(fill_count),
+                    "payload_json": json.dumps(
+                        {
+                            "submit_count": int(submit_count),
+                            "cancel_count": int(cancel_count),
+                            "fill_count": int(fill_count),
+                        },
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                },
+            )
+
+    def _reset_daily_counters_if_needed(self, now_ms: int) -> None:
+        day_bucket = datetime.fromtimestamp(int(now_ms) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+        if self._daily_bucket_utc == day_bucket:
+            return
+        self._daily_bucket_utc = day_bucket
+        self._daily_notional_usdc = 0.0
+        self._daily_loss_usdc = 0.0
+
+    def _risk_budget_reasons(self, now_ms: int) -> List[str]:
+        self._reset_daily_counters_if_needed(now_ms)
+        reasons: List[str] = []
+        orders_per_min = self._count_recent(self._submit_event_ts, now_ms)
+        cancels_per_min = self._count_recent(self._cancel_event_ts, now_ms)
+        if orders_per_min >= max(1, int(self._max_orders_per_min)):
+            reasons.append("RISK_ORDER_RATE_LIMIT")
+        if cancels_per_min >= max(1, int(self._max_cancels_per_min)):
+            reasons.append("RISK_CANCEL_RATE_LIMIT")
+        if float(self._daily_notional_usdc) >= float(max(1.0, self._max_daily_notional_usdc)):
+            reasons.append("RISK_DAILY_NOTIONAL_LIMIT")
+        if float(self._daily_loss_usdc) >= float(max(0.0, self._max_daily_loss_usdc)):
+            reasons.append("RISK_DAILY_LOSS_KILLSWITCH")
+        return sorted(set(reasons))
 
     def _causality_violations(
         self,
@@ -1657,8 +2051,14 @@ class RuntimeEngine:
     def _select_open_order_plan(
         self,
         open_orders: Dict[str, Any],
-    ) -> Tuple[Dict[Tuple[str, str, int], Dict[str, Any]], List[Dict[str, Any]]]:
+    ) -> Tuple[Dict[Tuple[str, str, int], Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         by_slot: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = defaultdict(list)
+        expected_slots = {
+            (str(token_id), side, 0)
+            for token_id in sorted(self.books.keys())
+            for side in ("buy", "sell")
+        }
+        unknown_rows: List[Dict[str, Any]] = []
         for order_id in sorted(open_orders.keys()):
             payload = open_orders.get(order_id)
             if not isinstance(payload, dict):
@@ -1666,7 +2066,11 @@ class RuntimeEngine:
             row = self._normalize_open_order_row(str(order_id), payload)
             if row is None:
                 continue
-            by_slot[self._open_order_slot_key(row)].append(row)
+            slot_key = self._open_order_slot_key(row)
+            if slot_key not in expected_slots:
+                unknown_rows.append(row)
+                continue
+            by_slot[slot_key].append(row)
 
         keepers: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
         extras: List[Dict[str, Any]] = []
@@ -1701,7 +2105,16 @@ class RuntimeEngine:
                 str(row.get("order_id") or ""),
             ),
         )
-        return keepers, extras
+        unknown_rows = sorted(
+            unknown_rows,
+            key=lambda row: (
+                str(row.get("token_id") or ""),
+                str(row.get("side") or ""),
+                int(_maybe_int(row.get("quote_slot")) or 0),
+                str(row.get("order_id") or ""),
+            ),
+        )
+        return keepers, extras, unknown_rows
 
     def _persist_open_orders_snapshot(self, now_ms: int, open_orders: Dict[str, Any]) -> None:
         if not isinstance(open_orders, dict) or not open_orders:
@@ -1737,7 +2150,7 @@ class RuntimeEngine:
         open_orders = snapshot.open_orders or {}
         if not isinstance(open_orders, dict):
             return 0
-        keepers, _ = self._select_open_order_plan(open_orders)
+        keepers, _, _ = self._select_open_order_plan(open_orders)
         adopted = 0
         for (token_id, side, _slot) in sorted(keepers.keys()):
             row = keepers[(token_id, side, _slot)]
@@ -1782,7 +2195,7 @@ class RuntimeEngine:
             "open_order_count": int(len(open_orders)),
         }
         try:
-            keepers, extras = self._select_open_order_plan(open_orders)
+            keepers, extras, unknown_rows = self._select_open_order_plan(open_orders)
         except RuntimeError as exc:
             invariant_payload["status"] = "VIOLATION"
             invariant_payload["reason"] = str(exc)
@@ -1807,6 +2220,7 @@ class RuntimeEngine:
         invariant_payload["status"] = "PASS"
         invariant_payload["slot_count"] = int(len(keepers))
         invariant_payload["duplicate_candidates"] = int(len(extras))
+        invariant_payload["unknown_order_count"] = int(len(unknown_rows))
         self.db.insert(
             "recovery_events",
             {
@@ -1825,6 +2239,54 @@ class RuntimeEngine:
             },
         )
         adopted = self.adopt_open_orders(snapshot=snapshot, now_ms=now_ms)
+        if unknown_rows and self.mode in {"PAPER", "TRADE"}:
+            self._startup_unknown_order_quarantine = [dict(row) for row in unknown_rows]
+            self._reconciliation_frozen = True
+            self._reconciliation_freeze_reason = "RECON_UNKNOWN_ORDER_QUARANTINE"
+            self.db.append_alert(
+                int(now_ms),
+                "critical",
+                "RECON_UNKNOWN_ORDER_QUARANTINE",
+                f"unknown_open_orders={len(unknown_rows)}",
+                payload={
+                    "unknown_orders": [
+                        {
+                            "token_id": str(row.get("token_id") or ""),
+                            "side": str(row.get("side") or ""),
+                            "order_id": str(row.get("order_id") or ""),
+                            "quote_slot": int(_maybe_int(row.get("quote_slot")) or 0),
+                            "price": _maybe_float(row.get("price")),
+                            "qty": _maybe_float(row.get("qty")),
+                        }
+                        for row in unknown_rows
+                    ]
+                },
+            )
+            self.db.insert(
+                "recovery_events",
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": uuid.uuid4().hex,
+                    "run_id": self.run_id,
+                    "mode": self.mode,
+                    "recovery_action": "UNKNOWN_OPEN_ORDER_QUARANTINE",
+                    "token_id": None,
+                    "side": None,
+                    "order_id": None,
+                    "price": None,
+                    "size": None,
+                    "adopted_order_count": int(adopted),
+                    "payload_json": json.dumps(
+                        {
+                            "unknown_order_count": int(len(unknown_rows)),
+                            "freeze_reason": "RECON_UNKNOWN_ORDER_QUARANTINE",
+                        },
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                },
+            )
         canceled = 0
         if extras and self.mode in {"PAPER", "TRADE"} and self.broker is not None:
             for row in extras:
@@ -1866,7 +2328,11 @@ class RuntimeEngine:
                     },
                 )
         self._persist_open_orders_snapshot(now_ms=now_ms, open_orders=open_orders)
-        return {"adopted": int(adopted), "duplicates_canceled": int(canceled)}
+        return {
+            "adopted": int(adopted),
+            "duplicates_canceled": int(canceled),
+            "unknown_quarantined": int(len(unknown_rows)),
+        }
 
     def _fair_probability(self, token_id: str, symbol: str, snap: BookSnapshot, pstar: PStar, now_ms: int) -> float:
         mid = snap.mid()
@@ -1907,7 +2373,7 @@ class RuntimeEngine:
         ask = _round_up(ask, constraint.min_tick)
         return bid, ask
 
-    async def run_stats_cycle(self, now_ms: int) -> None:
+    async def run_stats_cycle(self, now_ms: int, liveness_inputs: Optional[Dict[str, Any]] = None) -> None:
         p50_send_ack = _quantile(list(self.send_ack_samples), 0.50)
         p95_send_ack = _quantile(list(self.send_ack_samples), 0.95)
         p50_ack_fill = _quantile(list(self.ack_fill_samples), 0.50)
@@ -1958,6 +2424,93 @@ class RuntimeEngine:
                     "ws_recv_rate_msgs_min": float(len(recv_q)),
                 },
             )
+        corrected_execution_rows = self._flush_execution_quality(now_ms)
+        self._record_execution_quality_stats(now_ms)
+        self._record_queue_quality_stats(now_ms)
+        inputs = dict(liveness_inputs or {})
+        clock_drift_ms = _maybe_float(inputs.get("clock_drift_ms"))
+        sequence_gap_rate_per_min = _maybe_float(inputs.get("sequence_gap_rate_per_min"))
+        sequence_gap_count_1m = _maybe_int(inputs.get("sequence_gap_count_1m"))
+        active_market_lag_ms = _maybe_float(inputs.get("active_market_lag_ms"))
+        starved_tokens: List[str] = []
+        starvation_by_token: Dict[str, Optional[float]] = {}
+        max_ws_starvation_ms = 0.0
+        for token_id in sorted(self.books.keys()):
+            snap = self._latest_book_snapshot_by_token.get(token_id)
+            recv_ts_ms = _maybe_int(snap.book_recv_ts_ms) if snap is not None else None
+            starvation_ms = None
+            if recv_ts_ms is not None:
+                starvation_ms = max(0.0, float(now_ms - int(recv_ts_ms)))
+            if starvation_ms is None:
+                starvation_by_token[token_id] = None
+                starved_tokens.append(token_id)
+                continue
+            starvation_by_token[token_id] = float(starvation_ms)
+            max_ws_starvation_ms = max(float(max_ws_starvation_ms), float(starvation_ms))
+            if float(starvation_ms) > float(self._ws_starvation_max_ms):
+                starved_tokens.append(token_id)
+
+        liveness_reasons: List[str] = []
+        if clock_drift_ms is not None and float(clock_drift_ms) > float(self._clock_drift_max_ms):
+            liveness_reasons.append("E_CLOCK_DRIFT_HIGH")
+        if starved_tokens:
+            liveness_reasons.append("E_WS_STARVATION")
+        if sequence_gap_rate_per_min is not None and float(sequence_gap_rate_per_min) > 0.0:
+            liveness_reasons.append("E_WS_SEQUENCE_GAP")
+        if active_market_lag_ms is not None and float(active_market_lag_ms) > float(self._ws_starvation_max_ms):
+            liveness_reasons.append("E_ACTIVE_MARKET_LAG_HIGH")
+        prev_liveness_frozen = bool(self._liveness_freeze_active)
+        self._liveness_freeze_active = bool(
+            ("E_CLOCK_DRIFT_HIGH" in liveness_reasons) or ("E_WS_STARVATION" in liveness_reasons)
+        )
+        self._liveness_reason_codes = sorted(set(liveness_reasons))
+        if self._liveness_freeze_active and not prev_liveness_frozen:
+            self.db.append_alert(
+                int(now_ms),
+                "critical",
+                "LIVENESS_FROZEN_EDGE",
+                f"liveness_freeze_reasons={','.join(self._liveness_reason_codes)}",
+                payload={
+                    "clock_drift_ms": _maybe_float(clock_drift_ms),
+                    "starved_tokens": list(starved_tokens),
+                    "sequence_gap_rate_per_min": _maybe_float(sequence_gap_rate_per_min),
+                    "active_market_lag_ms": _maybe_float(active_market_lag_ms),
+                },
+            )
+        elif (not self._liveness_freeze_active) and prev_liveness_frozen:
+            self.db.append_alert(
+                int(now_ms),
+                "info",
+                "LIVENESS_UNFROZEN_EDGE",
+                "liveness_freeze_cleared",
+                payload={},
+            )
+        self.db.insert(
+            "liveness_stats",
+            {
+                "ts_ms": int(now_ms),
+                "event_id": uuid.uuid4().hex,
+                "mode": self.mode,
+                "clock_drift_ms": _maybe_float(clock_drift_ms),
+                "sequence_gap_rate_per_min": _maybe_float(sequence_gap_rate_per_min),
+                "sequence_gap_count_1m": _maybe_int(sequence_gap_count_1m),
+                "ws_starvation_token_count": int(len(starved_tokens)),
+                "max_ws_starvation_ms": float(max_ws_starvation_ms),
+                "active_market_lag_ms": _maybe_float(active_market_lag_ms),
+                "freeze_state": 1 if self._liveness_freeze_active else 0,
+                "reason_codes": ",".join(self._liveness_reason_codes),
+                "payload_json": json.dumps(
+                    {
+                        "starved_tokens": starved_tokens,
+                        "starvation_by_token_ms": starvation_by_token,
+                        "corrected_execution_rows": int(corrected_execution_rows),
+                    },
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            },
+        )
         retention_cutoff_ms = int(now_ms - (7 * 24 * 60 * 60 * 1000))
         self.db.execute("DELETE FROM decision_ticks WHERE ts_ms < ?", [retention_cutoff_ms])
         if self._next_reconcile_due_ms <= 0 or int(now_ms) >= int(self._next_reconcile_due_ms):
@@ -2276,6 +2829,17 @@ class RuntimeEngine:
                 "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
             },
         )
+        self._fill_event_ts.append(int(fill_ts))
+        self._fill_event_ts_by_token[str(token_id)].append(int(fill_ts))
+        self._queue_execution_quality(
+            token_id=str(token_id),
+            side=str(side),
+            order_id=str(order_id),
+            fill_ts_ms=int(fill_ts),
+            fill_price=float(fill_price),
+            fill_qty=float(fill_qty),
+            fee_bps=float(_maybe_float(payload.get("fees_bps")) or 0.0),
+        )
         self.db.insert(
             "recovery_events",
             {
@@ -2482,6 +3046,23 @@ class RuntimeEngine:
             for token_quotes in self.open_quotes.values()
             for quote in token_quotes.values()
         }
+        unresolved_unknown_ids: List[str] = []
+        if self._startup_unknown_order_quarantine:
+            unknown_ids = {
+                str(row.get("order_id") or "")
+                for row in self._startup_unknown_order_quarantine
+                if str(row.get("order_id") or "")
+            }
+            unresolved_unknown_ids = sorted(unknown_ids.intersection(broker_ids))
+            if not unresolved_unknown_ids:
+                self._startup_unknown_order_quarantine = []
+                self.db.append_alert(
+                    int(now_ms),
+                    "info",
+                    "RECON_UNKNOWN_ORDER_QUARANTINE_CLEARED",
+                    "startup_unknown_orders_resolved",
+                    payload={},
+                )
         only_local = sorted(local_ids - broker_ids)
         only_broker = sorted(broker_ids - local_ids)
 
@@ -2668,6 +3249,8 @@ class RuntimeEngine:
             "only_broker": only_broker,
             "meta": meta,
             "corrected_missed_fills": int(corrected_missed_fills),
+            "startup_unknown_quarantine_count": int(len(self._startup_unknown_order_quarantine)),
+            "startup_unknown_unresolved_order_ids": unresolved_unknown_ids,
             "reconciliation_freeze_reason": str(self._reconciliation_freeze_reason or freeze_reason),
             "freeze_triggered": bool(freeze_triggered),
             "unfreeze_triggered": bool(unfreeze_triggered),
@@ -3221,6 +3804,7 @@ async def _run() -> None:
             {
                 "adopted_order_count": int(recovery_diag.get("adopted", 0)),
                 "duplicates_canceled": int(recovery_diag.get("duplicates_canceled", 0)),
+                "unknown_quarantined": int(recovery_diag.get("unknown_quarantined", 0)),
                 "open_order_count": int(len(snapshot.open_orders or {})),
             },
         )
@@ -3356,8 +3940,21 @@ async def _run() -> None:
         last_unknown_alert_ms: int = 0
         while not stop_event.is_set():
             now_ms = int(time_mapper.wall_ms(time.monotonic_ns()))
+            wall_now_ms = _now_ms()
+            active_recv_wall_ms = market_client.active_last_book_recv_wall_ms()
+            active_market_lag_ms = (
+                float(max(0, now_ms - int(active_recv_wall_ms)))
+                if active_recv_wall_ms is not None
+                else None
+            )
+            liveness_inputs = {
+                "clock_drift_ms": float(abs(int(wall_now_ms) - int(now_ms))),
+                "sequence_gap_rate_per_min": float(metrics.sequence_gap_rate_per_min(now_ms)),
+                "sequence_gap_count_1m": int(metrics.sequence_gap_count(now_ms)),
+                "active_market_lag_ms": _maybe_float(active_market_lag_ms),
+            }
             async with runtime_lock:
-                await runtime.run_stats_cycle(now_ms)
+                await runtime.run_stats_cycle(now_ms, liveness_inputs=liveness_inputs)
                 guard_state = runtime.rollover_guard_status(now_ms)
             unknown_count = metrics.market_unknown_count()
             unknown_rate = metrics.market_unknown_rate_per_min(now_ms)

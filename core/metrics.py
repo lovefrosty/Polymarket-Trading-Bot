@@ -44,6 +44,8 @@ class Metrics:
         self._out_of_order = Counter()
         self._market_unknown_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
         self._market_ignored_old_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
+        self._sequence_gap_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
+        self._sequence_out_of_order_recv_ts_ms: Deque[int] = deque(maxlen=20_000)
 
     def record_reconnect(self, channel: str) -> None:
         self._reconnects[channel] += 1
@@ -87,6 +89,27 @@ class Metrics:
         now_ms = int(now_wall_ms)
         self._prune_recent(self._market_ignored_old_recv_ts_ms, now_ms)
         return float(len(self._market_ignored_old_recv_ts_ms))
+
+    def record_sequence_warning(self, warning_code: str, recv_wall_ms: int) -> None:
+        code = str(warning_code or "").lower()
+        ts_ms = int(recv_wall_ms)
+        if code == "sequence_gap":
+            self._sequence_gap_recv_ts_ms.append(ts_ms)
+        elif code == "sequence_out_of_order":
+            self._sequence_out_of_order_recv_ts_ms.append(ts_ms)
+
+    def sequence_gap_count(self, now_wall_ms: int) -> int:
+        now_ms = int(now_wall_ms)
+        self._prune_recent(self._sequence_gap_recv_ts_ms, now_ms)
+        return int(len(self._sequence_gap_recv_ts_ms))
+
+    def sequence_gap_rate_per_min(self, now_wall_ms: int) -> float:
+        return float(self.sequence_gap_count(now_wall_ms))
+
+    def sequence_out_of_order_count(self, now_wall_ms: int) -> int:
+        now_ms = int(now_wall_ms)
+        self._prune_recent(self._sequence_out_of_order_recv_ts_ms, now_ms)
+        return int(len(self._sequence_out_of_order_recv_ts_ms))
 
     def total_messages_by_sub_state(self, channel: str, sub_state: str) -> int:
         key = f"{str(channel)}:{str(sub_state)}"

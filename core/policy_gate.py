@@ -41,6 +41,10 @@ class PolicyContext:
     depth_at_qty: Optional[float]
     book_health_state: Optional[str] = None
     reconciliation_mismatch_critical: bool = False
+    risk_throttle_critical: bool = False
+    liveness_critical: bool = False
+    unknown_order_quarantine: bool = False
+    daily_loss_critical: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,13 +138,32 @@ def evaluate_policy(ctx: PolicyContext, thresholds: PolicyThresholds) -> PolicyV
     if bool(ctx.reconciliation_mismatch_critical):
         reasons.append("RECONCILIATION_MISMATCH_CRITICAL")
         diagnostics["reconciliation_mismatch_critical"] = True
+    if bool(ctx.risk_throttle_critical):
+        reasons.append("RISK_THROTTLE_CRITICAL")
+        diagnostics["risk_throttle_critical"] = True
+    if bool(ctx.daily_loss_critical):
+        reasons.append("RISK_DAILY_LOSS_KILLSWITCH")
+        diagnostics["daily_loss_critical"] = True
+    if bool(ctx.liveness_critical):
+        reasons.append("E_LIVENESS_CRITICAL")
+        diagnostics["liveness_critical"] = True
+    if bool(ctx.unknown_order_quarantine):
+        reasons.append("RECON_UNKNOWN_ORDER_QUARANTINE")
+        diagnostics["unknown_order_quarantine"] = True
 
     if reasons:
         critical = any(
             code.startswith("A_")
             or code.startswith("B_")
             or code in {"D_HEDGE_TIMEOUT", "C_BOOK_DOWN"}
-            or code == "RECONCILIATION_MISMATCH_CRITICAL"
+            or code
+            in {
+                "RECONCILIATION_MISMATCH_CRITICAL",
+                "RISK_THROTTLE_CRITICAL",
+                "RISK_DAILY_LOSS_KILLSWITCH",
+                "E_LIVENESS_CRITICAL",
+                "RECON_UNKNOWN_ORDER_QUARANTINE",
+            }
             for code in reasons
         )
         return PolicyVerdict(

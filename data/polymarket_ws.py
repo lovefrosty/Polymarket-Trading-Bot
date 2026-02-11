@@ -444,6 +444,7 @@ class MarketWSClient:
         if should_track_sequence:
             seq_warning = self._check_sequence(msg, update_state=True)
             if seq_warning:
+                self.metrics.record_sequence_warning(seq_warning, recv_wall_ms)
                 parse_warnings.append(seq_warning)
 
         sub_state = _market_sub_state(phases_seen)
@@ -669,6 +670,7 @@ class UserWSClient:
 
         seq_warning = self._check_sequence(msg)
         if seq_warning:
+            self.metrics.record_sequence_warning(seq_warning, recv_wall_ms)
             parse_warnings.append(seq_warning)
         out_of_order = False
 

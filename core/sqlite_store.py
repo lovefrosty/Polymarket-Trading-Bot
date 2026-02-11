@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import threading
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import weakref
 
 
 _SCHEMA = [
@@ -105,6 +106,83 @@ _SCHEMA = [
         send_ack_ms REAL,
         ack_fill_ms REAL,
         ws_lag_ms REAL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS execution_quality (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        mode TEXT,
+        token_id TEXT NOT NULL,
+        order_id TEXT NOT NULL,
+        side TEXT NOT NULL,
+        fill_ts_ms INTEGER NOT NULL,
+        fill_price REAL NOT NULL,
+        fill_qty REAL NOT NULL,
+        fee_bps REAL,
+        mid_at_send REAL,
+        mid_at_ack REAL,
+        mid_at_fill REAL,
+        mid_1s REAL,
+        mid_5s REAL,
+        mid_30s REAL,
+        realized_spread_bps REAL,
+        markout_1s_bps REAL,
+        markout_5s_bps REAL,
+        markout_30s_bps REAL,
+        net_edge_bps REAL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS execution_quality_stats (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        token_id TEXT NOT NULL,
+        sample_count INTEGER NOT NULL,
+        p50_realized_spread_bps REAL,
+        p95_realized_spread_bps REAL,
+        p50_markout_1s_bps REAL,
+        p95_markout_1s_bps REAL,
+        p50_markout_5s_bps REAL,
+        p95_markout_5s_bps REAL,
+        p50_markout_30s_bps REAL,
+        p95_markout_30s_bps REAL,
+        p50_net_edge_bps REAL,
+        p95_net_edge_bps REAL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS queue_quality_stats (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        token_id TEXT NOT NULL,
+        post_only_reject_rate REAL,
+        cancel_to_fill_ratio REAL,
+        time_to_first_fill_p50_s REAL,
+        time_to_first_fill_p95_s REAL,
+        partial_fill_count INTEGER,
+        orders_per_min REAL,
+        cancels_per_min REAL,
+        fills_per_min REAL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS liveness_stats (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL,
+        clock_drift_ms REAL,
+        sequence_gap_rate_per_min REAL,
+        sequence_gap_count_1m INTEGER,
+        ws_starvation_token_count INTEGER,
+        max_ws_starvation_ms REAL,
+        active_market_lag_ms REAL,
+        freeze_state INTEGER,
+        reason_codes TEXT NOT NULL,
         payload_json TEXT NOT NULL
     )
     """,
@@ -366,12 +444,39 @@ class SQLiteStore:
         self._cx.execute("PRAGMA journal_mode=WAL")
         self._cx.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()
+        self._closed = False
+        self._finalizer = weakref.finalize(self, SQLiteStore._close_connection, self._cx)
         self._init_schema()
 
     def close(self) -> None:
         with self._lock:
-            self._cx.commit()
-            self._cx.close()
+            if self._closed:
+                return
+            self._finalizer()
+            self._closed = True
+
+    def __enter__(self) -> "SQLiteStore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _close_connection(cx: sqlite3.Connection) -> None:
+        try:
+            cx.commit()
+        except Exception:
+            pass
+        try:
+            cx.close()
+        except Exception:
+            pass
 
     def insert(self, table: str, row: Dict[str, Any]) -> None:
         keys = sorted(row.keys())
@@ -768,6 +873,18 @@ class SQLiteStore:
             )
             self._cx.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rollover_metrics_name_ts ON rollover_metrics(metric_name, ts_ms)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_execution_quality_ts_token ON execution_quality(ts_ms, token_id)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_execution_quality_stats_ts_token ON execution_quality_stats(ts_ms, token_id)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_queue_quality_stats_ts_token ON queue_quality_stats(ts_ms, token_id)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_liveness_stats_ts ON liveness_stats(ts_ms)"
             )
             self._cx.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rollover_status_ts ON rollover_status(ts_ms)"
