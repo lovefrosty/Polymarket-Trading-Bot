@@ -14,6 +14,7 @@ from core.order_book import OrderBook
 from core.replay import ReplayRunner
 from core.reference_store import ReferenceStore
 from core.validators import OrderConstraints
+from scripts.walkforward_report import generate_report, write_report
 
 
 def main() -> None:
@@ -79,6 +80,8 @@ def main() -> None:
             "lag_guard_ms": settings.reference_lag_guard_ms,
             "disagreement_bps": settings.reference_disagreement_bps,
             "min_confidence": settings.reference_min_confidence,
+            "allow_partial": settings.reference_allow_partial,
+            "partial_confidence": settings.reference_partial_confidence,
             "allowed_symbols": {market.reference_symbol for market in resolved_markets},
             "hl_vol_sec": settings.hl_vol_sec,
         },
@@ -105,6 +108,21 @@ def main() -> None:
     )
     runner.run(_resolve_inputs(args.inputs))
     decision_tape.close()
+    if args.walkforward:
+        decision_paths = sorted(Path(log_dir).glob("decision_*.jsonl"))
+        reference_paths = sorted(Path(log_dir).glob("reference_*.jsonl"))
+        report = generate_report(
+            decision_paths=decision_paths,
+            reference_paths=reference_paths,
+            train_days=args.walkforward_train_days,
+            test_days=args.walkforward_test_days,
+            step_days=args.walkforward_step_days,
+            fee_bps_shift=args.walkforward_fee_bps_shift,
+            slippage_bps_shift=args.walkforward_slippage_bps_shift,
+            latency_threshold_ms=args.walkforward_latency_threshold_ms,
+            latency_shift_ms=args.walkforward_latency_shift_ms,
+        )
+        write_report(report, Path(args.walkforward_out or log_dir))
 
 
 def _resolve_inputs(inputs: list[str]) -> list[str]:
@@ -129,6 +147,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--resolved-markets", default=None, help="Path to resolved_markets JSON")
     parser.add_argument("--no_network", action="store_true", help="Require resolved artifact; forbid Gamma")
     parser.add_argument("--model", default=None, help="Path to trained model artifact JSON")
+    parser.add_argument("--walkforward", action="store_true", help="Generate walk-forward report after replay")
+    parser.add_argument("--walkforward-out", default=None, help="Output directory for walk-forward report")
+    parser.add_argument("--walkforward-train-days", type=int, default=7)
+    parser.add_argument("--walkforward-test-days", type=int, default=1)
+    parser.add_argument("--walkforward-step-days", type=int, default=1)
+    parser.add_argument("--walkforward-fee-bps-shift", type=float, default=0.0)
+    parser.add_argument("--walkforward-slippage-bps-shift", type=float, default=0.0)
+    parser.add_argument("--walkforward-latency-threshold-ms", type=int, default=2000)
+    parser.add_argument("--walkforward-latency-shift-ms", type=int, default=0)
     return parser.parse_args()
 
 

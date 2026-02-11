@@ -48,6 +48,10 @@ class ExecutionRunner:
             return
         self._decision_seq += 1
         for idx, intent in enumerate(intents):
+            intent_type = str(intent.get("intent_type") or "order")
+            if intent_type == "quote":
+                self._handle_quote_intent(record, idx, intent)
+                continue
             order_id = self._order_id(record, idx)
             client_order_id = f"{order_id}:client"
             intent_event_id = self._trade_tape.next_event_id()
@@ -70,6 +74,10 @@ class ExecutionRunner:
                 "as_of_ts_ms": int(intent.get("as_of_ts_ms") or record.t_decision_wall_ms),
                 "decision_id": intent.get("decision_id"),
                 "reason": intent.get("reason"),
+                "post_only": bool(intent.get("post_only", False)),
+                "time_in_force": str(intent.get("time_in_force") or "GTC"),
+                "reduce_only": bool(intent.get("reduce_only", False)),
+                "quote_group_id": intent.get("quote_group_id"),
             }
             self._trade_tape.write(intent_payload)
 
@@ -115,10 +123,95 @@ class ExecutionRunner:
                 as_of_ts_ms=int(intent.get("as_of_ts_ms") or record.t_decision_wall_ms),
                 decision_id=intent.get("decision_id"),
                 reason=intent.get("reason"),
+                post_only=bool(intent.get("post_only", False)),
+                time_in_force=str(intent.get("time_in_force") or "GTC"),
+                reduce_only=bool(intent.get("reduce_only", False)),
+                quote_group_id=intent.get("quote_group_id"),
+                idempotency_key=intent.get("idempotency_key"),
             )
             events = self._broker.submit(broker_intent)
             for event in events:
                 self._emit_broker_event(event, intent_event_id, broker_intent.as_of_ts_ms)
+
+    def _handle_quote_intent(self, record: DecisionRecord, intent_idx: int, intent: Dict[str, Any]) -> None:
+        order_id = str(intent.get("order_id") or self._order_id(record, intent_idx))
+        client_order_id = str(intent.get("client_order_id") or f"{order_id}:client")
+        action = str(intent.get("action") or "submit").lower()
+        as_of_ts = int(intent.get("as_of_ts_ms") or record.t_decision_wall_ms)
+
+        intent_event_id = self._trade_tape.next_event_id()
+        self._trade_tape.write(
+            {
+                "schema_version": "trade_v1",
+                "run_id": record.run_id,
+                "event_id": intent_event_id,
+                "parent_event_id": None,
+                "event_type": "order_intent",
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "asset_id": intent.get("asset_id"),
+                "side": intent.get("side"),
+                "size": intent.get("size"),
+                "price": intent.get("price"),
+                "mode": intent.get("mode"),
+                "t_decision_wall_ms": record.t_decision_wall_ms,
+                "t_event_wall_ms": as_of_ts,
+                "t_event_mono_ns": int(self._time_mapper.mono_ns_from_wall_ms(as_of_ts)),
+                "as_of_ts_ms": as_of_ts,
+                "decision_id": intent.get("decision_id"),
+                "reason": intent.get("reason"),
+                "quote_group_id": intent.get("quote_group_id"),
+                "quote_action": action,
+                "post_only": bool(intent.get("post_only", False)),
+                "time_in_force": str(intent.get("time_in_force") or "GTC"),
+                "reduce_only": bool(intent.get("reduce_only", False)),
+            }
+        )
+
+        if not self._enable_trading:
+            return
+        if self._broker is None:
+            return
+
+        if action == "cancel":
+            events = self._broker.cancel(order_id)
+            for event in events:
+                self._emit_broker_event(event, intent_event_id, as_of_ts)
+            return
+
+        try:
+            size = float(intent.get("size"))
+            price = float(intent.get("price"))
+        except (TypeError, ValueError):
+            self._emit_reject(order_id, intent_event_id, ["INVALID_INTENT"], "INVALID_INTENT", as_of_ts)
+            return
+
+        broker_intent = OrderIntent(
+            order_id=order_id,
+            client_order_id=client_order_id,
+            asset_id=str(intent.get("asset_id")),
+            side=str(intent.get("side")),
+            size=size,
+            price=price,
+            mode=str(intent.get("mode") or "MAKE"),
+            t_decision_wall_ms=record.t_decision_wall_ms,
+            as_of_ts_ms=as_of_ts,
+            decision_id=intent.get("decision_id"),
+            reason=intent.get("reason"),
+            post_only=bool(intent.get("post_only", True)),
+            time_in_force=str(intent.get("time_in_force") or "GTC"),
+            reduce_only=bool(intent.get("reduce_only", False)),
+            quote_group_id=intent.get("quote_group_id"),
+            idempotency_key=intent.get("idempotency_key"),
+        )
+
+        if action == "replace":
+            replace_target = str(intent.get("replace_order_id") or order_id)
+            events = self._broker.replace(replace_target, broker_intent)
+        else:
+            events = self._broker.submit(broker_intent)
+        for event in events:
+            self._emit_broker_event(event, intent_event_id, broker_intent.as_of_ts_ms)
 
     def _order_id(self, record: DecisionRecord, intent_idx: int) -> str:
         return f"{record.run_id}:{self._decision_seq}:{record.asset_id}:{intent_idx}"

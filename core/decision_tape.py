@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import threading
 
 
@@ -38,6 +38,11 @@ class DecisionRecord:
     gates: Dict[str, Any]
     exec_cost: Dict[str, Any]
     notes: Dict[str, Any]
+    as_of_ts_ms: Optional[int] = None
+    pstar_diag: Optional[Dict[str, Any]] = None
+    policy_codes: Optional[List[str]] = None
+    latency: Optional[Dict[str, Any]] = None
+    fsm_state: Optional[str] = None
 
 
 class DecisionTape:

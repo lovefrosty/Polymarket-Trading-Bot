@@ -91,6 +91,8 @@ class ReplayRunner:
             staleness_ms=int(self._reference_settings.get("staleness_ms", 5000)),
             disagreement_bps=float(self._reference_settings.get("disagreement_bps", 50.0)),
             min_confidence=float(self._reference_settings.get("min_confidence", 0.5)),
+            allow_partial=bool(self._reference_settings.get("allow_partial", False)),
+            partial_confidence=float(self._reference_settings.get("partial_confidence", 0.6)),
             disagreement_bps_soft=float(
                 self._reference_settings.get("disagreement_bps_soft", self._reference_settings.get("disagreement_bps", 50.0))
             ),

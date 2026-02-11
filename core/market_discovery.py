@@ -295,7 +295,8 @@ async def discover_15m_crypto_by_slug(
     markets = _filter_markets_by_slugs(markets or [], all_slugs)
     summary["gamma_markets_found"] = len(markets)
 
-    clob_candidates = clob_candidates or await list_clob_candidates_async()
+    if clob_candidates is None:
+        clob_candidates = await list_clob_candidates_async()
     summary["clob_candidates"] = len(clob_candidates)
     clob_by_condition = {candidate.condition_id: candidate for candidate in clob_candidates}
 

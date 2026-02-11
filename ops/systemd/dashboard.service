@@ -1,0 +1,16 @@
+[Unit]
+Description=Polymarket V1 Dashboard
+After=network-online.target trader.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/Users/padraigjudge/Desktop/Polymarket Bot
+Environment=RUNTIME_DB_PATH=/Users/padraigjudge/Desktop/Polymarket Bot/runtime.db
+ExecStart=/Users/padraigjudge/Desktop/Polymarket Bot/.venv/bin/python3 -m scripts.run_dashboard --db-path ${RUNTIME_DB_PATH} --host 0.0.0.0 --port 8501
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

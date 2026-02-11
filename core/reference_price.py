@@ -61,6 +61,8 @@ class ReferencePriceAggregator:
         staleness_ms: int,
         disagreement_bps: float,
         min_confidence: float,
+        allow_partial: bool = False,
+        partial_confidence: float = 0.6,
         disagreement_bps_soft: Optional[float] = None,
         disagreement_bps_hard: Optional[float] = None,
         disagreement_decay_k: float = 1.0,
@@ -70,6 +72,8 @@ class ReferencePriceAggregator:
         self.staleness_ms = staleness_ms
         self.disagreement_bps = disagreement_bps
         self.min_confidence = min_confidence
+        self.allow_partial = allow_partial
+        self.partial_confidence = partial_confidence
         self.disagreement_bps_soft = (
             disagreement_bps_soft if disagreement_bps_soft is not None else disagreement_bps
         )
@@ -121,16 +125,59 @@ class ReferencePriceAggregator:
         missing_sources = [source for source in self.required_sources if source not in quotes]
         if missing_sources:
             reasons = [f"missing_source:{name}" for name in sorted(missing_sources)]
+            if not self.allow_partial:
+                return ReferencePriceResult(
+                    None,
+                    "missing_source",
+                    reasons,
+                    warnings,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            available = {source: quotes[source] for source in self.required_sources if source in quotes}
+            if not available:
+                return ReferencePriceResult(
+                    None,
+                    "missing_source",
+                    reasons,
+                    warnings,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            values = [quote.value for quote in available.values()]
+            avg = sum(values) / float(len(values))
+            ts_event_ms = _max_event_ts(list(available.values()))
+            recv_mono_ns = max(q.t_recv_mono_ns for q in available.values())
+            asof_wall = {
+                source: _asof_wall_ms(quote, as_of_mono_ns, decision_wall_ms) or 0
+                for source, quote in available.items()
+            }
+            max_stale = 0
+            if decision_wall_ms is not None:
+                max_stale = max(
+                    int(decision_wall_ms - wall_ms)
+                    for wall_ms in asof_wall.values()
+                    if wall_ms is not None
+                )
+            c_stale = _staleness_multiplier(max_stale, self.staleness_ms)
+            c_ref = max(0.0, min(1.0, self.partial_confidence * c_stale))
             return ReferencePriceResult(
-                None,
-                "missing_source",
+                ValidatedPrice(avg, ts_event_ms, recv_mono_ns, _max_wall_ms(asof_wall), sorted(available.keys()), c_ref),
+                "partial",
                 reasons,
                 warnings,
+                _max_wall_ms(asof_wall),
                 None,
                 None,
                 None,
                 None,
-                None,
+                c_ref=c_ref,
             )
 
         selected: Dict[str, ReferenceQuote] = {}

@@ -38,10 +38,23 @@ Enable reference feeds (spot polling) for reference events:
 REFERENCE_ENABLED=true python3 -m scripts.run_readonly --auto_discover
 ```
 
-Override reference source (polling, read-only):
+Override reference source (polling or WS):
 
 ```bash
 python3 -m scripts.run_readonly --reference_source poll_coinbase
+```
+
+Multiple sources (comma-separated) for fallback:
+
+```bash
+python3 -m scripts.run_readonly --reference_source ws_kraken,poll_coinbase
+```
+
+Reference fallback controls (partial reference confidence):
+
+```bash
+REFERENCE_ALLOW_PARTIAL=true
+REFERENCE_PARTIAL_CONFIDENCE=0.6
 ```
 
 Ingest existing reference tapes (offline):
@@ -135,6 +148,12 @@ Resolved markets artifact (canonical):
 
 Replay consumes `market_*.jsonl`, `reference_*.jsonl`, and `onchain_*.jsonl` from a directory for deterministic reproduction.
 
+Generate a walk-forward report after replay:
+
+```bash
+python3 -m scripts.replay_runner ./logs --walkforward --walkforward-out ./logs
+```
+
 ## Audit Report (Offline)
 
 ```bash
@@ -153,6 +172,19 @@ Outputs JSONL datasets under `./artifacts`:
 - `ref_window_BTC.jsonl` (reference-window features + labels)
 - `micro_decisions.jsonl` (microstructure features aligned to labels)
 - `dataset_manifest.json` (inputs, counts, schema_version)
+
+Additional exports (CSV + Parquet) are written into partitioned directories under `./artifacts`:
+
+- `ref_window_csv/` and `ref_window_parquet/`
+- `micro_decisions_csv/` and `micro_decisions_parquet/`
+
+Parquet export requires `pyarrow` (see `requirements.txt`).
+
+## Walk-forward Report (Offline)
+
+```bash
+python3 -m scripts.walkforward_report --logs ./logs --out ./logs
+```
 
 ## Train Ridge-Logistic Baseline (Offline)
 

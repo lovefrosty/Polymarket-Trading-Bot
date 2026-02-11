@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 import ssl
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import websockets
@@ -18,6 +18,8 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     certifi = None
 
 from core.event_tape import EventTape
+from core.reference_price import ReferenceQuote, parse_reference_event
+from core.reference_store import ReferenceStore
 
 
 KRAKEN_WS_URL = "wss://ws.kraken.com"
@@ -37,9 +39,13 @@ class ReferenceWSClient:
         self,
         tape: EventTape,
         config: ReferenceWSConfig,
+        on_quote: Optional[Callable[[ReferenceQuote], None]] = None,
+        reference_store: Optional[ReferenceStore] = None,
     ) -> None:
         self.tape = tape
         self.config = config
+        self._on_quote = on_quote
+        self._reference_store = reference_store
         self._stop_event = asyncio.Event()
         self._last_recv_mono_ns: Dict[str, int] = {}
 
@@ -133,19 +139,45 @@ class ReferenceWSClient:
             "raw_payload": raw_payload,
         }
 
+        record = {
+            "channel": "reference",
+            "event_type": "reference_tick",
+            "market": symbol,
+            "asset_id": None,
+            "t_event_ms": t_event_ms,
+            "t_recv_wall_ms": recv_wall_ms,
+            "t_recv_wall_iso": recv_wall_iso,
+            "t_recv_mono_ns": recv_mono_ns,
+            "raw": raw,
+            "parse_warnings": parse_warnings,
+            "out_of_order": out_of_order,
+        }
         self.tape.write(
-            channel="reference",
-            event_type="reference_tick",
-            market=symbol,
-            asset_id=None,
-            t_event_ms=t_event_ms,
-            raw=raw,
-            parse_warnings=parse_warnings,
-            out_of_order=out_of_order,
-            t_recv_wall_iso=recv_wall_iso,
-            t_recv_wall_ms=recv_wall_ms,
-            t_recv_mono_ns=recv_mono_ns,
+            channel=record["channel"],
+            event_type=record["event_type"],
+            market=record["market"],
+            asset_id=record["asset_id"],
+            t_event_ms=record["t_event_ms"],
+            raw=record["raw"],
+            parse_warnings=record["parse_warnings"],
+            out_of_order=record["out_of_order"],
+            t_recv_wall_iso=record["t_recv_wall_iso"],
+            t_recv_wall_ms=record["t_recv_wall_ms"],
+            t_recv_mono_ns=record["t_recv_mono_ns"],
         )
+
+        if self._reference_store is not None:
+            self._reference_store.ingest_record(record)
+
+        if self._on_quote is not None:
+            quote = parse_reference_event(
+                record.get("raw"),
+                record.get("t_recv_mono_ns"),
+                record.get("t_recv_wall_iso"),
+                record.get("t_recv_wall_ms"),
+            )
+            if quote is not None:
+                self._on_quote(quote)
 
 
 def _parse_kraken_message(msg: Any) -> List[Dict[str, Any]]:

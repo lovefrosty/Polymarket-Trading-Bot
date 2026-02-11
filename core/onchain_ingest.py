@@ -269,16 +269,13 @@ class OnchainIngestor:
                     },
                 )
             for event_name, event in contracts:
-                try:
-                    logs = await asyncio.to_thread(
-                        event.get_logs, from_block=start, to_block=latest_block
-                    )
-                except Exception as exc:
-                    self._write_error(
-                        "reconcile_error",
-                        f"{event_name}:from_block={start} to_block={latest_block} err={exc}",
-                    )
-                    continue
+                logs = await self._safe_get_logs(
+                    event_name,
+                    event,
+                    start,
+                    latest_block,
+                    max_splits=5,
+                )
                 for entry in logs:
                     self._handle_event(event_name, entry)
 
@@ -295,16 +292,64 @@ class OnchainIngestor:
         while block <= end_block:
             chunk_end = min(end_block, block + max_range - 1)
             for event_name, event in contracts:
-                try:
-                    logs = await asyncio.to_thread(
-                        event.get_logs, from_block=block, to_block=chunk_end
-                    )
-                except Exception as exc:
-                    self._write_error("reconcile_error", f"{event_name}:{exc}")
-                    continue
+                logs = await self._safe_get_logs(
+                    event_name,
+                    event,
+                    block,
+                    chunk_end,
+                    max_splits=3,
+                )
                 for entry in logs:
                     self._handle_event(event_name, entry)
             block = chunk_end + 1
+
+    async def _safe_get_logs(
+        self,
+        event_name: str,
+        event: Any,
+        start_block: int,
+        end_block: int,
+        max_splits: int,
+    ) -> List[Any]:
+        if start_block > end_block:
+            return []
+        try:
+            return await asyncio.to_thread(
+                event.get_logs, from_block=start_block, to_block=end_block
+            )
+        except Exception as exc:
+            if max_splits <= 0 or start_block == end_block:
+                self._write_error(
+                    "reconcile_error",
+                    f"{event_name}:from_block={start_block} to_block={end_block} err={exc}",
+                )
+                return []
+            mid = (start_block + end_block) // 2
+            self._write_warning(
+                "reconcile_split",
+                {
+                    "event": event_name,
+                    "from_block": start_block,
+                    "to_block": end_block,
+                    "split_at": mid,
+                    "error": str(exc),
+                },
+            )
+            left = await self._safe_get_logs(
+                event_name,
+                event,
+                start_block,
+                mid,
+                max_splits=max_splits - 1,
+            )
+            right = await self._safe_get_logs(
+                event_name,
+                event,
+                mid + 1,
+                end_block,
+                max_splits=max_splits - 1,
+            )
+            return left + right
 
     def _create_filters(self, contracts: List[Tuple[str, Any]]) -> List[_FilterHandle]:
         filters: List[_FilterHandle] = []

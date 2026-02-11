@@ -17,6 +17,11 @@ class OrderIntent:
     as_of_ts_ms: int
     decision_id: Optional[str] = None
     reason: Optional[str] = None
+    post_only: bool = False
+    time_in_force: str = "GTC"
+    reduce_only: bool = False
+    quote_group_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 @dataclass(frozen=True)

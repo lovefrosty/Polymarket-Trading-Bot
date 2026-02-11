@@ -57,6 +57,8 @@ class Settings:
     reference_disagreement_bps_hard: float
     reference_disagreement_decay_k: float
     reference_min_confidence: float
+    reference_allow_partial: bool
+    reference_partial_confidence: float
     hl_vol_sec: float
     vol_pctl_window_sec: int
     sigma10s_floor: float
@@ -92,6 +94,23 @@ class Settings:
     onchain_dedupe_lru_size: int
     onchain_recreate_filter_after_secs: float
     onchain_log_level: str
+    trading_mode: str
+    polymarket_private_key: str
+    post_only_enabled: bool
+    quote_interval_ms: int
+    stats_interval_ms: int
+    rebalance_timeout_ms: int
+    emergency_taker_enabled: bool
+    emergency_taker_after_ms: int
+    pstar_max_age_ms: int
+    pstar_freeze_disagree_bps: float
+    book_stale_after_ms: int
+    book_down_after_ms: int
+    signal_age_max_ms: int
+    ack_p95_max_ms: float
+    ws_lag_max_ms: float
+    ctf_split_merge_enabled: bool
+    runtime_db_path: str
 
 
 def _parse_bool(value: str, default: bool) -> bool:
@@ -144,6 +163,8 @@ def load_settings() -> Settings:
         reference_disagreement_bps_hard=ref_disagree_hard,
         reference_disagreement_decay_k=ref_disagree_decay,
         reference_min_confidence=float(os.getenv("REFERENCE_MIN_CONFIDENCE", "0.5")),
+        reference_allow_partial=_parse_bool(os.getenv("REFERENCE_ALLOW_PARTIAL"), True),
+        reference_partial_confidence=float(os.getenv("REFERENCE_PARTIAL_CONFIDENCE", "0.6")),
         hl_vol_sec=float(os.getenv("HL_VOL_SEC", "120")),
         vol_pctl_window_sec=int(os.getenv("VOL_PCTL_WINDOW_SEC", "21600")),
         sigma10s_floor=float(os.getenv("SIGMA10S_FLOOR", "1e-5")),
@@ -181,6 +202,23 @@ def load_settings() -> Settings:
         onchain_dedupe_lru_size=int(os.getenv("ONCHAIN_DEDUPE_LRU_SIZE", "5000")),
         onchain_recreate_filter_after_secs=float(os.getenv("ONCHAIN_RECREATE_FILTER_AFTER_SECS", "30")),
         onchain_log_level=os.getenv("ONCHAIN_LOG_LEVEL", "INFO"),
+        trading_mode=os.getenv("TRADING_MODE", "OBSERVE").upper(),
+        polymarket_private_key=os.getenv("POLYMARKET_PRIVATE_KEY", ""),
+        post_only_enabled=_parse_bool(os.getenv("POST_ONLY_ENABLED"), True),
+        quote_interval_ms=int(os.getenv("QUOTE_INTERVAL_MS", "1000")),
+        stats_interval_ms=int(os.getenv("STATS_INTERVAL_MS", "5000")),
+        rebalance_timeout_ms=int(os.getenv("REBALANCE_TIMEOUT_MS", "5000")),
+        emergency_taker_enabled=_parse_bool(os.getenv("EMERGENCY_TAKER_ENABLED"), True),
+        emergency_taker_after_ms=int(os.getenv("EMERGENCY_TAKER_AFTER_MS", "1000")),
+        pstar_max_age_ms=int(os.getenv("PSTAR_MAX_AGE_MS", os.getenv("REFERENCE_STALENESS_MS", "3000"))),
+        pstar_freeze_disagree_bps=float(os.getenv("PSTAR_FREEZE_DISAGREE_BPS", "50")),
+        book_stale_after_ms=int(os.getenv("BOOK_STALE_AFTER_MS", "30000")),
+        book_down_after_ms=int(os.getenv("BOOK_DOWN_AFTER_MS", "120000")),
+        signal_age_max_ms=int(os.getenv("SIGNAL_AGE_MAX_MS", "1200")),
+        ack_p95_max_ms=float(os.getenv("ACK_P95_MAX_MS", "400")),
+        ws_lag_max_ms=float(os.getenv("WS_LAG_MAX_MS", "1000")),
+        ctf_split_merge_enabled=_parse_bool(os.getenv("CTF_SPLIT_MERGE_ENABLED"), False),
+        runtime_db_path=os.getenv("RUNTIME_DB_PATH", "./runtime.db"),
     )
 
 

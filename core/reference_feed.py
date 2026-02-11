@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core.event_tape import EventTape
 from core.reference_adapters import (
+    BinancePerpPollingAdapter,
     CoinbasePollingAdapter,
     KrakenPollingAdapter,
     PollingAdapterConfig,
@@ -25,12 +26,13 @@ class ReferenceFeedConfig:
     source: str
     coinbase_base: str = "https://api.exchange.coinbase.com"
     kraken_base: str = "https://api.kraken.com"
+    binance_futures_base: str = "https://fapi.binance.com"
 
 
 class ReferenceFeed:
     def __init__(
         self,
-        aggregator: ReferencePriceAggregator,
+        aggregator: Optional[ReferencePriceAggregator],
         tape: EventTape,
         config: ReferenceFeedConfig,
         on_quote: Optional[Callable[[object], None]] = None,
@@ -78,7 +80,8 @@ class ReferenceFeed:
         )
         if quote is None:
             return
-        self.aggregator.ingest(quote)
+        if self.aggregator is not None:
+            self.aggregator.ingest(quote)
         if self._on_quote is not None:
             self._on_quote(quote)
 
@@ -105,6 +108,16 @@ def _build_adapter(config: ReferenceFeedConfig) -> Optional[ReferenceAdapter]:
                 base_url=config.kraken_base,
                 source="spot",
                 venue="kraken_spot",
+            )
+        )
+    if source == "poll_binance_perp":
+        return BinancePerpPollingAdapter(
+            PollingAdapterConfig(
+                symbols=config.symbols,
+                poll_interval_secs=config.poll_interval_secs,
+                base_url=config.binance_futures_base,
+                source="perp",
+                venue="binance_perp",
             )
         )
     raise ValueError(f"unsupported_reference_source:{config.source}")

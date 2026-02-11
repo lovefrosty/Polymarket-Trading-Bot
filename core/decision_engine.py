@@ -228,7 +228,15 @@ class DecisionEngine:
             ref_result = self._reference_aggregator.validated_price(
                 ref_symbol, decision_mono_ns, wall_ms
             )
-            if ref_result.status != "ok":
+            ref_conf = None
+            if ref_result.price is not None:
+                ref_conf = ref_result.price.confidence
+            if ref_result.status == "ok":
+                ref_reason = None
+            elif ref_result.status == "partial":
+                if ref_conf is None or ref_conf < self._reference_aggregator.min_confidence:
+                    ref_reason = "partial_confidence_low"
+            else:
                 ref_reason = ref_result.status
         if ref_reason is not None:
             reasons.append(ref_reason)
@@ -272,6 +280,11 @@ class DecisionEngine:
         signals["ref_mid"] = ref_mid
         signals["ref_latency_ms"] = ref_latency_ms
         signals["ref_blockers"] = ref_store_blockers
+        if ref_result is not None:
+            signals["reference_status"] = ref_result.status
+            if ref_result.price is not None:
+                signals["reference_confidence"] = ref_result.price.confidence
+                signals["reference_sources"] = ref_result.price.sources
 
         onchain_signals = None
         if self._onchain_state is not None:

@@ -143,6 +143,32 @@ class KrakenPollingAdapter(PollingAdapter):
         return self._event_record(symbol, price, t_event_ms, raw, parse_warnings)
 
 
+class BinancePerpPollingAdapter(PollingAdapter):
+    def _poll_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        pair = _binance_perp_pair(symbol)
+        url = f"{self.config.base_url.rstrip('/')}/fapi/v1/ticker/bookTicker?symbol={pair}"
+        data = _fetch_json(url)
+        bid = _parse_float(data.get("bidPrice"))
+        ask = _parse_float(data.get("askPrice"))
+        price = _mid(bid, ask)
+        if price is None:
+            price = _parse_float(data.get("price"))
+        if price is None:
+            return None
+        t_event_ms = None
+        parse_warnings = ["MISSING_EVENT_TS"]
+        raw = {
+            "source": self.config.source,
+            "venue": self.config.venue,
+            "symbol": symbol,
+            "value": price,
+            "bid": bid,
+            "ask": ask,
+            "t_event_ms": t_event_ms,
+        }
+        return self._event_record(symbol, price, t_event_ms, raw, parse_warnings)
+
+
 def _fetch_json(url: str) -> Dict[str, Any]:
     headers = {
         "User-Agent": (
@@ -193,6 +219,19 @@ def _kraken_pair(symbol: str) -> str:
     if upper == "BTC":
         return "XBTUSD"
     return f"{upper}USD"
+
+
+def _binance_perp_pair(symbol: str) -> str:
+    upper = symbol.upper()
+    if upper == "BTC":
+        return "BTCUSDT"
+    if upper == "ETH":
+        return "ETHUSDT"
+    if upper == "SOL":
+        return "SOLUSDT"
+    if upper == "XRP":
+        return "XRPUSDT"
+    return f"{upper}USDT"
 
 
 def _utc_iso() -> str:
