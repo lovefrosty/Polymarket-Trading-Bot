@@ -53,6 +53,8 @@ def render_market_context_panel(
     c1.metric("Resolved market", topbar.market_slug if is_dev else market_label)
     c2.metric("Token count", str(len(topbar.token_ids)))
     c3.metric("Window end ETA", topbar.time_to_window_end)
+    if not is_dev:
+        st.caption(f"Market detail: {market_label} - closes in {topbar.time_to_window_end}")
 
     if is_dev:
         token_preview = ", ".join(topbar.token_ids) if topbar.token_ids else "N/A"
@@ -76,7 +78,25 @@ def render_market_context_panel(
         if "next_retry_ts_ms" in reqs.columns:
             reqs["next_retry_ts"] = pd.to_datetime(reqs["next_retry_ts_ms"], unit="ms", utc=True, errors="coerce")
         st.subheader("Market discovery evidence")
-        st.dataframe(reqs, width="stretch", height=220)
+        if is_dev:
+            st.dataframe(reqs, width="stretch", height=220)
+        else:
+            latest = reqs.head(1).copy()
+            if latest.empty:
+                st.info("No recent market discovery request.")
+            else:
+                row = latest.iloc[0]
+                status = str(row.get("status") or "unknown").upper()
+                selected_slug = str(row.get("selected_slug") or "N/A")
+                reason = str(row.get("reason_code") or "none")
+                source = str(row.get("end_ts_source") or "unknown")
+                retry = row.get("next_retry_ts")
+                retry_text = "none scheduled"
+                if retry is not None and not pd.isna(retry):
+                    retry_text = str(retry)
+                st.markdown(
+                    f"Status={status} | Selected market={selected_slug} | Selection reason={reason} | End-time source={source} | Next retry={retry_text}"
+                )
 
     elapsed = (perf_counter() - t0) * 1000.0
     if elapsed > panel_budget_ms:

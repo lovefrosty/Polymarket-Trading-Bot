@@ -29,6 +29,7 @@ def render_signals_panel(
 ) -> None:
     assert st is not None
     t0 = perf_counter()
+    is_dev = str(view_mode).lower() == "developer"
     ok, missing_required, _ = require_sources(SIGNALS_DEP.required_sources)
     if not ok:
         st.markdown(
@@ -53,7 +54,7 @@ def render_signals_panel(
 
     display = build_signals_view(dec) if build_signals_view is not None else dec
     if display.empty:
-        st.info("No signals right now - widen filters / check degraded state.")
+        st.info("No signals right now - widen filters or wait for spread compression.")
     else:
         st.dataframe(display, width="stretch", height=300)
 
@@ -74,15 +75,26 @@ def render_signals_panel(
     else:
         latest = dec.head(1)
         payload = safe_json(latest.iloc[0].get("policy_json")) if not latest.empty else {}
-        summary = {
-            "strategy": latest.iloc[0].get("strategy") if not latest.empty else "N/A",
-            "gate_result": latest.iloc[0].get("gate_result") if not latest.empty else "N/A",
-            "reason_codes": latest.iloc[0].get("reason_codes") if not latest.empty else "",
-            "has_policy_payload": bool(payload),
-        }
-        st.json(summary)
+        strategy = str(latest.iloc[0].get("strategy") or "N/A") if not latest.empty else "N/A"
+        gate = str(latest.iloc[0].get("gate_result") or "N/A") if not latest.empty else "N/A"
+        reason_codes = str(latest.iloc[0].get("reason_codes") or "") if not latest.empty else ""
+        p_hat = latest.iloc[0].get("p_hat") if not latest.empty else None
+        ev = latest.iloc[0].get("ev") if not latest.empty else None
+        if gate.upper() == "ALLOW":
+            hint = "Eligible now - monitor entry window and spread."
+        else:
+            hint = "WAIT - gate blocked. Review Health tab for current blocker."
+        if p_hat is not None and ev is not None:
+            st.markdown(
+                f"Latest signal: strategy={strategy} | gate={gate} | p_hat={float(p_hat):.3f} | ev={float(ev):.4f}"
+            )
+        else:
+            st.markdown(f"Latest signal: strategy={strategy} | gate={gate}")
+        if reason_codes:
+            st.caption(f"Reason: {reason_codes}")
+        st.caption(f"Action hint: {hint}")
+        st.caption(f"Policy payload available: {'yes' if bool(payload) else 'no'}")
 
     elapsed = (perf_counter() - t0) * 1000.0
     if elapsed > panel_budget_ms:
         st.caption(f"DEGRADED panel_over_budget_ms={elapsed:.1f} budget_ms={panel_budget_ms}")
-    is_dev = str(view_mode).lower() == "developer"

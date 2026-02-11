@@ -33,7 +33,8 @@ class TestTraderViewHidesIds(unittest.TestCase):
         self.assertNotIn("token_id", out.columns)
         self.assertNotIn("decision_id", out.columns)
         self.assertIn("Market", out.columns)
-        self.assertIn("Action", out.columns)
+        self.assertIn("Direction", out.columns)
+        self.assertIn("Tradeable", out.columns)
 
 
 if __name__ == "__main__":

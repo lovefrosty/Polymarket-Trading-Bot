@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import re
 from time import perf_counter
 import sys
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -128,6 +129,7 @@ CODE_TO_HUMAN = {
     "A_PSTAR_DIVERGED": "Spot/perp disagreement high",
     "B_BOOK_TIME_LEAK": "Book causality violation",
     "C_SPREAD_TOO_WIDE": "Spread too wide",
+    "C_SLIPPAGE_HIGH": "Slippage risk high",
     "C_BOOK_STALE": "Order book stale",
     "C_NO_EXECUTION_PRICE": "Execution price unavailable",
     "D_ONE_LEG_TIMEOUT": "Hedge incomplete timeout",
@@ -138,6 +140,25 @@ CODE_TO_HUMAN = {
     "WS_UNKNOWN_RATE_HIGH": "Unknown websocket payload rate high",
     "FEED_NOT_WIRED": "Feed wiring incomplete",
 }
+
+EMPTY_STATE_MESSAGES = {
+    "signals": "No signals right now - widen filters or wait for spread compression.",
+    "positions": "No open positions - review Signals tab for trading opportunities.",
+    "live_feed": "No live events yet.",
+    "active_orders": "No active orders",
+    "quote_skew": "No quote skew telemetry yet.",
+    "micro": "No microstructure telemetry yet.",
+    "fills": "No fills yet.",
+}
+
+
+def _status_class(level: str) -> str:
+    token = str(level or "").strip().upper()
+    if token in {"FROZEN", "CRITICAL", "BLOCKED"}:
+        return "alert"
+    if token in {"DEGRADED", "WARN", "CAUTION", "BOOTING", "PARTIAL", "UNKNOWN"}:
+        return "warn"
+    return "ok"
 
 
 DB_PATH = da.resolve_db_path()
@@ -412,9 +433,171 @@ def human_reason(code: Optional[str], message: Optional[str], view_mode: ViewMod
         if code_text:
             return f"{base} [{code_text}]"
         return base
+    return format_trader_reason(code=code_text, payload=None, message=msg)
+
+
+def _extract_first_number(text: str) -> Optional[float]:
+    if not text:
+        return None
+    match = re.search(r"(-?\d+(?:\.\d+)?)", text)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def format_trader_reason(code: Optional[str], payload: Optional[Dict[str, Any]], message: Optional[str]) -> str:
+    code_text = str(code or "").strip()
+    base = CODE_TO_HUMAN.get(code_text, code_text if code_text else "Unknown condition")
+    data = payload if isinstance(payload, dict) else {}
+    msg = str(message or "").strip()
+
+    spread_bps = data.get("spread_bps")
+    if spread_bps is None:
+        spread_bps = _extract_first_number(msg) if "spread" in msg.lower() else None
+    max_bps = data.get("max_bps")
+    if max_bps is None:
+        max_bps = data.get("threshold_bps")
+
+    if code_text == "C_SPREAD_TOO_WIDE" and spread_bps is not None:
+        if max_bps is not None:
+            return f"Spread too wide ({float(spread_bps):.1f} bps > {float(max_bps):.1f} bps max)"
+        return f"Spread too wide ({float(spread_bps):.1f} bps)"
+    if code_text == "C_SLIPPAGE_HIGH" and spread_bps is not None:
+        return f"Slippage risk high ({float(spread_bps):.1f} bps)"
+
+    age_ms = data.get("age_ms")
+    threshold_ms = data.get("threshold_ms")
+    if code_text.startswith("A_PSTAR") and age_ms is not None:
+        if threshold_ms is not None:
+            return f"{base} ({float(age_ms)/1000.0:.1f}s > {float(threshold_ms)/1000.0:.1f}s limit)"
+        return f"{base} ({float(age_ms)/1000.0:.1f}s)"
+
     if msg and msg.lower() not in base.lower():
         return f"{base} ({msg[:72]})"
     return base
+
+
+def classify_spread_state(spread_bps: Optional[float], warn_bps: float = 100.0, block_bps: float = 200.0) -> str:
+    if spread_bps is None or (isinstance(spread_bps, float) and math.isnan(spread_bps)):
+        return "UNKNOWN"
+    value = float(spread_bps)
+    if value > block_bps:
+        return "BLOCKED"
+    if value >= warn_bps:
+        return "CAUTION"
+    return "OK"
+
+
+def build_tradeable_hint(row: Dict[str, Any]) -> Tuple[str, str]:
+    spread = row.get("spread_bps")
+    state = classify_spread_state(spread)
+    book_health = str(row.get("book_health") or row.get("book_health_state") or "").strip().upper()
+    depth_buy = row.get("depth_at_qty_buy")
+    depth_sell = row.get("depth_at_qty_sell")
+    min_depth = None
+    vals: List[float] = []
+    for val in (depth_buy, depth_sell):
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            continue
+        try:
+            vals.append(float(val))
+        except (TypeError, ValueError):
+            continue
+    if vals:
+        min_depth = min(vals)
+
+    if book_health == "DOWN":
+        return "WAIT", "Book feed degraded"
+    if state == "BLOCKED":
+        return "WAIT", f"Spread too wide ({float(spread):.1f} bps)"
+    if min_depth is not None and min_depth <= 0:
+        return "WAIT", "No executable depth"
+    if state == "CAUTION":
+        return "WAIT", "Spread elevated - wait for compression"
+    if state == "UNKNOWN":
+        return "WAIT", "Spread unavailable"
+    return "YES", "Tradeable"
+
+
+def build_trader_health_chips(metrics: TopBarMetrics, health_map: Dict[str, HealthGateStatus]) -> List[Dict[str, str]]:
+    chips: List[Dict[str, str]] = []
+
+    pstar_ms = metrics.pstar_age_current_ms
+    if pstar_ms is not None:
+        if pstar_ms < 2_000:
+            state = "Fresh"
+            klass = "ok"
+        elif pstar_ms < 5_000:
+            state = "Slightly stale"
+            klass = "warn"
+        else:
+            state = "Stale"
+            klass = "alert"
+        chips.append({"label": "Price Feed", "state": state, "detail": f"{pstar_ms/1000.0:.1f}s", "klass": klass})
+
+    ws_ms = metrics.ws_lag_current_ms
+    if ws_ms is not None:
+        if ws_ms < 250:
+            conn_state = "Healthy"
+            conn_klass = "ok"
+        elif ws_ms < 1_500:
+            conn_state = "Degraded"
+            conn_klass = "warn"
+        else:
+            conn_state = "Lagging"
+            conn_klass = "alert"
+        chips.append({"label": "Connection", "state": conn_state, "detail": f"{ws_ms:.0f} ms", "klass": conn_klass})
+
+    ack_ms = metrics.ack_p95_5m_ms
+    if ack_ms is not None:
+        if ack_ms < 300:
+            ex_state = "Healthy"
+            ex_klass = "ok"
+        elif ack_ms < 1_000:
+            ex_state = "Degraded"
+            ex_klass = "warn"
+        else:
+            ex_state = "Lagging"
+            ex_klass = "alert"
+        chips.append({"label": "Execution Path", "state": ex_state, "detail": f"p95 {ack_ms:.0f} ms", "klass": ex_klass})
+
+    sig_ms = metrics.signal_age_p95_5m_ms
+    if sig_ms is not None:
+        if sig_ms < 1_000:
+            sig_state = "Fresh"
+            sig_klass = "ok"
+        elif sig_ms < 5_000:
+            sig_state = "Aging"
+            sig_klass = "warn"
+        else:
+            sig_state = "Stale"
+            sig_klass = "alert"
+        chips.append({"label": "Signal Freshness", "state": sig_state, "detail": f"p95 {sig_ms:.0f} ms", "klass": sig_klass})
+
+    # Reflect hard gate state if present.
+    gate_e = health_map.get("E")
+    if gate_e is not None and gate_e.status == "CRITICAL":
+        chips.append({"label": "Latency Gate", "state": "Blocked", "detail": "E gate critical", "klass": "alert"})
+
+    return chips
+
+
+def _latest_tradeability_summary() -> Tuple[str, str]:
+    row = query_df(
+        """
+        SELECT spread_bps, depth_at_qty_buy, depth_at_qty_sell, book_health
+        FROM microstructure_stats
+        ORDER BY ts_ms DESC
+        LIMIT 1
+        """
+    )
+    if row.empty:
+        return "WAIT", "No recent microstructure snapshot"
+    status, reason = build_tradeable_hint(row.iloc[0].to_dict())
+    return status, reason
 
 
 def build_signals_table_for_view(
@@ -425,7 +608,7 @@ def build_signals_table_for_view(
     if signal_df.empty:
         if is_developer_mode(view_mode):
             return signal_df
-        return pd.DataFrame(columns=["Market", "Action", "EV", "Suggested->Current", "Size cap", "Confidence", "Why blocked"])
+        return pd.DataFrame(columns=["Market", "Direction", "EV", "Suggested price", "Confidence", "Tradeable", "Why blocked", "Action hint"])
 
     out = signal_df.copy()
     labels = out.apply(lambda row: label_token(label_registry, row.get("market"), row.get("token_id")), axis=1)
@@ -455,12 +638,24 @@ def build_signals_table_for_view(
             return "N/A"
 
     out["suggested_current"] = out.apply(_suggested_current, axis=1)
-    out["size_cap"] = "N/A"
     out["confidence"] = out.get("ev", pd.Series(dtype=float)).apply(
         lambda value: "High" if pd.notna(value) and float(value) >= 0.03 else ("Med" if pd.notna(value) and float(value) >= 0.01 else "Low")
     )
-    out["why_blocked"] = out.apply(
-        lambda row: "" if str(row.get("gate_result") or "").upper() == "ALLOW" else human_reason(str(row.get("reason_codes") or ""), None, view_mode),
+
+    def _why_blocked(row: pd.Series) -> str:
+        gate = str(row.get("gate_result") or "").upper()
+        if gate == "ALLOW":
+            return ""
+        reason_codes = str(row.get("reason_codes") or "").strip()
+        first_code = reason_codes.split(",")[0].strip() if reason_codes else ""
+        return format_trader_reason(first_code, None, None)
+
+    out["why_blocked"] = out.apply(_why_blocked, axis=1)
+    out["tradeable"] = out["gate_result"].apply(lambda gate: "YES" if str(gate).upper() == "ALLOW" else "WAIT")
+    out["action_hint"] = out.apply(
+        lambda row: "Eligible - monitor entry window"
+        if row.get("tradeable") == "YES"
+        else "WAIT for spread < 150 bps",
         axis=1,
     )
 
@@ -475,12 +670,13 @@ def build_signals_table_for_view(
     slim = pd.DataFrame(
         {
             "Market": out["market_label"],
-            "Action": out["action_label"],
+            "Direction": out["action_label"],
             "EV": out["ev"],
-            "Suggested->Current": out["suggested_current"],
-            "Size cap": out["size_cap"],
+            "Suggested price": out["suggested_current"],
             "Confidence": out["confidence"],
+            "Tradeable": out["tradeable"],
             "Why blocked": out["why_blocked"],
+            "Action hint": out["action_hint"],
         }
     )
     return slim
@@ -809,9 +1005,23 @@ def compute_health_a_to_e(filters: DashboardFilters) -> Dict[str, HealthGateStat
         """,
         (start_ts,),
     )
+    c_micro = query_df(
+        """
+        SELECT spread_bps, depth_at_qty_buy, depth_at_qty_sell, book_health
+        FROM microstructure_stats
+        WHERE ts_ms >= ?
+        ORDER BY ts_ms DESC
+        LIMIT 1
+        """,
+        (start_ts,),
+    )
     c_down = int((c_df.get("book_health_state", pd.Series(dtype=str)).astype(str).str.upper() == "DOWN").sum()) if not c_df.empty else 0
     c_stale = int((c_df.get("book_age_p95_ms", pd.Series(dtype=float)) > 5000).sum()) if not c_df.empty else 0
-    c_status = "CRITICAL" if c_down > 0 else ("WARN" if c_stale > 0 else "OK")
+    c_spread_latest = safe_first(c_micro, "spread_bps", None)
+    c_depth_buy = safe_first(c_micro, "depth_at_qty_buy", None)
+    c_depth_sell = safe_first(c_micro, "depth_at_qty_sell", None)
+    c_spread_state = classify_spread_state(float(c_spread_latest) if c_spread_latest is not None and not pd.isna(c_spread_latest) else None)
+    c_status = "CRITICAL" if c_down > 0 or c_spread_state == "BLOCKED" else ("WARN" if c_stale > 0 or c_spread_state == "CAUTION" else "OK")
 
     d_alerts = query_df(
         """
@@ -877,8 +1087,15 @@ def compute_health_a_to_e(filters: DashboardFilters) -> Dict[str, HealthGateStat
         "C": HealthGateStatus(
             gate="C",
             status=c_status,
-            summary=f"book_down={c_down} stale={c_stale}",
-            details={"book_down": c_down, "book_stale": c_stale},
+            summary=f"book_down={c_down} stale={c_stale} spread_state={c_spread_state}",
+            details={
+                "book_down": c_down,
+                "book_stale": c_stale,
+                "latest_spread_bps": c_spread_latest,
+                "depth_at_qty_buy": c_depth_buy,
+                "depth_at_qty_sell": c_depth_sell,
+                "spread_state": c_spread_state,
+            },
         ),
         "D": HealthGateStatus(
             gate="D",
@@ -919,22 +1136,38 @@ def _build_filters() -> Tuple[DashboardFilters, RefreshPolicy, ViewMode]:
 
     selected_market = st.sidebar.selectbox("Market", markets, index=0)
 
-    tokens = _selected_market_tokens(selected_market)
-    selected_token = st.sidebar.selectbox("Token", ["ALL"] + tokens, index=0)
-
     window_label = st.sidebar.selectbox("Time Window", ["5m", "15m", "1h", "6h", "24h"], index=2)
     window_map = {"5m": 5, "15m": 15, "1h": 60, "6h": 360, "24h": 1440}
-
-    lookback_rows = st.sidebar.slider("Rows", 50, 2000, 200, step=50)
-    severity_filter = st.sidebar.selectbox("Alert Severity", ["ALL", "critical", "warn", "info"], index=0)
-    strategy_filter = st.sidebar.text_input("Strategy filter", value="")
-    positive_ev_only = st.sidebar.checkbox("Signals with EV > 0", value=False)
-    allow_only = st.sidebar.checkbox("Gate = ALLOW only", value=False)
 
     st.sidebar.divider()
     auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
     refresh_ms = st.sidebar.selectbox("Refresh interval (ms)", [1000, 1500, 2000], index=0)
-    heavy_every_ticks = st.sidebar.slider("Heavy chart every N ticks", 2, 10, 5)
+    heavy_every_ticks = 5
+    tokens = _selected_market_tokens(selected_market)
+    selected_token = "ALL"
+    lookback_rows = 200
+    severity_filter = "ALL"
+    strategy_filter = ""
+    positive_ev_only = False
+    allow_only = False
+
+    if is_developer_mode(view_mode):
+        selected_token = st.sidebar.selectbox("Token", ["ALL"] + tokens, index=0)
+        lookback_rows = st.sidebar.slider("Rows", 50, 2000, 200, step=50)
+        severity_filter = st.sidebar.selectbox("Alert Severity", ["ALL", "critical", "warn", "info"], index=0)
+        strategy_filter = st.sidebar.text_input("Strategy filter", value="")
+        positive_ev_only = st.sidebar.checkbox("Signals with EV > 0", value=False)
+        allow_only = st.sidebar.checkbox("Gate = ALLOW only", value=False)
+        heavy_every_ticks = st.sidebar.slider("Heavy chart every N ticks", 2, 10, 5)
+    else:
+        advanced = st.sidebar.expander("Advanced", expanded=False)
+        selected_token = advanced.selectbox("Token", ["ALL"] + tokens, index=0)
+        lookback_rows = advanced.slider("Rows", 50, 2000, 200, step=50)
+        severity_filter = advanced.selectbox("Alert Severity", ["ALL", "critical", "warn", "info"], index=0)
+        strategy_filter = advanced.text_input("Strategy filter", value="")
+        positive_ev_only = advanced.checkbox("Signals with EV > 0", value=False)
+        allow_only = advanced.checkbox("Gate = ALLOW only", value=False)
+        heavy_every_ticks = advanced.slider("Heavy chart every N ticks", 2, 10, 5)
 
     policy = RefreshPolicy(
         auto_refresh=auto_refresh,
@@ -981,47 +1214,102 @@ def _apply_decision_filters(df: pd.DataFrame, filters: DashboardFilters) -> pd.D
     return out
 
 
-def _render_topbar(metrics: TopBarMetrics, view_mode: ViewMode, label_registry: Dict[str, Dict[str, Any]]) -> None:
+def _render_topbar(
+    metrics: TopBarMetrics,
+    health_map: Dict[str, HealthGateStatus],
+    view_mode: ViewMode,
+    label_registry: Dict[str, Dict[str, Any]],
+) -> None:
     assert st is not None
-    freeze_class = "ok"
-    if metrics.alert_state == "FROZEN":
-        freeze_class = "alert"
-    elif metrics.alert_state == "DEGRADED":
-        freeze_class = "warn"
+    freeze_class = _status_class(metrics.alert_state)
     freeze_label = metrics.alert_state
-    reasons = ", ".join(human_reason(reason, None, view_mode) for reason in metrics.freeze_reasons) if metrics.freeze_reasons else "none"
+    reasons = ", ".join(format_trader_reason(reason, None, None) for reason in metrics.freeze_reasons) if metrics.freeze_reasons else "none"
     market_label = label_token(label_registry, metrics.market_slug, None)["market_label"]
+    market_text = f"{market_label} - closes in {metrics.time_to_window_end}"
+
+    c_details = (health_map.get("C").details if health_map.get("C") is not None else {}) if health_map else {}
+    spread_bps = c_details.get("latest_spread_bps") if isinstance(c_details, dict) else None
+    spread_limit = 150.0
+
+    if metrics.alert_state == "OK":
+        state_line = "Trading active - all gates healthy"
+    else:
+        if spread_bps is not None and not pd.isna(spread_bps):
+            spread_text = f"Spread {float(spread_bps):.1f} bps (max {spread_limit:.0f})"
+            state_line = f"Trading paused: {spread_text}"
+        else:
+            state_line = "Trading paused due to safety gates"
+        if reasons != "none":
+            state_line = f"{state_line} | {reasons}"
 
     st.markdown('<div class="topbar">', unsafe_allow_html=True)
-    st.markdown(
-        f'<div class="{freeze_class}"><b>Mode:</b> {metrics.mode} &nbsp; <b>State:</b> {freeze_label} '
-        f'&nbsp; <b>Readiness:</b> {metrics.readiness_state} &nbsp; <b>Reasons:</b> {reasons}</div>',
-        unsafe_allow_html=True,
-    )
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Market", market_label if not is_developer_mode(view_mode) else metrics.market_slug)
-    c2.metric("Tokens", str(len(metrics.token_ids)))
-    c3.metric("Window End ETA", metrics.time_to_window_end)
-    c4.metric("P*_age_ms cur/p95", f"{_fmt_ms(metrics.pstar_age_current_ms)}/{_fmt_ms(metrics.pstar_age_p95_5m_ms)}")
-    c5.metric("ws_lag_ms cur/p95", f"{_fmt_ms(metrics.ws_lag_current_ms)}/{_fmt_ms(metrics.ws_lag_p95_5m_ms)}")
-    c6.metric("ack_ms p50/p95", f"{_fmt_ms(metrics.ack_p50_5m_ms)}/{_fmt_ms(metrics.ack_p95_5m_ms)}")
-
-    q1, q2, q3, q4, q5, q6 = st.columns(6)
-    q1.metric("signal_age_ms p95", _fmt_ms(metrics.signal_age_p95_5m_ms))
-    q2.metric("decisions (1h)", metrics.decisions_1h)
-    q3.metric("signals (1h)", metrics.signals_1h)
-    q4.metric("cancels/replaces", f"{metrics.cancels_1h}/{metrics.replaces_1h}")
-    q5.metric("fills/rejects", f"{metrics.fills_1h}/{metrics.rejects_1h}")
-    q6.metric("hedge completeness", _fmt_ratio(metrics.hedge_completeness))
-
-    i1, i2, i3 = st.columns(3)
-    i1.metric("net YES", f"{metrics.net_yes:.3f}")
-    i2.metric("net NO", f"{metrics.net_no:.3f}")
-    i3.metric("net USD exposure", f"{metrics.net_usd_exposure:.3f}")
     if is_developer_mode(view_mode):
+        st.markdown(
+            f'<div class="{freeze_class}"><b>Mode:</b> {metrics.mode} &nbsp; <b>State:</b> {freeze_label} '
+            f'&nbsp; <b>Readiness:</b> {metrics.readiness_state} &nbsp; <b>Status:</b> {state_line}</div>',
+            unsafe_allow_html=True,
+        )
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Market", metrics.market_slug)
+        c2.metric("Tokens", str(len(metrics.token_ids)))
+        c3.metric("Window End ETA", metrics.time_to_window_end)
+        c4.metric("P*_age_ms cur/p95", f"{_fmt_ms(metrics.pstar_age_current_ms)}/{_fmt_ms(metrics.pstar_age_p95_5m_ms)}")
+        c5.metric("ws_lag_ms cur/p95", f"{_fmt_ms(metrics.ws_lag_current_ms)}/{_fmt_ms(metrics.ws_lag_p95_5m_ms)}")
+        c6.metric("ack_ms p50/p95", f"{_fmt_ms(metrics.ack_p50_5m_ms)}/{_fmt_ms(metrics.ack_p95_5m_ms)}")
+
+        q1, q2, q3, q4, q5, q6 = st.columns(6)
+        q1.metric("signal_age_ms p95", _fmt_ms(metrics.signal_age_p95_5m_ms))
+        q2.metric("decisions (1h)", metrics.decisions_1h)
+        q3.metric("signals (1h)", metrics.signals_1h)
+        q4.metric("cancels/replaces", f"{metrics.cancels_1h}/{metrics.replaces_1h}")
+        q5.metric("fills/rejects", f"{metrics.fills_1h}/{metrics.rejects_1h}")
+        q6.metric("hedge completeness", _fmt_ratio(metrics.hedge_completeness))
+
+        i1, i2, i3 = st.columns(3)
+        i1.metric("net YES", f"{metrics.net_yes:.3f}")
+        i2.metric("net NO", f"{metrics.net_no:.3f}")
+        i3.metric("net USD exposure", f"{metrics.net_usd_exposure:.3f}")
         token_preview = ", ".join(metrics.token_ids[:6]) if metrics.token_ids else "N/A"
         st.caption(f"Token IDs: {token_preview}")
+    else:
+        b1, b2, b3 = st.columns(3)
+        b1.markdown(f'<div class="ok"><b>Mode</b><br/>{metrics.mode}</div>', unsafe_allow_html=True)
+        b2.markdown(f'<div class="{freeze_class}"><b>State</b><br/>{freeze_label}</div>', unsafe_allow_html=True)
+        b3.markdown(
+            f'<div class="{_status_class(metrics.readiness_state)}"><b>Readiness</b><br/>{metrics.readiness_state}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="{freeze_class}"><b>Current status:</b> {state_line}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="ok"><b>Market:</b> {market_text}</div>',
+            unsafe_allow_html=True,
+        )
+        chips = build_trader_health_chips(metrics, health_map)
+        if chips:
+            chip_cols = st.columns(max(1, min(4, len(chips))))
+            for idx, chip in enumerate(chips[:4]):
+                klass = chip.get("klass", "ok")
+                chip_cols[idx].markdown(
+                    f'<div class="{klass}"><b>{chip.get("label")}:</b> {chip.get("state")}<br/><small>{chip.get("detail")}</small></div>',
+                    unsafe_allow_html=True,
+                )
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Decisions (1h)", metrics.decisions_1h)
+        s2.metric("Signals (1h)", metrics.signals_1h)
+        s3.metric("Fills / Rejects", f"{metrics.fills_1h}/{metrics.rejects_1h}")
+        s4.metric("Hedge completeness", _fmt_ratio(metrics.hedge_completeness))
+        net_position = abs(metrics.net_yes) + abs(metrics.net_no) + abs(metrics.net_usd_exposure)
+        if net_position < 1e-9:
+            st.info(EMPTY_STATE_MESSAGES["positions"])
+        else:
+            i1, i2, i3 = st.columns(3)
+            i1.metric("Net YES", f"{metrics.net_yes:.3f}")
+            i2.metric("Net NO", f"{metrics.net_no:.3f}")
+            i3.metric("Net USD exposure", f"{metrics.net_usd_exposure:.3f}")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1120,6 +1408,15 @@ def _render_overview(
     if not feed_df.empty:
         feed_df = feed_df.sort_values("ts_ms", ascending=False).head(100)
         feed_df["ts"] = pd.to_datetime(feed_df["ts_ms"], unit="ms", utc=True)
+
+    if not is_developer_mode(view_mode):
+        tradeable, reason = _latest_tradeability_summary()
+        klass = "ok" if tradeable == "YES" else "warn"
+        st.markdown(
+            f'<div class="{klass}"><b>Tradeability now:</b> {tradeable} | {reason}</div>',
+            unsafe_allow_html=True,
+        )
+
     st.subheader("Live Feed")
     if not feed_df.empty:
         feed_df["ts"] = pd.to_datetime(feed_df["ts_ms"], unit="ms", utc=True)
@@ -1135,7 +1432,7 @@ def _render_overview(
     else:
         trader_cols = [col for col in ["ts", "type", "Market", "Side", "event", "details", "ev", "strategy"] if col in feed_df.columns]
         if feed_df.empty:
-            st.info("No live events yet.")
+            st.info(EMPTY_STATE_MESSAGES["live_feed"])
         else:
             st.dataframe(feed_df[trader_cols], width="stretch", height=260)
 
@@ -1144,7 +1441,7 @@ def _render_overview(
     signal_df = signal_df.sort_values("ts_ms", ascending=False).head(filters.lookback_rows)
     display_signals = build_signals_table_for_view(signal_df, view_mode, label_registry)
     if display_signals.empty:
-        st.info("No signals right now - widen filters / check degraded state.")
+        st.info(EMPTY_STATE_MESSAGES["signals"])
     else:
         st.dataframe(display_signals, width="stretch", height=240)
 
@@ -1201,7 +1498,7 @@ def _render_inventory_quotes(
         inv["ts"] = pd.to_datetime(inv["ts_ms"], unit="ms", utc=True)
     st.subheader("Inventory")
     if inv.empty:
-        st.info("No open positions")
+        st.info(EMPTY_STATE_MESSAGES["positions"])
     elif is_developer_mode(view_mode):
         st.dataframe(inv, width="stretch", height=230)
     else:
@@ -1238,7 +1535,7 @@ def _render_inventory_quotes(
                 )
         trader_inv = pd.DataFrame(rows)
         if trader_inv.empty:
-            st.info("No open positions")
+            st.info(EMPTY_STATE_MESSAGES["positions"])
         else:
             st.dataframe(trader_inv, width="stretch", height=230)
 
@@ -1257,7 +1554,7 @@ def _render_inventory_quotes(
         )
     )
     if orders.empty:
-        st.info("No active orders")
+        st.info(EMPTY_STATE_MESSAGES["active_orders"])
     elif is_developer_mode(view_mode):
         cols = [
             col
@@ -1319,7 +1616,7 @@ def _render_inventory_quotes(
         st.dataframe(skew, width="stretch", height=180)
     else:
         if skew.empty:
-            st.info("No quote skew telemetry yet.")
+            st.info(EMPTY_STATE_MESSAGES["quote_skew"])
         else:
             rows = []
             for _, row in skew.iterrows():
@@ -1362,29 +1659,56 @@ def _render_microstructure(
     if not micro.empty:
         micro["ts"] = pd.to_datetime(micro["ts_ms"], unit="ms", utc=True)
 
-    st.subheader("Microstructure table")
+    st.subheader("Microstructure")
     if not micro.empty:
         labels = micro.apply(lambda row: label_token(label_registry, filters.selected_market if filters.selected_market != "ALL" else None, row.get("token_id")), axis=1)
         micro["market_label"] = labels.apply(lambda item: item.get("market_label"))
         micro["outcome_label"] = labels.apply(lambda item: item.get("outcome_label"))
     if micro.empty:
-        st.info("No microstructure telemetry yet.")
+        st.info(EMPTY_STATE_MESSAGES["micro"])
     elif is_developer_mode(view_mode):
         st.dataframe(micro, width="stretch", height=260)
     else:
-        show_cols = [
-            col
-            for col in ["ts", "market_label", "outcome_label", "spread_bps", "depth_at_qty_buy", "depth_at_qty_sell", "book_health"]
-            if col in micro.columns
-        ]
-        st.dataframe(micro[show_cols], width="stretch", height=260)
+        trader_micro = micro.copy()
+        trader_micro["Depth"] = (
+            trader_micro["depth_at_qty_buy"].fillna(0.0).astype(float)
+            + trader_micro["depth_at_qty_sell"].fillna(0.0).astype(float)
+        ) / 2.0
+        tradeable_rows = []
+        for _, row in trader_micro.iterrows():
+            hint_status, hint_reason = build_tradeable_hint(row.to_dict())
+            spread_state = classify_spread_state(float(row.get("spread_bps")) if pd.notna(row.get("spread_bps")) else None)
+            tradeable_rows.append(
+                {
+                    "Market": row.get("market_label"),
+                    "Side": row.get("outcome_label"),
+                    "Spread (bps)": row.get("spread_bps"),
+                    "Depth": row.get("Depth"),
+                    "Spread state": spread_state,
+                    "Tradeable": hint_status,
+                    "Reason": hint_reason,
+                }
+            )
+        trader_df = pd.DataFrame(tradeable_rows).head(300)
+        st.dataframe(trader_df, width="stretch", height=260)
+        wait_count = int((trader_df["Tradeable"] == "WAIT").sum()) if "Tradeable" in trader_df.columns else 0
+        if wait_count > 0:
+            st.markdown(
+                f'<div class="warn"><b>Tradeability:</b> {wait_count} row(s) currently WAIT due to spread/depth constraints.</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="ok"><b>Tradeability:</b> all displayed rows currently tradeable.</div>',
+                unsafe_allow_html=True,
+            )
 
-    if not micro.empty and alt is not None:
+    if not micro.empty and alt is not None and is_developer_mode(view_mode):
         spread_chart = alt.Chart(micro).mark_line().encode(
             x="ts:T",
             y="spread_bps:Q",
-            color=("token_id:N" if is_developer_mode(view_mode) else "outcome_label:N"),
-            tooltip=(["ts", "token_id", "spread_bps"] if is_developer_mode(view_mode) else ["ts", "outcome_label", "spread_bps"]),
+            color="token_id:N",
+            tooltip=["ts", "token_id", "spread_bps"],
         ).properties(height=160)
         st.altair_chart(_style_chart(spread_chart), width="stretch")
 
@@ -1393,8 +1717,8 @@ def _render_microstructure(
         depth_chart = alt.Chart(depth).mark_line().encode(
             x="ts:T",
             y="depth_at_qty:Q",
-            color=("token_id:N" if is_developer_mode(view_mode) else "outcome_label:N"),
-            tooltip=(["ts", "token_id", "depth_at_qty"] if is_developer_mode(view_mode) else ["ts", "outcome_label", "depth_at_qty"]),
+            color="token_id:N",
+            tooltip=["ts", "token_id", "depth_at_qty"],
         ).properties(height=160)
         st.altair_chart(_style_chart(depth_chart), width="stretch")
 
@@ -1413,7 +1737,7 @@ def _render_microstructure(
     )
     st.subheader("Fill latency distribution")
     if fill_latency.empty:
-        st.info("No fills yet.")
+        st.info(EMPTY_STATE_MESSAGES["fills"])
     elif is_developer_mode(view_mode):
         st.dataframe(fill_latency, width="stretch", height=180)
     else:
@@ -1501,7 +1825,7 @@ def render_dashboard() -> None:
         health = compute_health_a_to_e(filters)
 
         with topbar_slot.container():
-            _render_topbar(metrics, view_mode, label_registry)
+            _render_topbar(metrics, health, view_mode, label_registry)
         with status_slot.container():
             st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
 

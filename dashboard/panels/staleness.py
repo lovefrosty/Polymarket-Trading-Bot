@@ -66,7 +66,22 @@ def render_staleness_panel(
     if not pstar.empty:
         pstar["ts"] = pd.to_datetime(pstar["ts_ms"], unit="ms", utc=True)
     st.subheader("Staleness explainer")
-    st.dataframe(pstar, width="stretch", height=180)
+    if is_dev:
+        st.dataframe(pstar, width="stretch", height=180)
+    else:
+        if pstar.empty:
+            st.info("No recent price-feed freshness samples.")
+        else:
+            latest = pstar.iloc[0]
+            valid = int(latest.get("valid") or 0) == 1
+            age_spot = float(latest.get("age_spot_ms") or 0.0) / 1000.0
+            age_perp = float(latest.get("age_perp_ms") or 0.0) / 1000.0
+            disagree = latest.get("disagreement_bps")
+            disagree_text = f"{float(disagree):.1f} bps" if disagree is not None and not pd.isna(disagree) else "N/A"
+            state = "healthy" if valid else "invalid"
+            st.markdown(f"Price feed is {state}. spot_age={age_spot:.1f}s perp_age={age_perp:.1f}s disagreement={disagree_text}.")
+            cols = [col for col in ["ts", "symbol", "age_spot_ms", "age_perp_ms", "disagreement_bps", "valid"] if col in pstar.columns]
+            st.dataframe(pstar[cols].head(30), width="stretch", height=140)
 
     book = query_df(
         """
@@ -80,18 +95,34 @@ def render_staleness_panel(
     )
     if not book.empty:
         book["ts"] = pd.to_datetime(book["ts_ms"], unit="ms", utc=True)
-    if not is_dev and not book.empty:
-        if label_token_fn is not None:
+    if not is_dev:
+        if label_token_fn is not None and not book.empty:
             book["Outcome"] = book["token_id"].apply(lambda token: label_token_fn(None, token).get("outcome_label", "Outcome"))
             book["Market"] = book["token_id"].apply(lambda token: label_token_fn(None, token).get("market_label", "Unknown market"))
         book = book.drop(columns=["token_id"], errors="ignore")
-    st.dataframe(book, width="stretch", height=160)
+    if is_dev:
+        st.dataframe(book, width="stretch", height=160)
+    else:
+        if book.empty:
+            st.info("No recent book freshness samples.")
+        else:
+            latest_book = book.iloc[0]
+            health = str(latest_book.get("book_health_state") or "UNKNOWN")
+            age = latest_book.get("book_age_p95_ms")
+            age_text = f"{float(age):.1f} ms" if age is not None and not pd.isna(age) else "N/A"
+            st.markdown(f"Book health is {health}. p95 book age={age_text}.")
+            cols = [col for col in ["ts", "Market", "Outcome", "book_health_state", "book_age_p95_ms"] if col in book.columns]
+            st.dataframe(book[cols].head(30), width="stretch", height=140)
 
-    if allow_widgets:
+    if allow_widgets and is_dev:
         selected_metric = st.selectbox("Metric inspector", METRIC_KEYS, index=0)
     else:
         selected_metric = METRIC_KEYS[0]
-        st.caption(f"Metric inspector: {selected_metric} (auto-refresh mode)")
+        if not pstar.empty and int(pstar.iloc[0].get("valid") or 0) == 0:
+            selected_metric = "PSTAR_AGE"
+        elif not book.empty and str(book.iloc[0].get("book_health_state") or "").upper() == "DOWN":
+            selected_metric = "BOOK_STALE"
+        st.caption(f"Metric inspector: {selected_metric} (auto)")
     evidence = query_evidence_rows(
         start_ts_ms=start_ts,
         end_ts_ms=end_ts,
@@ -100,9 +131,12 @@ def render_staleness_panel(
         limit=200,
     )
     st.subheader("Evidence rows")
-    if not is_dev and not evidence.empty:
+    if not is_dev:
         evidence = evidence.drop(columns=["token_id", "decision_id", "order_id"], errors="ignore")
-    st.dataframe(evidence, width="stretch", height=220)
+    if evidence.empty:
+        st.info("No evidence rows for current filters.")
+    else:
+        st.dataframe(evidence, width="stretch", height=220)
 
     context = build_drillthrough_context(
         metric_key=selected_metric,

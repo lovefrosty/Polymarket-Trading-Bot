@@ -36,6 +36,12 @@ LOGS_DEP = PanelDependency(
     optional_sources=("logs",),
 )
 
+EMPTY_LOG_MESSAGES = {
+    "alerts": "No recent errors - system operating normally.",
+    "breaches": "No gate breaches in the selected window.",
+    "logs": "No warning/error logs for this window.",
+}
+
 
 def _sanitize_df_for_view(
     df: pd.DataFrame,
@@ -43,7 +49,7 @@ def _sanitize_df_for_view(
     label_token_fn: Optional[Callable[[Any, Any], Dict[str, str]]] = None,
     reason_humanizer: Optional[Callable[[Optional[str], Optional[str]], str]] = None,
 ) -> pd.DataFrame:
-    if df.empty or str(view_mode).lower() == "developer":
+    if str(view_mode).lower() == "developer":
         return df
     out = df.copy()
     if "token_id" in out.columns:
@@ -68,6 +74,7 @@ def render_health_panel(
 ) -> None:
     assert st is not None
     t0 = perf_counter()
+    is_dev = str(view_mode).lower() == "developer"
     ok, missing_required, missing_optional = require_sources(
         HEALTH_DEP.required_sources,
         HEALTH_DEP.optional_sources,
@@ -93,6 +100,162 @@ def render_health_panel(
             f'<div class="{klass}"><b>{status.gate}</b> {status.status}<br/><small>{status.summary}</small></div>',
             unsafe_allow_html=True,
         )
+
+    if not is_dev:
+        gate_help = {
+            "A": "Price feed validity",
+            "B": "Feature/decision causality",
+            "C": "Book spread and depth",
+            "D": "Hedge completeness",
+            "E": "Latency and signal age",
+        }
+        blockers = [gate for gate, status in gate_map.items() if status.status == "CRITICAL"]
+        warns = [gate for gate, status in gate_map.items() if status.status == "WARN"]
+        if blockers:
+            blocked_text = ", ".join(sorted(blockers))
+            st.markdown(
+                f"<div class='alert'><b>Tradeability:</b> WAIT | Blocked by gate(s): {blocked_text}</div>",
+                unsafe_allow_html=True,
+            )
+        elif warns:
+            warn_text = ", ".join(sorted(warns))
+            st.markdown(
+                f"<div class='warn'><b>Tradeability:</b> CAUTION | Degraded gate(s): {warn_text}</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div class='ok'><b>Tradeability:</b> YES | All A-E gates healthy for this window</div>",
+                unsafe_allow_html=True,
+            )
+
+        summary_rows = []
+        for gate in ["A", "B", "C", "D", "E"]:
+            status = gate_map[gate]
+            if status.status == "CRITICAL":
+                action = "Wait - hard block active"
+            elif status.status == "WARN":
+                action = "Monitor and wait for improvement"
+            else:
+                action = "Healthy"
+            summary_rows.append(
+                {
+                    "Gate": gate,
+                    "State": status.status,
+                    "Checks": gate_help.get(gate, ""),
+                    "Current": status.summary,
+                    "Action": action,
+                }
+            )
+        st.subheader("A-E Summary")
+        st.dataframe(pd.DataFrame(summary_rows), width="stretch", height=210)
+
+        pstar_latest = query_df(
+            """
+            SELECT ts_ms, symbol, disagreement_bps, age_spot_ms, age_perp_ms, valid
+            FROM pstar_stats
+            ORDER BY ts_ms DESC
+            LIMIT 1
+            """
+        )
+        st.subheader("A: Price feed")
+        if pstar_latest.empty:
+            st.info("No recent price feed sample.")
+        else:
+            row = pstar_latest.iloc[0]
+            valid = int(row.get("valid") or 0) == 1
+            age_spot = float(row.get("age_spot_ms") or 0.0) / 1000.0
+            age_perp = float(row.get("age_perp_ms") or 0.0) / 1000.0
+            disagree = row.get("disagreement_bps")
+            validity_text = "valid" if valid else "invalid"
+            disagree_text = f"{float(disagree):.1f} bps" if disagree is not None and not pd.isna(disagree) else "N/A"
+            st.markdown(
+                f"Latest feed is {validity_text}. spot_age={age_spot:.1f}s perp_age={age_perp:.1f}s disagreement={disagree_text}."
+            )
+
+        st.subheader("B: Causality")
+        causality_counts = query_df(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN max_feature_ts_ms >= ts_ms THEN 1 ELSE 0 END) AS violations
+            FROM decisions
+            WHERE ts_ms >= ?
+            """,
+            (int(pd.Timestamp.utcnow().timestamp() * 1000) - filters.window_minutes * 60_000,),
+        )
+        total = int(causality_counts.iloc[0]["total"]) if not causality_counts.empty and causality_counts.iloc[0]["total"] is not None else 0
+        violations = int(causality_counts.iloc[0]["violations"]) if not causality_counts.empty and causality_counts.iloc[0]["violations"] is not None else 0
+        if violations > 0:
+            st.markdown(f"<div class='alert'>Detected {violations} causality violation(s) out of {total} decisions.</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='ok'>No causality violations in the selected window.</div>", unsafe_allow_html=True)
+
+        st.subheader("C: Book quality")
+        book_latest = query_df(
+            """
+            SELECT ts_ms, spread_bps, depth_at_qty_buy, depth_at_qty_sell, book_health
+            FROM microstructure_stats
+            ORDER BY ts_ms DESC
+            LIMIT 1
+            """
+        )
+        if book_latest.empty:
+            st.info("No recent order book snapshot.")
+        else:
+            row = book_latest.iloc[0]
+            spread = row.get("spread_bps")
+            spread_text = f"{float(spread):.1f} bps" if spread is not None and not pd.isna(spread) else "N/A"
+            buy = row.get("depth_at_qty_buy")
+            sell = row.get("depth_at_qty_sell")
+            depth_text = "N/A"
+            if buy is not None and sell is not None and not pd.isna(buy) and not pd.isna(sell):
+                depth_text = f"{(float(buy) + float(sell)) / 2.0:.3f}"
+            health = str(row.get("book_health") or "UNKNOWN").upper()
+            st.markdown(f"Spread={spread_text} | Depth={depth_text} | Book health={health}")
+
+        st.subheader("D: Hedge risk")
+        d_state = gate_map.get("D")
+        if d_state is not None:
+            completeness = d_state.details.get("hedge_completeness")
+            one_leg = int(d_state.details.get("one_leg_alerts") or 0)
+            if completeness is not None:
+                st.markdown(f"Hedge completeness={float(completeness) * 100.0:.1f}% | one-leg alerts={one_leg}")
+            else:
+                st.markdown(f"One-leg alerts={one_leg}")
+
+        st.subheader("E: Latency")
+        e_state = gate_map.get("E")
+        if e_state is not None:
+            ws_lag = e_state.details.get("ws_lag_p95_ms")
+            ack = e_state.details.get("ack_p95_ms")
+            sig = e_state.details.get("signal_age_p95_ms")
+            ws_text = f"{float(ws_lag):.1f} ms" if ws_lag is not None else "N/A"
+            ack_text = f"{float(ack):.1f} ms" if ack is not None else "N/A"
+            sig_text = f"{float(sig):.1f} ms" if sig is not None else "N/A"
+            st.markdown(f"ws_lag p95={ws_text} | ack p95={ack_text} | signal_age p95={sig_text}")
+
+        st.subheader("Recent critical alerts")
+        critical = query_df(
+            """
+            SELECT ts_ms, code, message
+            FROM alerts
+            WHERE LOWER(severity)='critical'
+            ORDER BY ts_ms DESC
+            LIMIT 10
+            """
+        )
+        if critical.empty:
+            st.info("No recent critical alerts - system operating normally.")
+        else:
+            critical["ts"] = pd.to_datetime(critical["ts_ms"], unit="ms", utc=True)
+            if reason_humanizer is not None:
+                critical["reason"] = critical.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
+            critical = critical.drop(columns=["message"], errors="ignore")
+            st.dataframe(critical, width="stretch", height=180)
+        elapsed = (perf_counter() - t0) * 1000.0
+        if elapsed > panel_budget_ms:
+            st.caption(f"DEGRADED panel_over_budget_ms={elapsed:.1f} budget_ms={panel_budget_ms}")
+        return
 
     st.subheader("A: P* validity")
     pstar = query_df(
@@ -332,7 +495,10 @@ def render_logs_panel(
     if reason_humanizer is not None and "code" in alerts.columns:
         alerts["reason"] = alerts.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
     alerts = _sanitize_df_for_view(alerts, view_mode, reason_humanizer=reason_humanizer)
-    st.dataframe(alerts, width="stretch", height=220)
+    if alerts.empty:
+        st.info(EMPTY_LOG_MESSAGES["alerts"])
+    else:
+        st.dataframe(alerts, width="stretch", height=220)
 
     breaches = query_df(
         """
@@ -351,7 +517,10 @@ def render_logs_panel(
     if reason_humanizer is not None and "code" in breaches.columns:
         breaches["reason"] = breaches.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
     breaches = _sanitize_df_for_view(breaches, view_mode, reason_humanizer=reason_humanizer)
-    st.dataframe(breaches, width="stretch", height=180)
+    if breaches.empty:
+        st.info(EMPTY_LOG_MESSAGES["breaches"])
+    else:
+        st.dataframe(breaches, width="stretch", height=180)
 
     logs = query_df(
         """
@@ -366,7 +535,10 @@ def render_logs_panel(
     if not logs.empty:
         logs["ts"] = pd.to_datetime(logs["ts_ms"], unit="ms", utc=True)
     st.subheader("Logs")
-    st.dataframe(logs, width="stretch", height=220)
+    if logs.empty:
+        st.info(EMPTY_LOG_MESSAGES["logs"])
+    else:
+        st.dataframe(logs, width="stretch", height=220)
 
     manifest = logs[logs["msg"].str.contains("manifest", case=False, na=False)] if not logs.empty else pd.DataFrame()
     last_manifest_hash = "N/A"
