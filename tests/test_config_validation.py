@@ -1,10 +1,11 @@
 import asyncio
 import unittest
 
-from config.settings import MarketConfig, validate_markets_config
+from config.settings import AutoDiscoverSpec, MarketConfig, load_markets, validate_markets_config
 from core.market_discovery import resolve_markets
 from pathlib import Path
 import json
+import tempfile
 
 
 class TestConfigValidation(unittest.TestCase):
@@ -56,6 +57,79 @@ class TestConfigValidation(unittest.TestCase):
         )
         self.assertEqual(resolved[0].condition_id, "0xbtc2")
         self.assertEqual(resolved[0].token_ids, ["btc_new_down", "btc_new_up"])
+
+    def test_load_markets_parses_auto_discover_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "markets.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "markets": [
+                            {
+                                "name": "BTC 15m",
+                                "condition_id": "",
+                                "token_ids": [],
+                                "slug_prefix": None,
+                                "reference_symbol": "BTC",
+                                "min_tick": 0.01,
+                                "min_size": 1.0,
+                                "max_price": 0.99,
+                                "min_price": 0.01,
+                                "auto_discover": {
+                                    "symbol": "BTC",
+                                    "horizon": "15m",
+                                    "mode": "latest_active",
+                                },
+                            }
+                        ]
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            loaded = load_markets(path.as_posix())
+        self.assertEqual(len(loaded), 1)
+        self.assertIsNotNone(loaded[0].auto_discover)
+        assert loaded[0].auto_discover is not None
+        self.assertEqual(loaded[0].auto_discover.symbol, "BTC")
+        self.assertEqual(loaded[0].auto_discover.horizon, "15m")
+        self.assertEqual(loaded[0].auto_discover.mode, "latest_active")
+
+    def test_invalid_auto_discover_tuple_raises(self) -> None:
+        markets = [
+            MarketConfig(
+                name="BTC 15m",
+                condition_id=None,
+                token_ids=[],
+                slug_prefix=None,
+                reference_symbol="BTC",
+                min_tick=0.01,
+                min_size=1.0,
+                max_price=0.99,
+                min_price=0.01,
+                auto_discover=AutoDiscoverSpec(symbol="ETH", horizon="1h", mode="latest_active"),
+            )
+        ]
+        with self.assertRaises(ValueError) as exc:
+            validate_markets_config(markets, auto_discover=True)
+        self.assertIn("auto_discover unsupported tuple", str(exc.exception))
+
+    def test_valid_auto_discover_tuple_passes(self) -> None:
+        markets = [
+            MarketConfig(
+                name="BTC 15m",
+                condition_id=None,
+                token_ids=[],
+                slug_prefix=None,
+                reference_symbol="BTC",
+                min_tick=0.01,
+                min_size=1.0,
+                max_price=0.99,
+                min_price=0.01,
+                auto_discover=AutoDiscoverSpec(symbol="BTC", horizon="15m", mode="latest_active"),
+            )
+        ]
+        validate_markets_config(markets, auto_discover=True)
 
 
 if __name__ == "__main__":

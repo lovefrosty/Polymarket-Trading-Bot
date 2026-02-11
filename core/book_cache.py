@@ -25,6 +25,11 @@ class BookSnapshot:
     ts_event_ms: Optional[int]
     ts_recv_mono_ns: int
     ts_recv_wall_ms: int
+    book_asof_ts_ms: Optional[int] = None
+    book_recv_ts_ms: Optional[int] = None
+    book_seq: int = 0
+    book_level_count: int = 0
+    book_health_state: Optional[str] = None
 
     @classmethod
     def from_order_book(
@@ -32,9 +37,20 @@ class BookSnapshot:
         token_id: str,
         book: OrderBook,
         ts_recv_wall_ms: int,
+        book_seq: int = 0,
     ) -> "BookSnapshot":
         bids = tuple(sorted([(float(p), float(s)) for p, s in book.bids.items() if s > 0], key=lambda x: -x[0]))
         asks = tuple(sorted([(float(p), float(s)) for p, s in book.asks.items() if s > 0], key=lambda x: x[0]))
+        asof_ts_ms = int(book.last_event_ts_ms if book.last_event_ts_ms is not None else ts_recv_wall_ms)
+        recv_ts_ms = int(ts_recv_wall_ms)
+        level_count = int(len(bids) + len(asks))
+        age_ms = max(0, recv_ts_ms - asof_ts_ms)
+        if age_ms > 120_000:
+            health_state = BookHealthState.DOWN.value
+        elif age_ms > 30_000:
+            health_state = BookHealthState.STALE.value
+        else:
+            health_state = BookHealthState.FRESH.value
         return cls(
             token_id=token_id,
             bids=bids,
@@ -42,6 +58,11 @@ class BookSnapshot:
             ts_event_ms=book.last_event_ts_ms,
             ts_recv_mono_ns=book.last_recv_mono_ns,
             ts_recv_wall_ms=int(ts_recv_wall_ms),
+            book_asof_ts_ms=asof_ts_ms,
+            book_recv_ts_ms=recv_ts_ms,
+            book_seq=int(book_seq),
+            book_level_count=level_count,
+            book_health_state=health_state,
         )
 
     def is_fresh(self, now_wall_ms: int, threshold_ms: int) -> bool:
@@ -98,6 +119,24 @@ class BookSnapshot:
                 break
             filled += min(size, qty - filled)
         return filled
+
+    def depth_at_notional(self, side: str, notional: float) -> float:
+        if notional <= 0:
+            return 0.0
+        levels = self._levels_for_side(side)
+        remaining = float(notional)
+        filled_qty = 0.0
+        for price, size in levels:
+            if remaining <= 0:
+                break
+            if price <= 0:
+                continue
+            level_notional = float(price) * float(size)
+            take_notional = min(level_notional, remaining)
+            take_qty = take_notional / float(price)
+            filled_qty += take_qty
+            remaining -= take_notional
+        return float(filled_qty)
 
     def vwap_to_fill(self, side: str, qty: float) -> Optional[float]:
         if qty <= 0:

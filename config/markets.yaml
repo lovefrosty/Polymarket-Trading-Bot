@@ -6,6 +6,11 @@
       "discovery_backend": "clob",
       "selection_regex": null,
       "allow_unknown_symbol": false,
+      "auto_discover": {
+        "symbol": "BTC",
+        "horizon": "15m",
+        "mode": "latest_active"
+      },
       "condition_id": "",
       "token_ids": [],
       "reference_symbol": "BTC",

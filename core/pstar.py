@@ -23,6 +23,8 @@ class PStar:
     confidence: float
     valid: bool
     diagnostics: Dict[str, object]
+    ts_recv_ms: Optional[int] = None
+    invalid_reason: Optional[str] = None
 
 
 class PStarBuilder:
@@ -55,6 +57,10 @@ class PStarBuilder:
             return
         by_source[snap.source] = snap
 
+    def reset_symbols(self, symbols: Set[str]) -> None:
+        for symbol in {str(sym) for sym in symbols if sym}:
+            self._latest.pop(symbol, None)
+
     def build(self, symbol: str, now_wall_ms: int) -> PStar:
         by_source = self._latest.get(symbol) or {}
         missing = sorted(self.required_sources - set(by_source.keys()))
@@ -69,6 +75,9 @@ class PStarBuilder:
             "spot_px": None,
             "perp_px": None,
             "single_source": None,
+            "pstar_recv_ts_ms": None,
+            "pstar_sourceset": [],
+            "invalid_reason": None,
         }
 
         def _age(source_name: str) -> Optional[int]:
@@ -90,7 +99,9 @@ class PStarBuilder:
             if age is not None and age > self.max_age_ms
         ]
         if stale_sources:
-            diagnostics["freeze_reason"] = f"stale_source:{','.join(sorted(stale_sources))}"
+            invalid_reason = f"stale_source:{','.join(sorted(stale_sources))}"
+            diagnostics["freeze_reason"] = invalid_reason
+            diagnostics["invalid_reason"] = invalid_reason
             return PStar(
                 symbol=symbol,
                 value=None,
@@ -99,6 +110,8 @@ class PStarBuilder:
                 confidence=0.0,
                 valid=False,
                 diagnostics=diagnostics,
+                ts_recv_ms=None,
+                invalid_reason=invalid_reason,
             )
 
         spot = by_source.get("spot")
@@ -111,6 +124,7 @@ class PStarBuilder:
             mid = (spot.value + perp.value) / 2.0
             if mid <= 0:
                 diagnostics["freeze_reason"] = "non_positive_reference"
+                diagnostics["invalid_reason"] = "non_positive_reference"
                 return PStar(
                     symbol=symbol,
                     value=None,
@@ -119,11 +133,14 @@ class PStarBuilder:
                     confidence=0.0,
                     valid=False,
                     diagnostics=diagnostics,
+                    ts_recv_ms=None,
+                    invalid_reason="non_positive_reference",
                 )
             disagree_bps = abs(perp.value - spot.value) / mid * 10000.0
             diagnostics["disagreement_bps"] = disagree_bps
             if disagree_bps >= self.freeze_disagree_bps:
                 diagnostics["freeze_reason"] = "pstar_disagreement_extreme"
+                diagnostics["invalid_reason"] = "pstar_disagreement_extreme"
                 return PStar(
                     symbol=symbol,
                     value=None,
@@ -132,6 +149,8 @@ class PStarBuilder:
                     confidence=0.0,
                     valid=False,
                     diagnostics=diagnostics,
+                    ts_recv_ms=None,
+                    invalid_reason="pstar_disagreement_extreme",
                 )
             confidence = 1.0
             if disagree_bps > self.degrade_disagree_bps:
@@ -139,6 +158,9 @@ class PStarBuilder:
                 x = min(1.0, (disagree_bps - self.degrade_disagree_bps) / width)
                 confidence = max(0.2, 1.0 - x)
             ts_event_ms = max(spot.ts_event_ms, perp.ts_event_ms)
+            ts_recv_ms = max(spot.ts_recv_wall_ms, perp.ts_recv_wall_ms)
+            diagnostics["pstar_recv_ts_ms"] = ts_recv_ms
+            diagnostics["pstar_sourceset"] = ["perp", "spot"]
             return PStar(
                 symbol=symbol,
                 value=mid,
@@ -147,10 +169,13 @@ class PStarBuilder:
                 confidence=float(confidence),
                 valid=True,
                 diagnostics=diagnostics,
+                ts_recv_ms=ts_recv_ms,
+                invalid_reason=None,
             )
 
         if not self.allow_degraded_single_source:
             diagnostics["freeze_reason"] = "missing_required_sources"
+            diagnostics["invalid_reason"] = "missing_required_sources"
             return PStar(
                 symbol=symbol,
                 value=None,
@@ -159,11 +184,14 @@ class PStarBuilder:
                 confidence=0.0,
                 valid=False,
                 diagnostics=diagnostics,
+                ts_recv_ms=None,
+                invalid_reason="missing_required_sources",
             )
 
         freshest = _freshest(by_source)
         if freshest is None:
             diagnostics["freeze_reason"] = "missing_required_sources"
+            diagnostics["invalid_reason"] = "missing_required_sources"
             return PStar(
                 symbol=symbol,
                 value=None,
@@ -172,10 +200,14 @@ class PStarBuilder:
                 confidence=0.0,
                 valid=False,
                 diagnostics=diagnostics,
+                ts_recv_ms=None,
+                invalid_reason="missing_required_sources",
             )
         diagnostics["degraded"] = True
         diagnostics["freeze_reason"] = None
         diagnostics["single_source"] = freshest.source
+        diagnostics["pstar_recv_ts_ms"] = int(freshest.ts_recv_wall_ms)
+        diagnostics["pstar_sourceset"] = [str(freshest.source)]
         return PStar(
             symbol=symbol,
             value=float(freshest.value),
@@ -184,6 +216,8 @@ class PStarBuilder:
             confidence=0.4,
             valid=True,
             diagnostics=diagnostics,
+            ts_recv_ms=int(freshest.ts_recv_wall_ms),
+            invalid_reason=None,
         )
 
 

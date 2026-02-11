@@ -299,6 +299,10 @@ def _normalize_open_orders(raw: Any) -> Dict[str, Dict[str, Any]]:
             "status": str(row.get("status") or row.get("state") or "open"),
             "client_order_id": str(row.get("client_order_id") or row.get("clientOrderId") or ""),
             "quote_group_id": str(row.get("quote_group_id") or ""),
+            "idempotency_key": str(row.get("idempotency_key") or ""),
+            "post_only": bool(row.get("post_only", True)),
+            "mode": str(row.get("mode") or "MAKE"),
+            "updated_ts_ms": _as_int(row.get("updated_ts_ms") or row.get("updatedAt") or row.get("updated_at")),
         }
     return normalized
 
@@ -308,6 +312,13 @@ def _as_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _dry_run_events(intent: OrderIntent, ts_ms: int) -> List[BrokerEvent]:

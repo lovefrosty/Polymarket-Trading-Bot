@@ -1,102 +1,50 @@
-# Polymarket Trading Bot — Project Tracker
+# Polymarket Terminal - Live Readiness Tracker
 
-Last updated: 2026-02-04
+Last updated: 2026-02-11
 
-## Status Summary
+## Program Objective
+Reach safe TRADE readiness with zero silent failures, deterministic observability, and operator-grade explainability.
 
-Goal: single execution-safe system for 15-minute crypto Up/Down markets with strict reference validation, causal features, and simulation-true backtests.
+Build order is locked:
+1. Runtime reliability and ingestion hardening
+2. Dashboard modularization + explainability
+3. Data/replay/export diagnostics
+4. Conservative promotion pipeline (OBSERVE -> PAPER -> TRADE)
 
-Current focus:
-- Reference WS integration + multi-source fallback
-- Walk-forward report with expanded metrics
-- Dataset export upgrades (CSV + Parquet)
+## Milestone Status (G0-G7)
 
-## Roadmap (12 Implementations)
+| Milestone | Status | Scope | Evidence |
+|---|---|---|---|
+| G0 | Done | Baseline + program control | `audit/milestones/G0_baseline.md` |
+| G1 | Done | On-chain + discovery hardening | `audit/milestones/G1_onchain_discovery_hardening.md` |
+| G2 | Done | Canonical evidence contract + source guards | `audit/milestones/G2_evidence_contract_source_guards.md` |
+| G3 | Done | Dashboard monolith split into panel modules | `audit/milestones/G3_dashboard_modularization.md` |
+| G4 | Done | Operator explainability + incident export v0 | `audit/milestones/G4_explainability_export_v0.md` |
+| G5 | Done | Replay/live diff v0 + reliability scoreboard | `audit/milestones/G5_replay_diff_reliability_scoreboard.md` |
+| G6 | Pending | Data pipeline completion + expanded walk-forward | pending |
+| G7 | Pending | Promotion pipeline + soak gates | pending |
 
-Status legend: `Done`, `Partial`, `Missing`, `In Progress`
+## Locked Safety Thresholds (Constitution)
+Source: `config/constitution.yaml`
 
-1. WS On-chain Ingestion (Primary) — Done  
-Goal: WS persistent filters for on-chain logs  
-Acceptance: events <1s post-block, reconnects ok, EventTape includes `tx_hash` + `log_index`
+- `policy.pstar_max_age_ms = 3000`
+- `policy.pstar_freeze_disagree_bps = 50.0`
+- `policy.book_stale_after_ms = 30000`
+- `policy.book_down_after_ms = 120000`
+- `policy.signal_age_max_ms = 1200`
+- `policy.ack_p95_max_ms = 400.0`
+- `policy.ws_lag_max_ms = 1000.0`
 
-2. HTTP Reconciliation (Fallback) — Done  
-Goal: gap-fill missed logs  
-Acceptance: WS off still yields continuity; no double counting
+## Promotion Policy (Conservative)
+- OBSERVE gate: 7d stability, no unresolved A/B causality violations.
+- PAPER gate: 10-14d stability, replay diagnostics green, reconciliation stable.
+- TRADE gate: low-cap canary, maker-first, emergency unwind enabled, kill-switch armed.
 
-3. LRU Deduper — Done  
-Goal: dedupe on reconnect/provider quirks  
-Acceptance: duplicate `(tx_hash, log_index)` processed once
+## Current Workstream (G6-G7)
+- Complete dataset/export/label/walk-forward expanded metrics path.
+- Execute conservative promotion pipeline and soak gates.
 
-4. Heartbeat + Health Telemetry — Partial  
-Goal: regular system-alive + lag counters  
-Acceptance: heartbeat every 2s idle; includes lag/counters
-
-5. Event Normalization Schema — Partial  
-Goal: canonical event record with stable keys  
-Acceptance: all events have required keys; tests pass
-
-6. As-of Timestamp Guardrails — Partial  
-Goal: enforce causality in features  
-Acceptance: assert `max_event_ts_used <= as_of_ts`
-
-7. Exporter (Tapes → Dataset) — Partial  
-Goal: Parquet/CSV rows with as-of join  
-Acceptance: re-run exporter → identical dataset; stable schema
-
-8. Labeler (15m target) — Partial  
-Goal: honest labels (no leakage), log-odds optional  
-Acceptance: labels use only future data
-
-9. Broker Interface — Done  
-Goal: strategy talks to Broker interface only  
-Acceptance: strategy runs unchanged on Sim vs Live
-
-10. SimBroker + Fill/Cost Model — Partial  
-Goal: realistic backtest (fees/slip/latency)  
-Acceptance: PnL sensibly worsens with slippage/latency
-
-11. Walk-forward Report — Partial  
-Goal: OOS evaluation + stress tests  
-Acceptance: stable results across windows; outputs PnL/DD/turnover
-
-12. Dry-run Execution Loop — Partial  
-Goal: full loop w/ SimBroker live feed  
-Acceptance: 6h run; orders → fills → inventory logged
-
-## Audit Considerations
-
-Priority is highest-first.
-
-- Reference P Pipeline — In Progress  
-Switch to WS for Kraken; multi-source fallback; degrade confidence vs freeze.
-
-- DecisionTape Emission / Signal Cadence — Done  
-DecisionTape every 1s (heartbeat) + event-triggered decisions.
-
-- L2 Order Book Maintenance — Partial  
-Configurable staleness; multi-level imbalance feature still needed.
-
-- Replay & Calibration Harness — Partial  
-Fast-replay flag + walk-forward CV pending.
-
-- Fee Model Accuracy — Partial  
-Configurable fee override; ability to query fee curve pending.
-
-## Open Questions
-
-- How strict should the partial reference confidence gating be in live/paper?
-- Do we want a dedicated trade PnL ledger (TradeTape → PnL) beyond label-based PnL?
-
-## Acceptance Tests (Must-Haves)
-
-- Failure A (Reference): stale or mismatched reference ⇒ no trade
-- Failure B (Time leakage): max feature ts < decision ts
-- Failure C (Book lies): depth/slippage gates enforced
-- Failure D (One-leg risk): hedge deadline enforced
-- Failure E (Latency): reject on excessive signal age / ack latency
-
-## Next Milestones
-
-1. Finish reference WS integration + fallback confidence policy
-2. Deliver walk-forward report with expanded metrics and sensitivity
-3. Export datasets to CSV + Parquet with daily partitions
+## Blockers That Halt Autonomous Progress
+- Missing or invalid exchange credentials.
+- Requested changes to locked promotion thresholds.
+- Unexplained nondeterminism that invalidates replay diagnostics.

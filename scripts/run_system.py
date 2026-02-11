@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import signal
 import sys
 import time
 import uuid
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -31,7 +32,13 @@ from core.broker_sim import SimBroker, SimBrokerConfig
 from core.decision_tape import DecisionRecord, DecisionTape, TimeMapper
 from core.event_tape import EventTape
 from core.execution_fsm import ExecutionFSM, ExecutionState
-from core.market_discovery import GAMMA_BASE_URL, resolve_markets
+from core.market_discovery import (
+    GAMMA_BASE_URL,
+    NoActiveMarketError,
+    deterministic_market_selection_key_str,
+    resolve_markets,
+)
+from core.market_rollover import MarketRolloverConfig, MarketRolloverManager, MarketState, market_state_from_resolved
 from core.metrics import Metrics
 from core.order_book import OrderBook
 from core.policy_gate import PolicyContext, PolicyThresholds, PolicyVerdict, evaluate_policy
@@ -41,7 +48,7 @@ from core.reference_ws import ReferenceWSClient, ReferenceWSConfig
 from core.sqlite_store import SQLiteStore
 from core.trade_tape import TradeTape
 from core.validators import OrderConstraints
-from data.polymarket_ws import MarketWSClient, WSConfig
+from data.polymarket_ws import MarketWSClient, ResubscribeResult, WSConfig
 
 
 def _now_ms() -> int:
@@ -89,6 +96,72 @@ class OpenQuote:
     updated_ms: int
 
 
+@dataclass
+class RolloverHealthGate:
+    abort_threshold: int = 3
+    abort_window_ms: int = 10 * 60_000
+    cooldown_ms: int = 10 * 60_000
+    abort_ts_ms: Deque[int] = field(default_factory=deque)
+    frozen_until_ts_ms: Optional[int] = None
+
+    def is_frozen(self, now_ms: int) -> bool:
+        now = int(now_ms)
+        if self.frozen_until_ts_ms is None:
+            return False
+        if now >= int(self.frozen_until_ts_ms):
+            self.frozen_until_ts_ms = None
+            self._prune(now)
+            return False
+        return True
+
+    def note_abort(self, now_ms: int) -> Optional[Dict[str, Any]]:
+        now = int(now_ms)
+        self.abort_ts_ms.append(now)
+        self._prune(now)
+        threshold = max(1, int(self.abort_threshold))
+        if len(self.abort_ts_ms) < threshold:
+            return None
+        cooldown = max(0, int(self.cooldown_ms))
+        self.frozen_until_ts_ms = now + cooldown if cooldown > 0 else now
+        oldest = int(self.abort_ts_ms[0]) if self.abort_ts_ms else now
+        return {
+            "abort_count_window": int(len(self.abort_ts_ms)),
+            "abort_threshold": int(threshold),
+            "abort_window_ms": int(self.abort_window_ms),
+            "window_start_ts_ms": int(oldest),
+            "window_end_ts_ms": int(now),
+            "frozen_until_ts_ms": int(self.frozen_until_ts_ms),
+        }
+
+    def _prune(self, now_ms: int) -> None:
+        now = int(now_ms)
+        window = max(1, int(self.abort_window_ms))
+        while self.abort_ts_ms and now - int(self.abort_ts_ms[0]) > window:
+            self.abort_ts_ms.popleft()
+
+
+@dataclass(frozen=True)
+class MarketReadinessConfig:
+    book_max_age_ms: int = 5_000
+    book_max_spread_bps: float = 200.0
+    depth_target_qty: float = 1.0
+    pstar_max_age_ms: int = 5_000
+
+
+@dataclass(frozen=True)
+class MarketReadinessResult:
+    ready: bool
+    reason_codes: List[str]
+    details: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RolloverCommitDecision:
+    action: str
+    force_observe_only: bool
+    reason: str
+
+
 class RuntimeEngine:
     def __init__(
         self,
@@ -105,6 +178,8 @@ class RuntimeEngine:
         time_mapper: TimeMapper,
         broker: Optional[Any],
         run_epoch_ms: int,
+        run_id: Optional[str] = None,
+        readiness_config: Optional[MarketReadinessConfig] = None,
     ) -> None:
         self.mode = mode
         self.db = db
@@ -119,6 +194,7 @@ class RuntimeEngine:
         self.time_mapper = time_mapper
         self.broker = broker
         self.run_epoch_ms = int(run_epoch_ms)
+        self.run_id = str(run_id or f"run-{self.run_epoch_ms}")
         self.book_cache = BookCache()
         self.fsms: Dict[str, ExecutionFSM] = {
             token: ExecutionFSM(rebalance_timeout_ms=self.policy_thresholds.hedge_timeout_ms)
@@ -152,10 +228,257 @@ class RuntimeEngine:
             trading_cfg=self.constitution.get("trading", {}),
             execution_cfg=self.constitution.get("execution", {}),
         )
+        recon_cfg = self.constitution.get("reconciliation", {}) if isinstance(self.constitution, dict) else {}
+        trading_cfg = self.constitution.get("trading", {}) if isinstance(self.constitution, dict) else {}
+        self._reconcile_period_ms = int(
+            trading_cfg.get(
+                "reconcile_period_ms",
+                recon_cfg.get("reconcile_period_ms", 5_000),
+            )
+        )
+        self._mismatch_tolerance_qty = float(
+            trading_cfg.get(
+                "mismatch_tolerance_qty",
+                recon_cfg.get("mismatch_tolerance_qty", 0.01),
+            )
+        )
+        self._mismatch_tolerance_usdc = float(
+            trading_cfg.get(
+                "mismatch_tolerance_usdc",
+                recon_cfg.get("mismatch_tolerance_usdc", 1.0),
+            )
+        )
+        self._mismatch_freeze_cycles = int(
+            trading_cfg.get(
+                "mismatch_freeze_cycles",
+                recon_cfg.get("mismatch_freeze_cycles", 3),
+            )
+        )
+        self._onchain_disagree_freeze_cycles = int(
+            trading_cfg.get(
+                "onchain_disagree_freeze_cycles",
+                recon_cfg.get("onchain_disagree_freeze_cycles", 6),
+            )
+        )
+        self._reconcile_clean_unfreeze_cycles = int(
+            trading_cfg.get(
+                "reconcile_clean_unfreeze_cycles",
+                recon_cfg.get("reconcile_clean_unfreeze_cycles", 3),
+            )
+        )
+        self._single_level_quoting = bool(
+            trading_cfg.get(
+                "single_level_quoting",
+                recon_cfg.get("single_level_quoting", True),
+            )
+        )
+        self._startup_allow_exact_duplicate_cleanup = bool(
+            trading_cfg.get(
+                "startup_allow_exact_duplicate_cleanup",
+                recon_cfg.get("startup_allow_exact_duplicate_cleanup", False),
+            )
+        )
+        self._qty_scale = int(
+            trading_cfg.get(
+                "qty_scale",
+                recon_cfg.get("qty_scale", 1_000_000),
+            )
+        )
+        self._usdc_scale = int(
+            trading_cfg.get(
+                "usdc_scale",
+                recon_cfg.get("usdc_scale", 1_000_000),
+            )
+        )
+        self._next_reconcile_due_ms: int = 0
+        self._consecutive_mismatch_cycles: int = 0
+        self._consecutive_onchain_disagree_cycles: int = 0
+        self._consecutive_clean_cycles: int = 0
+        self._reconciliation_frozen: bool = False
+        self._reconciliation_freeze_reason: str = ""
+        self._seen_reconcile_fill_ids: Set[str] = set()
+        self._book_seq_by_token: Dict[str, int] = defaultdict(int)
+        self._book_update_count_by_token: Dict[str, int] = defaultdict(int)
+        self._last_book_recv_mono_by_token: Dict[str, int] = defaultdict(int)
+        self._book_recv_ts_ms_by_token: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=5000))
+        self._book_age_samples_by_token: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=2000))
+        self._latest_book_snapshot_by_token: Dict[str, BookSnapshot] = {}
+        self._latest_pstar_by_symbol: Dict[str, PStar] = {}
+        self.pstar_age_samples: Deque[float] = deque(maxlen=2000)
+        self.readiness_config = readiness_config or MarketReadinessConfig()
+        self._rollover_guard_token_ids: Set[str] = set()
+        self._rollover_guard_quiet_until_ms: int = 0
+        self._rollover_guard_require_readiness: bool = False
+        self._rollover_guard_last_result: MarketReadinessResult = MarketReadinessResult(
+            ready=True,
+            reason_codes=[],
+            details={},
+        )
+        self._rollover_guard_last_checked_ms: Optional[int] = None
 
     def on_reference(self, source: str, symbol: str, value: float, ts_event_ms: Optional[int], ts_recv_ms: int) -> None:
         event_ts = int(ts_event_ms if ts_event_ms is not None else ts_recv_ms)
         self.pstar_builder.ingest(source=source, symbol=symbol, value=value, ts_event_ms=event_ts, ts_recv_wall_ms=ts_recv_ms)
+
+    def evaluate_market_readiness(
+        self,
+        token_ids: List[str],
+        now_ms: int,
+        books_override: Optional[Dict[str, OrderBook]] = None,
+        market_meta_override: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> MarketReadinessResult:
+        cfg = self.readiness_config
+        books = books_override if books_override is not None else self.books
+        market_meta = market_meta_override if market_meta_override is not None else self.market_meta
+        reasons: List[str] = []
+        details: Dict[str, Any] = {"tokens": {}, "pstar": {}}
+        symbols_seen: Set[str] = set()
+        required_qty = max(0.0, float(cfg.depth_target_qty))
+
+        for token_id in [str(token) for token in token_ids if token]:
+            book = books.get(token_id)
+            token_meta = market_meta.get(token_id) or {}
+            symbol = str(token_meta.get("reference_symbol") or "")
+            if symbol:
+                symbols_seen.add(symbol)
+            if book is None:
+                reasons.append("C_BOOK_DOWN")
+                details["tokens"][token_id] = {
+                    "book_present": False,
+                    "book_health_state": BookHealthState.DOWN.value,
+                    "book_age_ms": None,
+                    "spread_bps": None,
+                    "depth_at_qty_buy": 0.0,
+                    "depth_at_qty_sell": 0.0,
+                    "depth_target_qty": required_qty,
+                    "symbol": symbol or None,
+                }
+                continue
+
+            snap = BookSnapshot.from_order_book(token_id=token_id, book=book, ts_recv_wall_ms=int(now_ms))
+            health = snap.health_state(
+                now_wall_ms=int(now_ms),
+                stale_after_ms=self._book_stale_after_ms,
+                down_after_ms=self._book_down_after_ms,
+            ).value
+            age_ms = _maybe_int(snap.age_ms(int(now_ms)))
+            spread_bps = _maybe_float(snap.spread_bps())
+            depth_buy = float(snap.depth_at_qty("buy", required_qty))
+            depth_sell = float(snap.depth_at_qty("sell", required_qty))
+            min_depth = min(depth_buy, depth_sell)
+
+            if health == BookHealthState.DOWN.value:
+                reasons.append("C_BOOK_DOWN")
+            elif health != BookHealthState.FRESH.value:
+                reasons.append("C_BOOK_STALE")
+            if age_ms is None or age_ms > int(cfg.book_max_age_ms):
+                reasons.append("C_BOOK_STALE")
+            if spread_bps is None or spread_bps > float(cfg.book_max_spread_bps):
+                reasons.append("C_SPREAD_TOO_WIDE")
+            if min_depth < required_qty:
+                reasons.append("C_DEPTH_TOO_THIN")
+
+            details["tokens"][token_id] = {
+                "book_present": True,
+                "book_health_state": health,
+                "book_age_ms": age_ms,
+                "spread_bps": spread_bps,
+                "depth_at_qty_buy": depth_buy,
+                "depth_at_qty_sell": depth_sell,
+                "depth_target_qty": required_qty,
+                "symbol": symbol or None,
+            }
+
+        selected_symbol = sorted(symbols_seen)[0] if symbols_seen else ""
+        if not selected_symbol:
+            reasons.append("A_PSTAR_INVALID")
+            details["pstar"] = {
+                "symbol": None,
+                "valid": False,
+                "value": None,
+                "pstar_age_ms": None,
+                "confidence": 0.0,
+                "sources_used": [],
+                "invalid_reason": "missing_symbol",
+            }
+        else:
+            pstar = self.pstar_builder.build(selected_symbol, int(now_ms))
+            self._latest_pstar_by_symbol[selected_symbol] = pstar
+            pstar_age_ms = _maybe_int(int(now_ms) - int(pstar.ts_event_ms)) if pstar.ts_event_ms is not None else None
+            if not pstar.valid or pstar.value is None or pstar.ts_event_ms is None:
+                reasons.append("A_PSTAR_INVALID")
+            elif pstar_age_ms is None or pstar_age_ms > int(cfg.pstar_max_age_ms):
+                reasons.append("A_PSTAR_STALE")
+            details["pstar"] = {
+                "symbol": selected_symbol,
+                "valid": bool(pstar.valid),
+                "value": _maybe_float(pstar.value),
+                "pstar_age_ms": pstar_age_ms,
+                "confidence": _maybe_float(pstar.confidence),
+                "sources_used": sorted(pstar.sources_used),
+                "invalid_reason": str(pstar.invalid_reason or ""),
+            }
+
+        reason_codes = sorted(set(str(code) for code in reasons if code))
+        ready = len(reason_codes) == 0
+        details["ready"] = bool(ready)
+        details["as_of_ts_ms"] = int(now_ms)
+        return MarketReadinessResult(
+            ready=bool(ready),
+            reason_codes=reason_codes,
+            details=details,
+        )
+
+    def activate_rollover_guard(
+        self,
+        token_ids: List[str],
+        quiet_until_ms: int,
+        require_readiness: bool,
+    ) -> None:
+        self._rollover_guard_token_ids = {str(token) for token in token_ids if token}
+        self._rollover_guard_quiet_until_ms = int(max(0, quiet_until_ms))
+        self._rollover_guard_require_readiness = bool(require_readiness)
+        self._rollover_guard_last_checked_ms = None
+        self._rollover_guard_last_result = MarketReadinessResult(
+            ready=False,
+            reason_codes=["ROLLOVER_QUIET_WINDOW"] if self._rollover_guard_token_ids else [],
+            details={"as_of_ts_ms": int(_now_ms())},
+        )
+
+    def quote_guard_reasons(self, token_id: str, now_ms: int) -> List[str]:
+        if token_id not in self._rollover_guard_token_ids:
+            return []
+        reasons: List[str] = []
+        if int(now_ms) < int(self._rollover_guard_quiet_until_ms):
+            reasons.append("ROLLOVER_QUIET_WINDOW")
+        readiness_result = self.evaluate_market_readiness(
+            token_ids=sorted(self._rollover_guard_token_ids),
+            now_ms=int(now_ms),
+        )
+        self._rollover_guard_last_result = readiness_result
+        self._rollover_guard_last_checked_ms = int(now_ms)
+        if self._rollover_guard_require_readiness and not readiness_result.ready:
+            reasons.append("ROLLOVER_READINESS_BLOCK")
+            reasons.extend(readiness_result.reason_codes)
+        if not reasons and readiness_result.ready:
+            self._rollover_guard_token_ids = set()
+            self._rollover_guard_quiet_until_ms = 0
+            self._rollover_guard_require_readiness = False
+        return sorted(set(reasons))
+
+    def rollover_guard_status(self, now_ms: int) -> Dict[str, Any]:
+        if self._rollover_guard_token_ids:
+            self.quote_guard_reasons(next(iter(sorted(self._rollover_guard_token_ids))), int(now_ms))
+        return {
+            "active": bool(self._rollover_guard_token_ids),
+            "token_ids": sorted(self._rollover_guard_token_ids),
+            "quiet_until_ts_ms": int(self._rollover_guard_quiet_until_ms),
+            "requires_readiness": bool(self._rollover_guard_require_readiness),
+            "last_ready": bool(self._rollover_guard_last_result.ready),
+            "last_reason_codes": list(self._rollover_guard_last_result.reason_codes),
+            "last_checked_ts_ms": _maybe_int(self._rollover_guard_last_checked_ms),
+            "last_details": dict(self._rollover_guard_last_result.details),
+        }
 
     async def run_quote_cycle(self, now_ms: int) -> None:
         target_size = float(self.constitution["execution"].get("maker_quote_size", 1.0))
@@ -169,7 +492,7 @@ class RuntimeEngine:
             meta = self.market_meta.get(token_id, {})
             symbol = str(meta.get("reference_symbol") or "")
             constraint = self.constraints[token_id]
-            snap = BookSnapshot.from_order_book(token_id, book, now_ms)
+            snap = self._snapshot_book(token_id=token_id, book=book, now_ms=now_ms)
             self.book_cache.update(snap)
             self._record_book_snapshot(snap)
             book_health = snap.health_state(
@@ -185,6 +508,10 @@ class RuntimeEngine:
 
             pstar = self.pstar_builder.build(symbol, now_ms) if symbol else PStar(symbol="", value=None, ts_event_ms=None, sources_used=set(), confidence=0.0, valid=False, diagnostics={"freeze_reason": "missing_symbol"})
             self._record_pstar(now_ms, symbol, pstar)
+            pstar_age_ms = None
+            if pstar.ts_event_ms is not None:
+                pstar_age_ms = float(max(0, now_ms - int(pstar.ts_event_ms)))
+                self.pstar_age_samples.append(pstar_age_ms)
 
             q = self._fair_probability(token_id=token_id, symbol=symbol, snap=snap, pstar=pstar, now_ms=now_ms)
             self._last_q_by_token[token_id] = float(q)
@@ -230,6 +557,7 @@ class RuntimeEngine:
                 expected_slippage_bps=slip_buy,
                 depth_at_qty=depth_buy,
                 book_health_state=book_health.value,
+                reconciliation_mismatch_critical=bool(self._reconciliation_frozen and self.mode == "TRADE"),
             )
             sell_ctx = PolicyContext(
                 market=str(meta.get("slug") or token_id),
@@ -249,11 +577,15 @@ class RuntimeEngine:
                 expected_slippage_bps=slip_sell,
                 depth_at_qty=depth_sell,
                 book_health_state=book_health.value,
+                reconciliation_mismatch_critical=bool(self._reconciliation_frozen and self.mode == "TRADE"),
             )
             buy_verdict = evaluate_policy(buy_ctx, self.policy_thresholds)
             sell_verdict = evaluate_policy(sell_ctx, self.policy_thresholds)
 
             reasons = sorted(set(buy_verdict.reason_codes + sell_verdict.reason_codes + causality_reasons))
+            guard_reasons = self.quote_guard_reasons(token_id=token_id, now_ms=now_ms)
+            if guard_reasons:
+                reasons = sorted(set(reasons + guard_reasons))
             cap_diag = self._inventory_cap_diagnostics(token_id=token_id, q=q)
             if bool(cap_diag.get("hard_breach", False)):
                 reasons.append("RISK_CAP_BREACH")
@@ -264,6 +596,7 @@ class RuntimeEngine:
                 book_health == BookHealthState.DOWN
                 or bool(causality_reasons)
                 or bool(cap_diag.get("hard_breach", False))
+                or bool(self._reconciliation_frozen and self.mode == "TRADE")
             )
             if force_freeze:
                 buy_verdict = PolicyVerdict(
@@ -277,6 +610,19 @@ class RuntimeEngine:
                     action="FREEZE",
                     reason_codes=reasons,
                     diagnostics={**sell_verdict.diagnostics, "cap_diag": cap_diag},
+                )
+            if guard_reasons:
+                buy_verdict = PolicyVerdict(
+                    allow=False,
+                    action="HOLD",
+                    reason_codes=reasons,
+                    diagnostics={**buy_verdict.diagnostics, "guard_reasons": guard_reasons, "cap_diag": cap_diag},
+                )
+                sell_verdict = PolicyVerdict(
+                    allow=False,
+                    action="HOLD",
+                    reason_codes=reasons,
+                    diagnostics={**sell_verdict.diagnostics, "guard_reasons": guard_reasons, "cap_diag": cap_diag},
                 )
             prev_fsm_state = fsm.status().state.value
             if buy_verdict.action == "FREEZE" or sell_verdict.action == "FREEZE":
@@ -332,9 +678,30 @@ class RuntimeEngine:
                     "book_health_state": book_health.value,
                     "cap_diag": cap_diag,
                     "codes": reasons,
+                    "guard_reasons": guard_reasons,
                 },
                 fsm_state=fsm.status().state.value,
                 pstar_diag=pstar.diagnostics,
+            )
+            self._record_decision_tick(
+                now_ms=now_ms,
+                token_id=token_id,
+                decision_id=decision_id,
+                decision_ts_ms=decision_ts_event_ms,
+                max_feature_ts_ms=feature_max_ts,
+                snap=snap,
+                pstar=pstar,
+                ws_lag_ms=ws_lag_ms,
+                pstar_age_ms=pstar_age_ms,
+                signal_age_ms=float(signal_age_ms),
+                allow_action=bool(buy_verdict.allow or sell_verdict.allow),
+                block_reason_codes=reasons,
+                payload={
+                    "buy_action": buy_verdict.action,
+                    "sell_action": sell_verdict.action,
+                    "book_health_state": book_health.value,
+                    "guard_reasons": guard_reasons,
+                },
             )
             self._record_microstructure(
                 now_ms=now_ms,
@@ -349,11 +716,12 @@ class RuntimeEngine:
                 effective_spread_bps_sell=eff_sell,
             )
 
-            if book_health != BookHealthState.DOWN:
+            if book_health != BookHealthState.DOWN and not guard_reasons:
                 await self._apply_side(token_id, "buy", bid_px, target_size, constraint, buy_verdict, now_ms, decision_id)
                 await self._apply_side(token_id, "sell", ask_px, target_size, constraint, sell_verdict, now_ms, decision_id)
             else:
-                self.db.append_alert(now_ms, "critical", "BOOK_DOWN_FREEZE", f"{token_id}:health={book_health.value}")
+                if book_health == BookHealthState.DOWN:
+                    self.db.append_alert(now_ms, "critical", "BOOK_DOWN_FREEZE", f"{token_id}:health={book_health.value}")
             self._record_inventory(now_ms, token_id)
 
         self.db.upsert_system_state(
@@ -715,11 +1083,26 @@ class RuntimeEngine:
             fill_ts = int(event.payload.get("t_fill_wall_ms") or ts_ms)
             fill_qty = float(event.payload.get("fill_size") or 0.0)
             fill_price = float(event.payload.get("fill_price") or 0.0)
+            fill_key = str(event.payload.get("fill_event_id") or f"{event.order_id}:{fill_ts}:{fill_qty:.8f}:{side}")
+            self._seen_reconcile_fill_ids.add(fill_key)
+            self.db.mark_fill_event_seen(
+                fill_event_key=str(fill_key),
+                first_seen_ts_ms=int(fill_ts),
+                source="broker_event",
+                payload={
+                    "order_id": str(event.order_id),
+                    "token_id": str(token_id),
+                    "side": str(side),
+                    "fill_qty": float(fill_qty),
+                    "fill_price": float(fill_price),
+                },
+            )
+            fill_event_id = str(event.payload.get("fill_event_id") or uuid.uuid4().hex)
             self.db.insert(
                 "fills",
                 {
                     "ts_ms": fill_ts,
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": fill_event_id,
                     "order_id": event.order_id,
                     "token_id": token_id,
                     "side": side,
@@ -861,6 +1244,7 @@ class RuntimeEngine:
 
     def _record_pstar(self, now_ms: int, symbol: str, pstar: PStar) -> None:
         sources = ",".join(sorted(pstar.sources_used))
+        self._latest_pstar_by_symbol[symbol] = pstar
         self.db.insert(
             "pstar",
             {
@@ -868,8 +1252,10 @@ class RuntimeEngine:
                 "symbol": symbol or "",
                 "value": pstar.value,
                 "ts_event_ms": pstar.ts_event_ms,
+                "pstar_recv_ts_ms": _maybe_int(pstar.ts_recv_ms),
                 "confidence": float(pstar.confidence),
                 "valid": 1 if pstar.valid else 0,
+                "invalid_reason": str(pstar.invalid_reason or ""),
                 "sources_used": sources,
                 "diagnostics_json": json.dumps(pstar.diagnostics, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
             },
@@ -974,6 +1360,90 @@ class RuntimeEngine:
         )
         self.decision_tape.write(record)
 
+    def _record_decision_tick(
+        self,
+        now_ms: int,
+        token_id: str,
+        decision_id: str,
+        decision_ts_ms: int,
+        max_feature_ts_ms: int,
+        snap: BookSnapshot,
+        pstar: PStar,
+        ws_lag_ms: Optional[float],
+        pstar_age_ms: Optional[float],
+        signal_age_ms: float,
+        allow_action: bool,
+        block_reason_codes: List[str],
+        payload: Dict[str, Any],
+    ) -> None:
+        self.db.insert(
+            "decision_ticks",
+            {
+                "ts_ms": int(now_ms),
+                "event_id": uuid.uuid4().hex,
+                "decision_ts_ms": int(decision_ts_ms),
+                "token_id": str(token_id),
+                "decision_id": str(decision_id),
+                "book_asof_ts_ms": _maybe_int(snap.book_asof_ts_ms),
+                "book_recv_ts_ms": _maybe_int(snap.book_recv_ts_ms),
+                "book_seq": int(snap.book_seq),
+                "book_level_count": int(snap.book_level_count),
+                "book_health_state": str(snap.book_health_state or ""),
+                "pstar_value": _maybe_float(pstar.value),
+                "pstar_asof_ts_ms": _maybe_int(pstar.ts_event_ms),
+                "pstar_recv_ts_ms": _maybe_int(pstar.ts_recv_ms),
+                "pstar_sourceset": json.dumps(sorted(pstar.sources_used), separators=(",", ":"), ensure_ascii=True),
+                "pstar_confidence": float(pstar.confidence),
+                "pstar_valid": 1 if pstar.valid else 0,
+                "invalid_reason": str(pstar.invalid_reason or ""),
+                "max_feature_ts_ms": int(max_feature_ts_ms),
+                "ws_lag_ms": _maybe_float(ws_lag_ms),
+                "pstar_age_ms": _maybe_float(pstar_age_ms),
+                "signal_age_ms": _maybe_float(signal_age_ms),
+                "allow_action": 1 if allow_action else 0,
+                "block_reason_codes": ",".join(sorted(set(block_reason_codes))),
+                "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+            },
+        )
+
+    def _snapshot_book(self, token_id: str, book: OrderBook, now_ms: int) -> BookSnapshot:
+        last_recv = int(book.last_recv_mono_ns or 0)
+        prev_recv = int(self._last_book_recv_mono_by_token.get(token_id, 0))
+        if last_recv > 0 and last_recv != prev_recv:
+            self._book_seq_by_token[token_id] += 1
+            self._book_update_count_by_token[token_id] += 1
+            self._last_book_recv_mono_by_token[token_id] = last_recv
+            self._book_recv_ts_ms_by_token[token_id].append(int(now_ms))
+        snap = BookSnapshot.from_order_book(
+            token_id=token_id,
+            book=book,
+            ts_recv_wall_ms=now_ms,
+            book_seq=int(self._book_seq_by_token[token_id]),
+        )
+        book_health = snap.health_state(
+            now_wall_ms=now_ms,
+            stale_after_ms=self._book_stale_after_ms,
+            down_after_ms=self._book_down_after_ms,
+        ).value
+        snap = BookSnapshot(
+            token_id=snap.token_id,
+            bids=snap.bids,
+            asks=snap.asks,
+            ts_event_ms=snap.ts_event_ms,
+            ts_recv_mono_ns=snap.ts_recv_mono_ns,
+            ts_recv_wall_ms=snap.ts_recv_wall_ms,
+            book_asof_ts_ms=_maybe_int(snap.book_asof_ts_ms),
+            book_recv_ts_ms=_maybe_int(snap.book_recv_ts_ms),
+            book_seq=snap.book_seq,
+            book_level_count=snap.book_level_count,
+            book_health_state=book_health,
+        )
+        age_ms = snap.age_ms(now_ms)
+        if age_ms is not None:
+            self._book_age_samples_by_token[token_id].append(float(age_ms))
+        self._latest_book_snapshot_by_token[token_id] = snap
+        return snap
+
     def _record_inventory(self, now_ms: int, token_id: str) -> None:
         self.db.insert(
             "inventory",
@@ -1004,10 +1474,14 @@ class RuntimeEngine:
             {
                 "ts_ms": int(ts_ms),
                 "event_id": uuid.uuid4().hex,
+                "run_id": self.run_id,
+                "mode": self.mode,
                 "recovery_action": "FSM_TRANSITION",
                 "token_id": token_id,
                 "side": None,
                 "order_id": None,
+                "price": None,
+                "size": None,
                 "adopted_order_count": None,
                 "payload_json": json.dumps(
                     {
@@ -1134,38 +1608,148 @@ class RuntimeEngine:
             "caps": self._cap_state,
         }
 
-    def adopt_open_orders(self, snapshot: BrokerSnapshot, now_ms: int) -> int:
-        open_orders = snapshot.open_orders or {}
-        if not isinstance(open_orders, dict):
-            return 0
-        adopted = 0
-        latest_by_token_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for order_id, payload in open_orders.items():
+    def _normalize_open_order_row(self, order_id: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        token_id = str(payload.get("token_id") or "")
+        side = str(payload.get("side") or "").lower()
+        if not token_id or side not in {"buy", "sell"}:
+            return None
+        mode = str(payload.get("mode") or "MAKE").upper()
+        if mode == "TAKE":
+            return None
+        row_order_id = str(payload.get("order_id") or order_id)
+        updated_ts_ms = _maybe_int(
+            payload.get("updated_ts_ms")
+            or payload.get("updated_at_ms")
+            or payload.get("updated_at")
+            or payload.get("ts_ms")
+        )
+        return {
+            "order_id": row_order_id,
+            "token_id": token_id,
+            "side": side,
+            "quote_slot": int(_maybe_int(payload.get("quote_slot")) or 0),
+            "client_order_id": str(payload.get("client_order_id") or f"{row_order_id}:client"),
+            "price": float(payload.get("price") or 0.0),
+            "qty": float(payload.get("size") or 0.0),
+            "quote_group_id": str(payload.get("quote_group_id") or f"recovered:{token_id}:{side}"),
+            "idempotency_key": str(payload.get("idempotency_key") or f"recovered:{token_id}:{side}"),
+            "status": str(payload.get("status") or "open"),
+            "updated_ts_ms": int(updated_ts_ms or 0),
+            "payload": dict(payload),
+        }
+
+    def _open_order_slot_key(self, row: Dict[str, Any]) -> Tuple[str, str, int]:
+        return (
+            str(row.get("token_id") or ""),
+            str(row.get("side") or ""),
+            int(_maybe_int(row.get("quote_slot")) or 0),
+        )
+
+    def _open_order_duplicate_signature(self, row: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (
+            str(row.get("token_id") or ""),
+            str(row.get("side") or ""),
+            int(_maybe_int(row.get("quote_slot")) or 0),
+            _maybe_float(row.get("price")),
+            _maybe_float(row.get("qty")),
+        )
+
+    def _select_open_order_plan(
+        self,
+        open_orders: Dict[str, Any],
+    ) -> Tuple[Dict[Tuple[str, str, int], Dict[str, Any]], List[Dict[str, Any]]]:
+        by_slot: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = defaultdict(list)
+        for order_id in sorted(open_orders.keys()):
+            payload = open_orders.get(order_id)
+            if not isinstance(payload, dict):
+                continue
+            row = self._normalize_open_order_row(str(order_id), payload)
+            if row is None:
+                continue
+            by_slot[self._open_order_slot_key(row)].append(row)
+
+        keepers: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        extras: List[Dict[str, Any]] = []
+        for slot in sorted(by_slot.keys()):
+            rows = sorted(
+                by_slot[slot],
+                key=lambda row: (
+                    int(row.get("updated_ts_ms") or 0),
+                    str(row.get("order_id") or ""),
+                ),
+            )
+            if len(rows) > 1 and self._single_level_quoting:
+                if not self._startup_allow_exact_duplicate_cleanup:
+                    raise RuntimeError(
+                        "RECON_STARTUP_INVARIANT_VIOLATION:"
+                        f"slot={slot[0]}:{slot[1]}:{slot[2]}:duplicate_count={len(rows)}"
+                    )
+                signatures = {self._open_order_duplicate_signature(row) for row in rows}
+                if len(signatures) > 1:
+                    raise RuntimeError(
+                        "RECON_STARTUP_INVARIANT_VIOLATION:"
+                        f"slot={slot[0]}:{slot[1]}:{slot[2]}:non_exact_duplicates={len(rows)}"
+                    )
+            keepers[slot] = rows[-1]
+            extras.extend(rows[:-1])
+        extras = sorted(
+            extras,
+            key=lambda row: (
+                str(row.get("token_id") or ""),
+                str(row.get("side") or ""),
+                int(_maybe_int(row.get("quote_slot")) or 0),
+                str(row.get("order_id") or ""),
+            ),
+        )
+        return keepers, extras
+
+    def _persist_open_orders_snapshot(self, now_ms: int, open_orders: Dict[str, Any]) -> None:
+        if not isinstance(open_orders, dict) or not open_orders:
+            return
+        rows: List[Dict[str, Any]] = []
+        for order_id in sorted(open_orders.keys()):
+            payload = open_orders.get(order_id)
             if not isinstance(payload, dict):
                 continue
             token_id = str(payload.get("token_id") or "")
             side = str(payload.get("side") or "").lower()
-            if not token_id or side not in {"buy", "sell"}:
-                continue
-            latest_by_token_side[(token_id, side)] = {
-                "order_id": str(payload.get("order_id") or order_id),
-                "client_order_id": str(payload.get("client_order_id") or f"{order_id}:client"),
-                "side": side,
-                "price": float(payload.get("price") or 0.0),
-                "qty": float(payload.get("size") or 0.0),
-                "quote_group_id": str(payload.get("quote_group_id") or f"recovered:{token_id}:{side}"),
-                "idempotency_key": str(payload.get("idempotency_key") or f"recovered:{token_id}:{side}"),
-            }
-        for (token_id, side), row in latest_by_token_side.items():
+            rows.append(
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": uuid.uuid4().hex,
+                    "run_id": self.run_id,
+                    "mode": self.mode,
+                    "token_id": token_id,
+                    "side": side if side in {"buy", "sell"} else None,
+                    "order_id": str(payload.get("order_id") or order_id),
+                    "price": _maybe_float(payload.get("price")),
+                    "size": _maybe_float(payload.get("size")),
+                    "status": str(payload.get("status") or ""),
+                    "client_order_id": str(payload.get("client_order_id") or ""),
+                    "quote_group_id": str(payload.get("quote_group_id") or ""),
+                    "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+                }
+            )
+        if rows:
+            self.db.insert_many("open_orders_snapshot", rows)
+
+    def adopt_open_orders(self, snapshot: BrokerSnapshot, now_ms: int) -> int:
+        open_orders = snapshot.open_orders or {}
+        if not isinstance(open_orders, dict):
+            return 0
+        keepers, _ = self._select_open_order_plan(open_orders)
+        adopted = 0
+        for (token_id, side, _slot) in sorted(keepers.keys()):
+            row = keepers[(token_id, side, _slot)]
             self.open_quotes[token_id][side] = OpenQuote(
-                order_id=row["order_id"],
-                client_order_id=row["client_order_id"],
+                order_id=str(row["order_id"]),
+                client_order_id=str(row["client_order_id"]),
                 side=side,
                 price=float(row["price"]),
                 qty=float(row["qty"]),
                 post_only=True,
-                quote_group_id=row["quote_group_id"],
-                idempotency_key=row["idempotency_key"],
+                quote_group_id=str(row["quote_group_id"]),
+                idempotency_key=str(row["idempotency_key"]),
                 updated_ms=int(now_ms),
             )
             adopted += 1
@@ -1174,15 +1758,115 @@ class RuntimeEngine:
                 {
                     "ts_ms": int(now_ms),
                     "event_id": uuid.uuid4().hex,
+                    "run_id": self.run_id,
+                    "mode": self.mode,
                     "recovery_action": "ADOPT_OPEN_ORDER",
                     "token_id": token_id,
                     "side": side,
-                    "order_id": row["order_id"],
+                    "order_id": str(row["order_id"]),
+                    "price": _maybe_float(row.get("price")),
+                    "size": _maybe_float(row.get("qty")),
                     "adopted_order_count": adopted,
                     "payload_json": json.dumps(snapshot.meta or {}, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
                 },
             )
         return adopted
+
+    async def adopt_open_orders_with_cleanup(self, snapshot: BrokerSnapshot, now_ms: int) -> Dict[str, int]:
+        open_orders = snapshot.open_orders or {}
+        if not isinstance(open_orders, dict):
+            return {"adopted": 0, "duplicates_canceled": 0}
+        invariant_payload: Dict[str, Any] = {
+            "single_level_quoting": bool(self._single_level_quoting),
+            "startup_allow_exact_duplicate_cleanup": bool(self._startup_allow_exact_duplicate_cleanup),
+            "open_order_count": int(len(open_orders)),
+        }
+        try:
+            keepers, extras = self._select_open_order_plan(open_orders)
+        except RuntimeError as exc:
+            invariant_payload["status"] = "VIOLATION"
+            invariant_payload["reason"] = str(exc)
+            self.db.insert(
+                "recovery_events",
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": uuid.uuid4().hex,
+                    "run_id": self.run_id,
+                    "mode": self.mode,
+                    "recovery_action": "STARTUP_QUOTING_INVARIANT_CHECK",
+                    "token_id": None,
+                    "side": None,
+                    "order_id": None,
+                    "price": None,
+                    "size": None,
+                    "adopted_order_count": 0,
+                    "payload_json": json.dumps(invariant_payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+                },
+            )
+            raise
+        invariant_payload["status"] = "PASS"
+        invariant_payload["slot_count"] = int(len(keepers))
+        invariant_payload["duplicate_candidates"] = int(len(extras))
+        self.db.insert(
+            "recovery_events",
+            {
+                "ts_ms": int(now_ms),
+                "event_id": uuid.uuid4().hex,
+                "run_id": self.run_id,
+                "mode": self.mode,
+                "recovery_action": "STARTUP_QUOTING_INVARIANT_CHECK",
+                "token_id": None,
+                "side": None,
+                "order_id": None,
+                "price": None,
+                "size": None,
+                "adopted_order_count": 0,
+                "payload_json": json.dumps(invariant_payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+            },
+        )
+        adopted = self.adopt_open_orders(snapshot=snapshot, now_ms=now_ms)
+        canceled = 0
+        if extras and self.mode in {"PAPER", "TRADE"} and self.broker is not None:
+            for row in extras:
+                order_id = str(row.get("order_id") or "")
+                if not order_id:
+                    continue
+                events = await self._broker_cancel(order_id)
+                canceled_ok = any(event.event_type == "order_cancel" for event in events)
+                if canceled_ok:
+                    canceled += 1
+                token_id = str(row.get("token_id") or "")
+                side = str(row.get("side") or "")
+                self.db.insert(
+                    "recovery_events",
+                    {
+                        "ts_ms": int(now_ms),
+                        "event_id": uuid.uuid4().hex,
+                        "run_id": self.run_id,
+                        "mode": self.mode,
+                        "recovery_action": "CANCEL_DUPLICATE_OPEN_ORDER",
+                        "token_id": token_id or None,
+                        "side": side if side in {"buy", "sell"} else None,
+                        "order_id": order_id,
+                        "price": _maybe_float(row.get("price")),
+                        "size": _maybe_float(row.get("qty")),
+                        "adopted_order_count": adopted,
+                        "payload_json": json.dumps(
+                            {
+                                "events": [event.event_type for event in events],
+                                "keepers": sorted(
+                                    f"{token}:{slot_side}:{slot}"
+                                    for token, slot_side, slot in keepers.keys()
+                                ),
+                            },
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    },
+                )
+        self._persist_open_orders_snapshot(now_ms=now_ms, open_orders=open_orders)
+        return {"adopted": int(adopted), "duplicates_canceled": int(canceled)}
 
     def _fair_probability(self, token_id: str, symbol: str, snap: BookSnapshot, pstar: PStar, now_ms: int) -> float:
         mid = snap.mid()
@@ -1229,6 +1913,10 @@ class RuntimeEngine:
         p50_ack_fill = _quantile(list(self.ack_fill_samples), 0.50)
         p95_ack_fill = _quantile(list(self.ack_fill_samples), 0.95)
         ws_lag = _quantile(list(self.ws_lag_samples), 0.95)
+        p50_ws_lag = _quantile(list(self.ws_lag_samples), 0.50)
+        p95_ws_lag = _quantile(list(self.ws_lag_samples), 0.95)
+        p50_pstar_age = _quantile(list(self.pstar_age_samples), 0.50)
+        p95_pstar_age = _quantile(list(self.pstar_age_samples), 0.95)
         p50_signal_age = _quantile(list(self.signal_age_samples), 0.50)
         p95_signal_age = _quantile(list(self.signal_age_samples), 0.95)
         self.db.insert(
@@ -1242,57 +1930,785 @@ class RuntimeEngine:
                 "ws_lag_ms": ws_lag,
                 "p50_signal_age_ms": p50_signal_age,
                 "p95_signal_age_ms": p95_signal_age,
+                "p50_ws_lag_ms": p50_ws_lag,
+                "p95_ws_lag_ms": p95_ws_lag,
+                "p50_pstar_age_ms": p50_pstar_age,
+                "p95_pstar_age_ms": p95_pstar_age,
             },
         )
-        await self._record_reconciliation(now_ms)
+        for token_id in sorted(self.books.keys()):
+            recv_q = self._book_recv_ts_ms_by_token[token_id]
+            while recv_q and int(recv_q[0]) < int(now_ms - 60_000):
+                recv_q.popleft()
+            snap = self._latest_book_snapshot_by_token.get(token_id)
+            ages = list(self._book_age_samples_by_token[token_id])
+            self.db.insert(
+                "book_health_stats",
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": uuid.uuid4().hex,
+                    "token_id": str(token_id),
+                    "book_asof_ts_ms": _maybe_int(snap.book_asof_ts_ms if snap else None),
+                    "book_recv_ts_ms": _maybe_int(snap.book_recv_ts_ms if snap else None),
+                    "book_seq": int(snap.book_seq if snap else 0),
+                    "book_level_count": int(snap.book_level_count if snap else 0),
+                    "book_health_state": str(snap.book_health_state if snap else BookHealthState.DOWN.value),
+                    "book_age_p50_ms": _maybe_float(_quantile(ages, 0.50)),
+                    "book_age_p95_ms": _maybe_float(_quantile(ages, 0.95)),
+                    "ws_recv_rate_msgs_min": float(len(recv_q)),
+                },
+            )
+        retention_cutoff_ms = int(now_ms - (7 * 24 * 60 * 60 * 1000))
+        self.db.execute("DELETE FROM decision_ticks WHERE ts_ms < ?", [retention_cutoff_ms])
+        if self._next_reconcile_due_ms <= 0 or int(now_ms) >= int(self._next_reconcile_due_ms):
+            await self._record_reconciliation(now_ms)
+            self._next_reconcile_due_ms = int(now_ms) + int(max(250, self._reconcile_period_ms))
+
+    async def startup_feed_guard(
+        self,
+        mode: str,
+        tracked_symbols: List[str],
+        max_wait_secs: int,
+        min_updates_per_token: int,
+        max_book_age_ms: int,
+        max_pstar_age_ms: int,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        deadline = time.monotonic() + float(max_wait_secs)
+        while time.monotonic() < deadline:
+            now_ms = _now_ms()
+            for token_id, book in self.books.items():
+                self._snapshot_book(token_id=token_id, book=book, now_ms=now_ms)
+            token_status: Dict[str, Dict[str, Any]] = {}
+            token_ok = True
+            for token_id in sorted(self.books.keys()):
+                snap = self._latest_book_snapshot_by_token.get(token_id)
+                updates = int(self._book_update_count_by_token.get(token_id, 0))
+                book_age = _maybe_int(snap.age_ms(now_ms) if snap else None)
+                wired = bool(
+                    updates >= int(min_updates_per_token)
+                    or (updates >= 1 and book_age is not None and int(book_age) < int(max_book_age_ms))
+                )
+                token_status[token_id] = {"updates": updates, "book_age_ms": book_age, "wired": wired}
+                token_ok = token_ok and wired
+
+            symbol_status: Dict[str, Dict[str, Any]] = {}
+            symbol_ok = True
+            for symbol in sorted({s for s in tracked_symbols if s}):
+                pstar = self.pstar_builder.build(symbol, now_ms)
+                self._latest_pstar_by_symbol[symbol] = pstar
+                pstar_age = _maybe_int(now_ms - int(pstar.ts_event_ms)) if pstar.ts_event_ms is not None else None
+                wired = bool(pstar.valid and pstar_age is not None and int(pstar_age) < int(max_pstar_age_ms))
+                symbol_status[symbol] = {
+                    "valid": bool(pstar.valid),
+                    "pstar_age_ms": pstar_age,
+                    "invalid_reason": str(pstar.invalid_reason or ""),
+                    "wired": wired,
+                }
+                symbol_ok = symbol_ok and wired
+
+            payload = {
+                "token_status": token_status,
+                "symbol_status": symbol_status,
+                "max_book_age_ms": int(max_book_age_ms),
+                "max_pstar_age_ms": int(max_pstar_age_ms),
+                "required_updates": int(min_updates_per_token),
+            }
+            if token_ok and symbol_ok:
+                return True, payload
+            await asyncio.sleep(1.0)
+
+        failure_payload = {
+            "token_status": {
+                token_id: {
+                    "updates": int(self._book_update_count_by_token.get(token_id, 0)),
+                    "book_age_ms": _maybe_int(
+                        self._latest_book_snapshot_by_token[token_id].age_ms(_now_ms())
+                        if token_id in self._latest_book_snapshot_by_token
+                        else None
+                    ),
+                }
+                for token_id in sorted(self.books.keys())
+            },
+            "symbol_status": {
+                symbol: {
+                    "valid": bool(self._latest_pstar_by_symbol.get(symbol).valid)
+                    if symbol in self._latest_pstar_by_symbol
+                    else False,
+                    "pstar_age_ms": _maybe_int(
+                        _now_ms() - int(self._latest_pstar_by_symbol[symbol].ts_event_ms)
+                        if symbol in self._latest_pstar_by_symbol
+                        and self._latest_pstar_by_symbol[symbol].ts_event_ms is not None
+                        else None
+                    ),
+                    "invalid_reason": str(self._latest_pstar_by_symbol[symbol].invalid_reason or "")
+                    if symbol in self._latest_pstar_by_symbol
+                    else "missing_symbol_pstar",
+                }
+                for symbol in sorted({s for s in tracked_symbols if s})
+            },
+            "mode": mode,
+        }
+        return False, failure_payload
+
+    async def prepare_rollover(self, next_token_ids: List[str], now_ms: int) -> Dict[str, Any]:
+        old_tokens = set(self.books.keys())
+        new_tokens = set(str(token) for token in next_token_ids if token)
+        removed = sorted(old_tokens - new_tokens)
+        cancelled_orders = 0
+
+        if removed and self.mode in {"PAPER", "TRADE"} and self.broker is not None:
+            for token_id in removed:
+                token_quotes = list((self.open_quotes.get(token_id) or {}).items())
+                for side, quote in token_quotes:
+                    for event in await self._broker_cancel(quote.order_id):
+                        self._handle_broker_event(
+                            token_id=token_id,
+                            side=side,
+                            event=event,
+                            decision_id=f"rollover_prepare:{now_ms}",
+                        )
+                    cancelled_orders += 1
+                self.open_quotes.pop(token_id, None)
+        return {
+            "removed_tokens": removed,
+            "cancelled_orders": int(cancelled_orders),
+        }
+
+    def reset_per_market_state(self, reason: str, token_ids: List[str], now_ms: int) -> None:
+        symbols_to_reset: set[str] = set()
+        for token_id in token_ids:
+            token_meta = self.market_meta.get(token_id) or {}
+            symbol = str(token_meta.get("reference_symbol") or "")
+            if symbol:
+                symbols_to_reset.add(symbol)
+            self.fsms[token_id] = ExecutionFSM(rebalance_timeout_ms=self.policy_thresholds.hedge_timeout_ms)
+            self._last_fsm_state_by_token[token_id] = ExecutionState.QUOTING_BOTH.value
+            self.open_quotes[token_id] = {}
+            self.pending_freeze[token_id] = []
+            self._unwind_state.pop(token_id, None)
+            self._post_only_attempts_by_token[token_id] = 0
+            self._post_only_rejects_by_token[token_id] = 0
+            self._book_seq_by_token[token_id] = 0
+            self._book_update_count_by_token[token_id] = 0
+            self._last_book_recv_mono_by_token[token_id] = 0
+            self._book_recv_ts_ms_by_token[token_id] = deque(maxlen=5000)
+            self._book_age_samples_by_token[token_id] = deque(maxlen=2000)
+            self._latest_book_snapshot_by_token.pop(token_id, None)
+            # Reset quote revision counters for deterministic ids after rollover.
+            for side in ("buy", "sell"):
+                self._quote_revision.pop((token_id, side), None)
+            self.db.insert(
+                "recovery_events",
+                {
+                    "ts_ms": int(now_ms),
+                    "event_id": uuid.uuid4().hex,
+                    "run_id": self.run_id,
+                    "mode": self.mode,
+                    "recovery_action": "MARKET_STATE_RESET",
+                    "token_id": token_id,
+                    "side": None,
+                    "order_id": None,
+                    "price": None,
+                    "size": None,
+                    "adopted_order_count": None,
+                    "payload_json": json.dumps(
+                        {"reason": reason},
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                },
+            )
+        for symbol in sorted(symbols_to_reset):
+            self._latest_pstar_by_symbol.pop(symbol, None)
+        if symbols_to_reset:
+            self.pstar_builder.reset_symbols(symbols_to_reset)
+
+    def commit_rollover_swap(
+        self,
+        books: Dict[str, OrderBook],
+        constraints: Dict[str, OrderConstraints],
+        market_meta: Dict[str, Dict[str, Any]],
+        now_ms: int,
+    ) -> Dict[str, Any]:
+        old_tokens = set(self.books.keys())
+        new_tokens = set(books.keys())
+        removed = sorted(old_tokens - new_tokens)
+        added = sorted(new_tokens - old_tokens)
+
+        self.books = books
+        self.constraints = constraints
+        self.market_meta = market_meta
+        self.book_cache = BookCache()
+
+        self._cap_state = self._build_caps(
+            trading_cfg=self.constitution.get("trading", {}),
+            execution_cfg=self.constitution.get("execution", {}),
+        )
+
+        for token_id in new_tokens:
+            self.inventory_yes.setdefault(token_id, 0.0)
+            self.inventory_no.setdefault(token_id, 0.0)
+            self._last_q_by_token.setdefault(token_id, 0.5)
+        self.reset_per_market_state(reason="rollover_commit", token_ids=sorted(new_tokens), now_ms=now_ms)
+
+        for token_id in removed:
+            self.fsms.pop(token_id, None)
+            self._last_fsm_state_by_token.pop(token_id, None)
+            self.inventory_yes.pop(token_id, None)
+            self.inventory_no.pop(token_id, None)
+            self.open_quotes.pop(token_id, None)
+            self.pending_freeze.pop(token_id, None)
+            self._unwind_state.pop(token_id, None)
+            self._post_only_attempts_by_token.pop(token_id, None)
+            self._post_only_rejects_by_token.pop(token_id, None)
+            self._last_q_by_token.pop(token_id, None)
+            self._book_seq_by_token.pop(token_id, None)
+            self._book_update_count_by_token.pop(token_id, None)
+            self._last_book_recv_mono_by_token.pop(token_id, None)
+            self._book_recv_ts_ms_by_token.pop(token_id, None)
+            self._book_age_samples_by_token.pop(token_id, None)
+            self._latest_book_snapshot_by_token.pop(token_id, None)
+
+        return {
+            "added_tokens": added,
+            "removed_tokens": removed,
+            "swap_ts_ms": int(now_ms),
+        }
+
+    def _to_units(self, value: Optional[float], scale: int) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(round(float(value) * float(max(1, int(scale)))))
+        except (TypeError, ValueError):
+            return None
+
+    def _fill_event_key(
+        self,
+        *,
+        event_id: str,
+        order_id: str,
+        token_id: str,
+        side: str,
+        fill_qty: float,
+        fill_price: float,
+        fill_ts: int,
+    ) -> str:
+        if event_id:
+            return f"broker:{event_id}"
+        fill_qty_units = int(self._to_units(fill_qty, self._qty_scale) or 0)
+        fill_price_units = int(self._to_units(fill_price, self._usdc_scale) or 0)
+        ts_bucket = int(fill_ts // 1000)
+        raw = f"{order_id}|{token_id}|{side}|{fill_qty_units}|{fill_price_units}|{ts_bucket}"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return f"derived:{digest}"
+
+    async def _cancel_all_open_quotes(self, now_ms: int, reason: str) -> int:
+        cancelled = 0
+        for token_id in sorted(self.open_quotes.keys()):
+            for side in sorted(self.open_quotes[token_id].keys()):
+                quote = self.open_quotes[token_id].get(side)
+                if quote is None:
+                    continue
+                if self.broker is None or self.mode not in {"PAPER", "TRADE"}:
+                    self.open_quotes[token_id].pop(side, None)
+                    continue
+                events = await self._broker_cancel(quote.order_id)
+                for event in events:
+                    self._handle_broker_event(
+                        token_id=token_id,
+                        side=side,
+                        event=event,
+                        decision_id=f"reconciliation_freeze:{now_ms}",
+                    )
+                self.db.insert(
+                    "recovery_events",
+                    {
+                        "ts_ms": int(now_ms),
+                        "event_id": uuid.uuid4().hex,
+                        "run_id": self.run_id,
+                        "mode": self.mode,
+                        "recovery_action": "CANCEL_OPEN_QUOTE_ON_FREEZE",
+                        "token_id": token_id,
+                        "side": side,
+                        "order_id": quote.order_id,
+                        "price": _maybe_float(quote.price),
+                        "size": _maybe_float(quote.qty),
+                        "adopted_order_count": None,
+                        "payload_json": json.dumps(
+                            {"reason": reason, "events": [event.event_type for event in events]},
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    },
+                )
+                self.open_quotes[token_id].pop(side, None)
+                cancelled += 1
+        return cancelled
+
+    def _record_missed_fill_correction(
+        self,
+        *,
+        now_ms: int,
+        token_id: str,
+        side: str,
+        order_id: str,
+        fill_qty: float,
+        fill_price: float,
+        fill_event_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        fill_ts = int(_maybe_int(payload.get("ts_ms")) or now_ms)
+        self.db.insert(
+            "fills",
+            {
+                "ts_ms": int(fill_ts),
+                "event_id": str(fill_event_id),
+                "order_id": str(order_id),
+                "token_id": str(token_id),
+                "side": str(side),
+                "fill_price": float(fill_price),
+                "fill_qty": float(fill_qty),
+                "fee": _maybe_float(payload.get("fees_bps")),
+                "liquidity": str(payload.get("liquidity") or "unknown"),
+                "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+            },
+        )
+        self.db.insert(
+            "recovery_events",
+            {
+                "ts_ms": int(now_ms),
+                "event_id": uuid.uuid4().hex,
+                "run_id": self.run_id,
+                "mode": self.mode,
+                "recovery_action": "MISSED_FILL_CORRECTION",
+                "token_id": str(token_id),
+                "side": str(side),
+                "order_id": str(order_id),
+                "price": _maybe_float(fill_price),
+                "size": _maybe_float(fill_qty),
+                "adopted_order_count": None,
+                "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+            },
+        )
+
+    def _reconcile_missed_fills(self, snapshot: BrokerSnapshot, now_ms: int) -> int:
+        meta = snapshot.meta if isinstance(snapshot.meta, dict) else {}
+        raw_fill_events = meta.get("fill_events")
+        if not isinstance(raw_fill_events, list):
+            return 0
+        normalized: List[Dict[str, Any]] = []
+        for row in raw_fill_events:
+            if not isinstance(row, dict):
+                continue
+            token_id = str(row.get("token_id") or row.get("asset_id") or "")
+            side = str(row.get("side") or "").lower()
+            if not token_id or side not in {"buy", "sell"}:
+                continue
+            fill_qty = _maybe_float(row.get("fill_qty") or row.get("size") or row.get("qty"))
+            if fill_qty is None or fill_qty <= 0:
+                continue
+            fill_ts = int(_maybe_int(row.get("ts_ms") or row.get("t_fill_wall_ms")) or now_ms)
+            fill_price = float(_maybe_float(row.get("fill_price") or row.get("price")) or 0.0)
+            order_id = str(row.get("order_id") or row.get("id") or f"recon:{token_id}:{side}:{fill_ts}")
+            event_id = str(row.get("event_id") or "")
+            fill_event_key = self._fill_event_key(
+                event_id=event_id,
+                order_id=order_id,
+                token_id=token_id,
+                side=side,
+                fill_qty=float(fill_qty),
+                fill_price=float(fill_price),
+                fill_ts=fill_ts,
+            )
+            normalized.append(
+                {
+                    "fill_event_key": fill_event_key,
+                    "event_id": event_id,
+                    "token_id": token_id,
+                    "side": side,
+                    "fill_qty": float(fill_qty),
+                    "fill_price": float(fill_price),
+                    "fill_ts": fill_ts,
+                    "order_id": order_id,
+                    "payload": dict(row),
+                }
+            )
+        corrected = 0
+        for row in sorted(
+            normalized,
+            key=lambda item: (
+                int(item["fill_ts"]),
+                str(item["token_id"]),
+                str(item["side"]),
+                str(item["order_id"]),
+                str(item["fill_event_key"]),
+            ),
+        ):
+            fill_event_key = str(row["fill_event_key"])
+            if fill_event_key in self._seen_reconcile_fill_ids:
+                self.db.insert(
+                    "recovery_events",
+                    {
+                        "ts_ms": int(now_ms),
+                        "event_id": uuid.uuid4().hex,
+                        "run_id": self.run_id,
+                        "mode": self.mode,
+                        "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                        "token_id": str(row["token_id"]),
+                        "side": str(row["side"]),
+                        "order_id": str(row["order_id"]),
+                        "price": _maybe_float(row.get("fill_price")),
+                        "size": _maybe_float(row.get("fill_qty")),
+                        "adopted_order_count": None,
+                        "payload_json": json.dumps(
+                            {
+                                "fill_event_key": fill_event_key,
+                                "reason": "in_memory_seen",
+                            },
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    },
+                )
+                continue
+            marked = self.db.mark_fill_event_seen(
+                fill_event_key=fill_event_key,
+                first_seen_ts_ms=int(row["fill_ts"]),
+                source="reconcile",
+                payload={
+                    "token_id": str(row["token_id"]),
+                    "side": str(row["side"]),
+                    "order_id": str(row["order_id"]),
+                    "fill_qty": _maybe_float(row.get("fill_qty")),
+                    "fill_price": _maybe_float(row.get("fill_price")),
+                    "event_id": str(row.get("event_id") or ""),
+                },
+            )
+            if not marked:
+                self.db.insert(
+                    "recovery_events",
+                    {
+                        "ts_ms": int(now_ms),
+                        "event_id": uuid.uuid4().hex,
+                        "run_id": self.run_id,
+                        "mode": self.mode,
+                        "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                        "token_id": str(row["token_id"]),
+                        "side": str(row["side"]),
+                        "order_id": str(row["order_id"]),
+                        "price": _maybe_float(row.get("fill_price")),
+                        "size": _maybe_float(row.get("fill_qty")),
+                        "adopted_order_count": None,
+                        "payload_json": json.dumps(
+                            {
+                                "fill_event_key": fill_event_key,
+                                "reason": "persistent_seen",
+                            },
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    },
+                )
+                self._seen_reconcile_fill_ids.add(fill_event_key)
+                continue
+            token_id = str(row["token_id"])
+            if token_id not in self.fsms:
+                self._seen_reconcile_fill_ids.add(fill_event_key)
+                continue
+            side = str(row["side"])
+            fill_qty = float(row["fill_qty"])
+            fill_ts = int(row["fill_ts"])
+            prev_state = self.fsms[token_id].status().state.value
+            if side == "buy":
+                self.inventory_yes[token_id] += fill_qty
+            else:
+                self.inventory_yes[token_id] -= fill_qty
+            self.fsms[token_id].on_fill(side=side, qty=fill_qty, ts_ms=fill_ts)
+            self.fsms[token_id].reset_if_flat()
+            self._record_fsm_transition(
+                token_id=token_id,
+                prev_state=prev_state,
+                new_state=self.fsms[token_id].status().state.value,
+                ts_ms=fill_ts,
+                reason="reconcile_missed_fill",
+            )
+            self._record_missed_fill_correction(
+                now_ms=now_ms,
+                token_id=token_id,
+                side=side,
+                order_id=str(row["order_id"]),
+                fill_qty=fill_qty,
+                fill_price=float(row["fill_price"]),
+                fill_event_id=str(row["event_id"] or uuid.uuid4().hex),
+                payload=row["payload"],
+            )
+            self._seen_reconcile_fill_ids.add(fill_event_key)
+            corrected += 1
+        return corrected
 
     async def _record_reconciliation(self, now_ms: int) -> None:
         broker_open_orders = 0
         broker_inventory = None
         onchain_inventory = None
+        derived_inventory = float(sum(self.inventory_yes.values()) - sum(self.inventory_no.values()))
         mismatch_count = 0
         unresolved_mismatch_count = 0
+        inventory_delta_qty = None
+        inventory_delta_usdc = None
+        outside_tolerance = False
         payload: Dict[str, Any] = {}
-        if self.mode == "TRADE" and self.broker is not None:
+        corrected_missed_fills = 0
+        freeze_triggered = False
+        unfreeze_triggered = False
+        freeze_reason = ""
+
+        snapshot = BrokerSnapshot(open_orders={}, meta={})
+        if self.broker is not None and self.mode in {"PAPER", "TRADE"}:
             snapshot = await asyncio.to_thread(self.broker.snapshot)
-            broker_orders = snapshot.open_orders if isinstance(snapshot.open_orders, dict) else {}
-            broker_open_orders = len(broker_orders)
-            broker_ids = set(broker_orders.keys())
-            local_ids = {
-                quote.order_id
-                for token_quotes in self.open_quotes.values()
-                for quote in token_quotes.values()
-            }
-            only_local = local_ids - broker_ids
-            only_broker = broker_ids - local_ids
-            mismatch_count = len(only_local) + len(only_broker)
-            unresolved_mismatch_count = mismatch_count
-            payload = {
-                "only_local": sorted(only_local),
-                "only_broker": sorted(only_broker),
-                "meta": snapshot.meta,
-            }
-            broker_inventory = _maybe_float((snapshot.meta or {}).get("broker_inventory"))
-            onchain_inventory = _maybe_float((snapshot.meta or {}).get("onchain_inventory"))
-            if unresolved_mismatch_count > 0:
+            corrected_missed_fills = self._reconcile_missed_fills(snapshot=snapshot, now_ms=now_ms)
+
+        broker_orders = snapshot.open_orders if isinstance(snapshot.open_orders, dict) else {}
+        broker_open_orders = len(broker_orders)
+        self._persist_open_orders_snapshot(now_ms=now_ms, open_orders=broker_orders)
+
+        broker_ids = set(str(order_id) for order_id in broker_orders.keys())
+        local_ids = {
+            quote.order_id
+            for token_quotes in self.open_quotes.values()
+            for quote in token_quotes.values()
+        }
+        only_local = sorted(local_ids - broker_ids)
+        only_broker = sorted(broker_ids - local_ids)
+
+        meta = snapshot.meta if isinstance(snapshot.meta, dict) else {}
+        broker_inventory = _maybe_float(meta.get("broker_inventory"))
+        onchain_inventory = _maybe_float(meta.get("onchain_inventory"))
+
+        compare_inventory = onchain_inventory if onchain_inventory is not None else derived_inventory
+        if broker_inventory is not None and compare_inventory is not None:
+            inventory_delta_qty = float(broker_inventory - compare_inventory)
+        broker_usdc = _maybe_float(meta.get("broker_usdc"))
+        onchain_usdc = _maybe_float(meta.get("onchain_usdc"))
+        if broker_usdc is not None and onchain_usdc is not None:
+            inventory_delta_usdc = float(broker_usdc - onchain_usdc)
+
+        inventory_delta_qty_units = self._to_units(inventory_delta_qty, self._qty_scale)
+        inventory_delta_usdc_units = self._to_units(inventory_delta_usdc, self._usdc_scale)
+        tolerance_qty_units = int(self._to_units(self._mismatch_tolerance_qty, self._qty_scale) or 0)
+        tolerance_usdc_units = int(self._to_units(self._mismatch_tolerance_usdc, self._usdc_scale) or 0)
+        outside_qty = bool(
+            inventory_delta_qty_units is not None
+            and abs(int(inventory_delta_qty_units)) > int(tolerance_qty_units)
+        )
+        outside_usdc = bool(
+            inventory_delta_usdc_units is not None
+            and abs(int(inventory_delta_usdc_units)) > int(tolerance_usdc_units)
+        )
+        outside_tolerance = bool(outside_qty or outside_usdc)
+
+        mismatch_count = int(len(only_local) + len(only_broker))
+        if outside_qty:
+            mismatch_count += 1
+        if outside_usdc:
+            mismatch_count += 1
+        unresolved_mismatch_count = int(mismatch_count)
+
+        if unresolved_mismatch_count > 0:
+            self._consecutive_mismatch_cycles += 1
+        else:
+            self._consecutive_mismatch_cycles = 0
+
+        onchain_delta_qty_units = None
+        if broker_inventory is not None and onchain_inventory is not None:
+            onchain_delta_qty_units = self._to_units(float(broker_inventory) - float(onchain_inventory), self._qty_scale)
+        onchain_disagree = bool(
+            onchain_delta_qty_units is not None
+            and abs(int(onchain_delta_qty_units)) > int(tolerance_qty_units)
+        )
+        if onchain_disagree:
+            self._consecutive_onchain_disagree_cycles += 1
+        else:
+            self._consecutive_onchain_disagree_cycles = 0
+
+        if unresolved_mismatch_count == 0 and not onchain_disagree:
+            self._consecutive_clean_cycles += 1
+        else:
+            self._consecutive_clean_cycles = 0
+
+        if unresolved_mismatch_count > 0:
+            self.db.append_alert(
+                now_ms,
+                "warning",
+                "RECON_MISMATCH",
+                f"mismatch_count={mismatch_count}",
+                payload={
+                    "only_local": only_local,
+                    "only_broker": only_broker,
+                    "inventory_delta_qty": _maybe_float(inventory_delta_qty),
+                    "inventory_delta_qty_units": _maybe_int(inventory_delta_qty_units),
+                    "inventory_delta_usdc": _maybe_float(inventory_delta_usdc),
+                    "inventory_delta_usdc_units": _maybe_int(inventory_delta_usdc_units),
+                    "tolerance_qty": float(self._mismatch_tolerance_qty),
+                    "tolerance_qty_units": int(tolerance_qty_units),
+                    "tolerance_usdc": float(self._mismatch_tolerance_usdc),
+                    "tolerance_usdc_units": int(tolerance_usdc_units),
+                    "meta": meta,
+                },
+            )
+
+        should_freeze_trade = bool(
+            self.mode == "TRADE"
+            and (
+                self._consecutive_mismatch_cycles >= max(1, int(self._mismatch_freeze_cycles))
+                or self._consecutive_onchain_disagree_cycles >= max(1, int(self._onchain_disagree_freeze_cycles))
+            )
+        )
+        should_mark_fail = bool(
+            self.mode == "PAPER"
+            and (
+                self._consecutive_mismatch_cycles >= max(1, int(self._mismatch_freeze_cycles))
+                or self._consecutive_onchain_disagree_cycles >= max(1, int(self._onchain_disagree_freeze_cycles))
+            )
+        )
+        if should_freeze_trade:
+            freeze_reason = (
+                "RECON_ONCHAIN_DIVERGENCE"
+                if self._consecutive_onchain_disagree_cycles >= max(1, int(self._onchain_disagree_freeze_cycles))
+                else "RECONCILIATION_MISMATCH_CRITICAL"
+            )
+            if not self._reconciliation_frozen:
+                freeze_triggered = True
+                self._reconciliation_frozen = True
+                self._reconciliation_freeze_reason = freeze_reason
                 self.db.append_alert(
                     now_ms,
-                    "warning",
-                    "RECON_MISMATCH",
-                    f"mismatch_count={mismatch_count}",
-                    payload=payload,
+                    "critical",
+                    "RECONCILIATION_FROZEN_EDGE",
+                    f"freeze_edge reason={freeze_reason}",
+                    payload={
+                        "consecutive_mismatch_cycles": int(self._consecutive_mismatch_cycles),
+                        "consecutive_onchain_disagree_cycles": int(self._consecutive_onchain_disagree_cycles),
+                        "consecutive_clean_cycles": int(self._consecutive_clean_cycles),
+                    },
                 )
+                self.db.append_alert(
+                    now_ms,
+                    "critical",
+                    "RECONCILIATION_MISMATCH_CRITICAL",
+                    f"freeze_trade reason={freeze_reason}",
+                    payload={
+                        "consecutive_mismatch_cycles": int(self._consecutive_mismatch_cycles),
+                        "consecutive_onchain_disagree_cycles": int(self._consecutive_onchain_disagree_cycles),
+                        "mismatch_freeze_cycles": int(self._mismatch_freeze_cycles),
+                        "onchain_disagree_freeze_cycles": int(self._onchain_disagree_freeze_cycles),
+                    },
+                )
+                expected_cancel_count = int(
+                    sum(len(token_quotes) for token_quotes in self.open_quotes.values())
+                )
+                canceled_count = await self._cancel_all_open_quotes(now_ms=now_ms, reason=freeze_reason)
+                if int(canceled_count) != int(expected_cancel_count):
+                    self.db.append_alert(
+                        now_ms,
+                        "critical",
+                        "RECON_FREEZE_CANCEL_ASSERT_FAIL",
+                        f"expected_cancel={expected_cancel_count} actual={canceled_count}",
+                        payload={
+                            "expected_cancel_count": int(expected_cancel_count),
+                            "actual_cancel_count": int(canceled_count),
+                            "freeze_reason": freeze_reason,
+                        },
+                    )
+        elif self._reconciliation_frozen and self._consecutive_clean_cycles >= max(1, int(self._reconcile_clean_unfreeze_cycles)):
+            self._reconciliation_frozen = False
+            self._reconciliation_freeze_reason = ""
+            unfreeze_triggered = True
+            self.db.append_alert(
+                now_ms,
+                "info",
+                "RECONCILIATION_UNFROZEN_EDGE",
+                "unfreeze_edge clean_cycles_threshold_reached",
+                payload={
+                    "consecutive_clean_cycles": int(self._consecutive_clean_cycles),
+                    "required_clean_cycles": int(self._reconcile_clean_unfreeze_cycles),
+                },
+            )
+            self.db.append_alert(
+                now_ms,
+                "info",
+                "RECONCILIATION_MISMATCH_RESOLVED",
+                "reconciliation mismatch resolved",
+                payload={
+                    "consecutive_mismatch_cycles": int(self._consecutive_mismatch_cycles),
+                    "consecutive_onchain_disagree_cycles": int(self._consecutive_onchain_disagree_cycles),
+                    "consecutive_clean_cycles": int(self._consecutive_clean_cycles),
+                },
+            )
+
+        if should_mark_fail:
+            self.db.append_alert(
+                now_ms,
+                "critical",
+                "RECONCILIATION_MISMATCH_CRITICAL",
+                "paper_mode_mismatch_fail_observe",
+                payload={
+                    "mode": self.mode,
+                    "consecutive_mismatch_cycles": int(self._consecutive_mismatch_cycles),
+                    "consecutive_onchain_disagree_cycles": int(self._consecutive_onchain_disagree_cycles),
+                },
+            )
+
+        payload = {
+            "only_local": only_local,
+            "only_broker": only_broker,
+            "meta": meta,
+            "corrected_missed_fills": int(corrected_missed_fills),
+            "reconciliation_freeze_reason": str(self._reconciliation_freeze_reason or freeze_reason),
+            "freeze_triggered": bool(freeze_triggered),
+            "unfreeze_triggered": bool(unfreeze_triggered),
+            "inventory_delta_qty": _maybe_float(inventory_delta_qty),
+            "inventory_delta_qty_units": _maybe_int(inventory_delta_qty_units),
+            "inventory_delta_usdc": _maybe_float(inventory_delta_usdc),
+            "inventory_delta_usdc_units": _maybe_int(inventory_delta_usdc_units),
+            "onchain_delta_qty_units": _maybe_int(onchain_delta_qty_units),
+            "tolerance_qty": float(self._mismatch_tolerance_qty),
+            "tolerance_qty_units": int(tolerance_qty_units),
+            "tolerance_usdc": float(self._mismatch_tolerance_usdc),
+            "tolerance_usdc_units": int(tolerance_usdc_units),
+            "outside_tolerance": bool(outside_tolerance),
+            "consecutive_mismatch_cycles": int(self._consecutive_mismatch_cycles),
+            "consecutive_onchain_disagree_cycles": int(self._consecutive_onchain_disagree_cycles),
+            "consecutive_clean_cycles": int(self._consecutive_clean_cycles),
+            "required_clean_cycles_to_unfreeze": int(self._reconcile_clean_unfreeze_cycles),
+        }
 
         self.db.insert(
             "reconciliation_stats",
             {
                 "ts_ms": int(now_ms),
                 "event_id": uuid.uuid4().hex,
+                "run_id": self.run_id,
+                "mode": self.mode,
                 "broker_open_orders": int(broker_open_orders),
                 "broker_inventory": _maybe_float(broker_inventory),
                 "onchain_inventory": _maybe_float(onchain_inventory),
+                "derived_inventory": _maybe_float(derived_inventory),
+                "inventory_delta_qty": _maybe_float(inventory_delta_qty),
+                "inventory_delta_usdc": _maybe_float(inventory_delta_usdc),
+                "tolerance_qty": float(self._mismatch_tolerance_qty),
+                "tolerance_usdc": float(self._mismatch_tolerance_usdc),
+                "outside_tolerance": 1 if outside_tolerance else 0,
                 "mismatch_count": int(mismatch_count),
                 "unresolved_mismatch_count": int(unresolved_mismatch_count),
+                "consecutive_mismatch_cycles": int(self._consecutive_mismatch_cycles),
+                "consecutive_onchain_disagree_cycles": int(self._consecutive_onchain_disagree_cycles),
+                "freeze_state": 1 if self._reconciliation_frozen else 0,
+                "freeze_reason": str(self._reconciliation_freeze_reason or freeze_reason),
                 "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
             },
         )
@@ -1340,44 +2756,12 @@ def _load_constitution(path: Path) -> Dict[str, Any]:
     return data
 
 
-async def _run() -> None:
-    args = _parse_args()
-    settings = load_settings()
-    constitution_path = Path(args.constitution or "config/constitution.yaml")
-    constitution = _load_constitution(constitution_path)
-    trading_cfg = constitution.get("trading", {}) if isinstance(constitution, dict) else {}
-    policy_cfg = constitution.get("policy", {}) if isinstance(constitution, dict) else {}
-    mode = (args.mode or settings.trading_mode or trading_cfg.get("mode_default") or "OBSERVE").upper()
-    if mode not in {"OBSERVE", "PAPER", "TRADE"}:
-        raise ValueError(f"unsupported_mode:{mode}")
-
-    markets_path = args.markets or settings.track_markets_yaml
-    markets = load_markets(markets_path)
-    validate_markets_config(markets, auto_discover=settings.auto_discover)
-
-    log_dir = Path(args.log_dir or settings.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    db_path = Path(args.db_path or settings.runtime_db_path)
-    db = SQLiteStore(db_path)
-    run_id = uuid.uuid4().hex
-    event_tape = EventTape(log_dir=str(log_dir), run_id=run_id)
-    decision_tape = DecisionTape(log_dir=str(log_dir), run_id=run_id)
-    trade_tape = TradeTape(log_dir=str(log_dir), run_id=run_id)
-    metrics = Metrics()
-
-    resolved_markets, asset_meta = await resolve_markets(
-        markets=markets,
-        auto_discover=args.auto_discover or settings.auto_discover,
-        cache_path=log_dir / "cache_gamma_markets.json",
-        gamma_base_url=GAMMA_BASE_URL,
-        discovery_summary={},
-    )
-    asset_ids = sorted({token for market in resolved_markets for token in market.token_ids if token})
-    if not asset_ids:
-        raise ValueError("no_asset_ids_resolved")
-
-    books = {asset_id: OrderBook(asset_id=asset_id, bids={}, asks={}) for asset_id in asset_ids}
-    constraints = {
+def _build_constraints(
+    resolved_markets: List[Any],
+    policy_cfg: Dict[str, Any],
+    settings: Any,
+) -> Dict[str, OrderConstraints]:
+    return {
         asset_id: OrderConstraints(
             min_tick=market.min_tick,
             min_size=market.min_size,
@@ -1391,7 +2775,332 @@ async def _run() -> None:
         for asset_id in market.token_ids
         if asset_id
     }
+
+
+def _resolve_primary_market_state(
+    resolved_markets: List[Any],
+    asset_meta: Dict[str, Dict[str, Any]],
+) -> Optional[MarketState]:
+    if len(resolved_markets) != 1:
+        return None
+    return market_state_from_resolved(resolved_markets[0], asset_meta)
+
+
+def _write_rollover_event(
+    event_tape: EventTape,
+    event_type: str,
+    now_ms: int,
+    market: Optional[str],
+    payload: Dict[str, Any],
+) -> None:
+    event_tape.write(
+        channel="system",
+        event_type=event_type,
+        market=market,
+        asset_id=None,
+        t_event_ms=int(now_ms),
+        raw=payload,
+        source="market_rollover",
+        parse_warnings=[],
+        out_of_order=False,
+        t_recv_wall_ms=int(now_ms),
+        t_recv_wall_iso=_utc_iso_from_ms(int(now_ms)),
+        t_recv_mono_ns=time.monotonic_ns(),
+    )
+
+
+def _write_rollover_decision_boundary(
+    decision_tape: DecisionTape,
+    time_mapper: TimeMapper,
+    event_type: str,
+    now_ms: int,
+    payload: Dict[str, Any],
+) -> None:
+    market_slug = payload.get("market_slug_new") or payload.get("market_slug_prev")
+    condition_id = payload.get("condition_id_new") or payload.get("condition_id_prev")
+    record = DecisionRecord(
+        schema_version="decision_v4_system",
+        engine_version="run_system_v1",
+        run_id=decision_tape.run_id,
+        t_decision_wall_iso=_utc_iso_from_ms(int(now_ms)),
+        t_decision_wall_ms=int(now_ms),
+        t_decision_mono_ns=int(time_mapper.mono_ns_from_wall_ms(int(now_ms))),
+        asset_id="__rollover__",
+        market_slug=str(market_slug) if market_slug is not None else None,
+        condition_id=str(condition_id) if condition_id is not None else None,
+        token_id="__rollover__",
+        outcome=None,
+        outcome_by_token=None,
+        book={},
+        p_market_mid=None,
+        p_market_exec_buy=None,
+        p_market_exec_sell=None,
+        p_market=None,
+        p_fair=None,
+        edge_net_buy=None,
+        edge_net_sell=None,
+        p_star=None,
+        labels=None,
+        features_raw=None,
+        features_ortho=None,
+        whitening=None,
+        gates={"allow": False, "reasons": [str(event_type)]},
+        exec_cost={},
+        notes={"rollover": payload, "event_type": str(event_type)},
+        as_of_ts_ms=int(now_ms),
+        pstar_diag=None,
+        policy_codes=[str(event_type)],
+        latency={},
+        fsm_state=None,
+    )
+    decision_tape.write(record)
+
+
+def _discovery_requests_from_summary(discovery_summary: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(discovery_summary, dict):
+        return []
+    requests = discovery_summary.get("discovery_requests")
+    if not isinstance(requests, list):
+        return []
+    return [dict(item) for item in requests if isinstance(item, dict)]
+
+
+def _dedupe_discovery_requests(discovery_requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for payload in discovery_requests:
+        key = json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(payload)
+    return deduped
+
+
+def _append_discovery_request_rows(
+    db: SQLiteStore,
+    ts_ms: int,
+    discovery_requests: List[Dict[str, Any]],
+) -> None:
+    for payload in discovery_requests:
+        counts = {
+            "n_total": _maybe_int(payload.get("n_total")),
+            "n_btc_15m": _maybe_int(payload.get("n_btc_15m")),
+            "n_with_end_ts": _maybe_int(payload.get("n_with_end_ts")),
+            "n_active_now": _maybe_int(payload.get("n_active_now")),
+        }
+        db.append_discovery_request(
+            ts_ms=int(ts_ms),
+            requested_symbol=str(payload.get("requested_symbol", "")),
+            requested_horizon=str(payload.get("requested_horizon", "")),
+            mode=str(payload.get("requested_mode", "")),
+            now_ms=int(_maybe_int(payload.get("now_wall_ms")) or ts_ms),
+            selected_slug=_coerce_optional_str(payload.get("selected_slug")),
+            end_ts_ms=_maybe_int(payload.get("selected_end_ts_ms")),
+            end_ts_source=_coerce_optional_str(payload.get("selected_end_ts_source")),
+            reason_code=_coerce_optional_str(payload.get("error_code")),
+            counts=counts,
+            payload=payload,
+        )
+
+
+def _coerce_optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    parsed = str(value).strip()
+    return parsed if parsed else None
+
+
+def _candidate_tradability(
+    asset_meta: Dict[str, Dict[str, Any]],
+    token_ids: List[str],
+) -> Tuple[bool, str, Dict[str, Any]]:
+    details: Dict[str, Any] = {"by_token": {}}
+    seen_metadata = False
+    for token_id in token_ids:
+        meta = asset_meta.get(token_id) or {}
+        active = meta.get("active")
+        closed = meta.get("closed")
+        accepting = meta.get("accepting_orders")
+        details["by_token"][token_id] = {
+            "active": active,
+            "closed": closed,
+            "accepting_orders": accepting,
+        }
+        if active is not None or closed is not None or accepting is not None:
+            seen_metadata = True
+        if closed is True:
+            return False, "CANDIDATE_CLOSED", details
+        if active is False:
+            return False, "CANDIDATE_INACTIVE", details
+        if accepting is False:
+            return False, "CANDIDATE_NOT_ACCEPTING_ORDERS", details
+    if not seen_metadata:
+        return True, "CANDIDATE_TRADABILITY_UNKNOWN", details
+    return True, "CANDIDATE_TRADABLE", details
+
+
+def _candidate_liveness(
+    asset_meta: Dict[str, Dict[str, Any]],
+    token_ids: List[str],
+    now_ms: int,
+    market_end_ts_ms: Optional[int],
+) -> Tuple[bool, str, Dict[str, Any]]:
+    tradable_ok, tradability_state, tradability_details = _candidate_tradability(asset_meta, token_ids)
+    details = {
+        "tradability_state": tradability_state,
+        "tradability_details": tradability_details,
+        "market_end_ts_ms": _maybe_int(market_end_ts_ms),
+    }
+    if market_end_ts_ms is not None and int(now_ms) >= int(market_end_ts_ms):
+        return False, "CANDIDATE_ENDED", details
+    if not tradable_ok:
+        return False, str(tradability_state), details
+    return True, "CANDIDATE_LIVE", details
+
+
+def _pending_books_liveness(token_ids: List[str], books: Dict[str, OrderBook]) -> Tuple[bool, Dict[str, Any]]:
+    by_token: Dict[str, bool] = {}
+    any_book_update = False
+    for token_id in [str(token) for token in token_ids if token]:
+        book = books.get(token_id)
+        seen = bool(book is not None and (int(book.last_recv_mono_ns or 0) > 0 or book.last_event_ts_ms is not None))
+        by_token[token_id] = seen
+        any_book_update = any_book_update or seen
+    all_tokens_seen = all(by_token.values()) if by_token else False
+    liveness_ok = bool(all_tokens_seen or any_book_update)
+    return liveness_ok, {
+        "all_tokens_seen": bool(all_tokens_seen),
+        "any_book_update": bool(any_book_update),
+        "by_token": by_token,
+    }
+
+
+def _rollover_commit_decision(
+    *,
+    now_ms: int,
+    readiness_ready: bool,
+    escape_hatch_open: bool,
+    liveness_ok: bool,
+) -> RolloverCommitDecision:
+    if readiness_ready:
+        return RolloverCommitDecision(
+            action="COMMIT",
+            force_observe_only=False,
+            reason="READINESS_READY",
+        )
+    if escape_hatch_open and liveness_ok:
+        return RolloverCommitDecision(
+            action="COMMIT",
+            force_observe_only=True,
+            reason="ESCAPE_HATCH_LIVENESS_ONLY",
+        )
+    if escape_hatch_open and not liveness_ok:
+        return RolloverCommitDecision(
+            action="RETRY",
+            force_observe_only=False,
+            reason="ESCAPE_HATCH_NO_LIVENESS",
+        )
+    return RolloverCommitDecision(
+        action="RETRY",
+        force_observe_only=False,
+        reason="READINESS_NOT_READY",
+    )
+
+
+async def _run() -> None:
+    args = _parse_args()
+    settings = load_settings()
+    constitution_path = Path(args.constitution or "config/constitution.yaml")
+    constitution = _load_constitution(constitution_path)
+    trading_cfg = constitution.get("trading", {}) if isinstance(constitution, dict) else {}
+    policy_cfg = constitution.get("policy", {}) if isinstance(constitution, dict) else {}
+    mode = (args.mode or settings.trading_mode or trading_cfg.get("mode_default") or "OBSERVE").upper()
+    if mode not in {"OBSERVE", "PAPER", "TRADE"}:
+        raise ValueError(f"unsupported_mode:{mode}")
+
+    effective_auto_discover = _effective_auto_discover(
+        cli_auto_discover=bool(args.auto_discover),
+        settings_auto_discover=bool(settings.auto_discover),
+    )
+    markets_path = args.markets or settings.track_markets_yaml
+    markets = load_markets(markets_path)
+    validate_markets_config(markets, auto_discover=effective_auto_discover)
+
+    log_dir = Path(args.log_dir or settings.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    db_path = Path(args.db_path or settings.runtime_db_path)
+    db = SQLiteStore(db_path)
+    run_id = uuid.uuid4().hex
+    event_tape = EventTape(log_dir=str(log_dir), run_id=run_id)
+    decision_tape = DecisionTape(log_dir=str(log_dir), run_id=run_id)
+    trade_tape = TradeTape(log_dir=str(log_dir), run_id=run_id)
+    metrics = Metrics()
     time_mapper = TimeMapper.from_wall_and_mono(wall_ms=_now_ms(), mono_ns=time.monotonic_ns())
+    startup_discovery_summary: Dict[str, Any] = {}
+    startup_discovery_now_ms = int(time_mapper.wall_ms(time.monotonic_ns()))
+    try:
+        resolved_markets, asset_meta = await resolve_markets(
+            markets=markets,
+            auto_discover=effective_auto_discover,
+            cache_path=log_dir / "cache_gamma_markets.json",
+            gamma_base_url=GAMMA_BASE_URL,
+            now_ts=int(startup_discovery_now_ms / 1000),
+            discovery_summary=startup_discovery_summary,
+        )
+    except NoActiveMarketError as exc:
+        discovery_requests = _discovery_requests_from_summary(startup_discovery_summary)
+        if exc.request_payload:
+            discovery_requests.append(dict(exc.request_payload))
+        discovery_requests = _dedupe_discovery_requests(discovery_requests)
+        _append_discovery_request_rows(
+            db=db,
+            ts_ms=startup_discovery_now_ms,
+            discovery_requests=discovery_requests,
+        )
+        db.append_log(
+            startup_discovery_now_ms,
+            "ERROR",
+            "startup_discovery_no_active_market",
+            {
+                "error_code": "NO_ACTIVE_BTC_15M",
+                "error": str(exc),
+                "discovery_requests": discovery_requests,
+                "diagnostics": dict(exc.diagnostics),
+            },
+        )
+        raise
+    except ValueError as exc:
+        msg = str(exc)
+        if msg.startswith("no_markets_found_for_symbol") or msg.startswith("no_markets_found_for_slug_prefix"):
+            discovery_requests = _discovery_requests_from_summary(startup_discovery_summary)
+            _append_discovery_request_rows(
+                db=db,
+                ts_ms=startup_discovery_now_ms,
+                discovery_requests=discovery_requests,
+            )
+            db.append_log(
+                startup_discovery_now_ms,
+                "ERROR",
+                "startup_discovery_no_markets",
+                {
+                    "error": msg,
+                    "discovery_summary": dict(startup_discovery_summary),
+                    "discovery_requests": discovery_requests,
+                },
+            )
+        raise
+    _append_discovery_request_rows(
+        db=db,
+        ts_ms=startup_discovery_now_ms,
+        discovery_requests=_discovery_requests_from_summary(startup_discovery_summary),
+    )
+    asset_ids = sorted({token for market in resolved_markets for token in market.token_ids if token})
+    if not asset_ids:
+        raise ValueError("no_asset_ids_resolved")
+
+    books = {asset_id: OrderBook(asset_id=asset_id, bids={}, asks={}) for asset_id in asset_ids}
+    constraints = _build_constraints(resolved_markets, policy_cfg, settings)
 
     policy_thresholds = PolicyThresholds(
         max_book_age_ms=int(policy_cfg.get("max_book_age_ms", settings.max_book_staleness_ms)),
@@ -1411,6 +3120,12 @@ async def _run() -> None:
         freeze_disagree_bps=float(policy_cfg.get("pstar_freeze_disagree_bps", settings.pstar_freeze_disagree_bps)),
         degrade_disagree_bps=float(policy_cfg.get("pstar_degrade_disagree_bps", 10.0)),
         allow_degraded_single_source=bool(policy_cfg.get("allow_degraded_single_source", True)),
+    )
+    readiness_config = MarketReadinessConfig(
+        book_max_age_ms=int(trading_cfg.get("rollover_book_max_age_ms", policy_cfg.get("max_book_age_ms", settings.max_book_staleness_ms))),
+        book_max_spread_bps=float(trading_cfg.get("rollover_book_max_spread_bps", policy_cfg.get("max_spread_bps", settings.max_spread_bps))),
+        depth_target_qty=float(trading_cfg.get("rollover_depth_target_qty", constitution.get("execution", {}).get("maker_quote_size", 1.0))),
+        pstar_max_age_ms=int(trading_cfg.get("rollover_pstar_max_age_ms", pstar_builder.max_age_ms)),
     )
 
     broker = None
@@ -1463,17 +3178,49 @@ async def _run() -> None:
         time_mapper=time_mapper,
         broker=broker,
         run_epoch_ms=run_epoch_ms,
+        run_id=run_id,
+        readiness_config=readiness_config,
     )
 
-    if mode == "TRADE" and broker is not None and not args.dry_run:
+    if mode in {"PAPER", "TRADE"} and broker is not None:
         snapshot = await asyncio.to_thread(broker.snapshot)
-        adopted = runtime.adopt_open_orders(snapshot=snapshot, now_ms=_now_ms())
+        try:
+            recovery_diag = await runtime.adopt_open_orders_with_cleanup(snapshot=snapshot, now_ms=_now_ms())
+        except RuntimeError as exc:
+            err_msg = str(exc)
+            if err_msg.startswith("RECON_STARTUP_INVARIANT_VIOLATION:"):
+                db.append_alert(
+                    _now_ms(),
+                    "critical",
+                    "RECON_STARTUP_INVARIANT_VIOLATION",
+                    err_msg,
+                    payload={
+                        "mode": mode,
+                        "open_order_count": int(len(snapshot.open_orders or {})),
+                    },
+                )
+            db.append_log(
+                _now_ms(),
+                "ERROR",
+                "startup_recovery_failed",
+                {
+                    "mode": mode,
+                    "error": err_msg,
+                    "open_order_count": int(len(snapshot.open_orders or {})),
+                },
+            )
+            event_tape.close()
+            decision_tape.close()
+            trade_tape.close()
+            db.close()
+            raise
         db.append_log(
             _now_ms(),
             "INFO",
             "startup_recovery_complete",
             {
-                "adopted_order_count": int(adopted),
+                "adopted_order_count": int(recovery_diag.get("adopted", 0)),
+                "duplicates_canceled": int(recovery_diag.get("duplicates_canceled", 0)),
                 "open_order_count": int(len(snapshot.open_orders or {})),
             },
         )
@@ -1490,9 +3237,43 @@ async def _run() -> None:
         config=ws_config,
         decision_engine=None,
     )
+    rollover_manager: Optional[MarketRolloverManager] = None
+    auto_discover_enabled = bool(args.auto_discover or settings.auto_discover)
+    if auto_discover_enabled and len(markets) == 1 and len(resolved_markets) == 1:
+        primary_market_state = _resolve_primary_market_state(resolved_markets, asset_meta)
+        if primary_market_state is not None:
+            rollover_manager = MarketRolloverManager(
+                current=primary_market_state,
+                config=MarketRolloverConfig(
+                    prefetch_ms=int(trading_cfg.get("rollover_prefetch_ms", 90_000)),
+                    stale_ms=int(trading_cfg.get("rollover_ws_stale_ms", 15_000)),
+                    discovery_period_ms=int(trading_cfg.get("rollover_discovery_period_ms", 30_000)),
+                    grace_ms=int(trading_cfg.get("rollover_grace_ms", 60_000)),
+                ),
+            )
+            db.append_log(
+                _now_ms(),
+                "INFO",
+                "rollover_manager_enabled",
+                {
+                    "market_slug": primary_market_state.market_slug,
+                    "market_end_ts_ms": primary_market_state.market_end_ts_ms,
+                    "market_end_source": primary_market_state.market_end_source,
+                },
+            )
+    elif auto_discover_enabled:
+        db.append_log(
+            _now_ms(),
+            "INFO",
+            "rollover_manager_disabled",
+            {"reason": "requires_single_market_config"},
+        )
 
     quote_interval_ms = int(args.quote_interval_ms or trading_cfg.get("quote_interval_ms", settings.quote_interval_ms))
     stats_interval_ms = int(args.stats_interval_ms or trading_cfg.get("stats_interval_ms", settings.stats_interval_ms))
+    rollover_quiet_window_ms = int(trading_cfg.get("rollover_quiet_window_ms", 500))
+    unknown_alert_threshold_per_min = int(trading_cfg.get("rollover_unknown_alert_threshold_per_min", 120))
+    unknown_alert_cooldown_ms = int(trading_cfg.get("rollover_unknown_alert_cooldown_ms", 60_000))
     reference_sources = args.reference_source or settings.reference_source or "poll_coinbase,poll_binance_perp"
 
     stop_event = asyncio.Event()
@@ -1538,20 +3319,773 @@ async def _run() -> None:
             ref_ws_clients.append(ws_client)
             tasks.append(asyncio.create_task(ws_client.run()))
 
+    guard_ok, guard_payload = await runtime.startup_feed_guard(
+        mode=mode,
+        tracked_symbols=symbols,
+        max_wait_secs=30,
+        min_updates_per_token=10,
+        max_book_age_ms=int(policy_thresholds.max_book_age_ms),
+        max_pstar_age_ms=int(pstar_builder.max_age_ms),
+    )
+    guard_live_blocked = _handle_startup_guard_result(
+        db=db,
+        mode=mode,
+        guard_ok=guard_ok,
+        guard_payload=guard_payload,
+    )
+    if guard_live_blocked:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        db.append_log(_now_ms(), "ERROR", "startup_feed_guard_failed", guard_payload)
+        event_tape.close()
+        decision_tape.close()
+        trade_tape.close()
+        db.close()
+        raise RuntimeError("feed_not_wired_for_live_mode")
+    runtime_lock = asyncio.Lock()
+
     async def _quote_loop() -> None:
         while not stop_event.is_set():
-            now_ms = _now_ms()
-            await runtime.run_quote_cycle(now_ms)
+            now_ms = int(time_mapper.wall_ms(time.monotonic_ns()))
+            async with runtime_lock:
+                await runtime.run_quote_cycle(now_ms)
             await asyncio.sleep(max(0.05, quote_interval_ms / 1000.0))
 
     async def _stats_loop() -> None:
+        last_unknown_alert_ms: int = 0
         while not stop_event.is_set():
-            now_ms = _now_ms()
-            await runtime.run_stats_cycle(now_ms)
+            now_ms = int(time_mapper.wall_ms(time.monotonic_ns()))
+            async with runtime_lock:
+                await runtime.run_stats_cycle(now_ms)
+                guard_state = runtime.rollover_guard_status(now_ms)
+            unknown_count = metrics.market_unknown_count()
+            unknown_rate = metrics.market_unknown_rate_per_min(now_ms)
+            ignored_old_rate = metrics.market_ignored_old_rate_per_min(now_ms)
+            current_market_slug = rollover_manager.current.market_slug if rollover_manager is not None else None
+            current_selection_key = rollover_manager.current.selection_key if rollover_manager is not None else None
+            current_end_source = rollover_manager.current.market_end_source if rollover_manager is not None else None
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="unknown_msg_count",
+                metric_value=float(unknown_count),
+                market_slug=current_market_slug,
+                selection_key=current_selection_key,
+                payload={"unknown_rate_per_min": unknown_rate},
+            )
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="ignored_old_rate_per_min",
+                metric_value=float(ignored_old_rate),
+                market_slug=current_market_slug,
+                selection_key=current_selection_key,
+                payload={"unknown_msg_count": unknown_count},
+            )
+            db.append_rollover_status(
+                ts_ms=now_ms,
+                event_type="GUARD_HEARTBEAT",
+                market_slug=current_market_slug,
+                selection_key=current_selection_key,
+                end_ts_source=current_end_source,
+                readiness_ok=bool(guard_state.get("last_ready", True)),
+                readiness_reason_codes=[str(code) for code in guard_state.get("last_reason_codes", [])],
+                confirm_wait_ms=None,
+                commit_block_ms=None,
+                unsubscribe_ms=None,
+                unknown_msg_count=int(unknown_count),
+                ignored_old_rate_per_min=float(ignored_old_rate),
+                payload=guard_state,
+            )
+            if (
+                unknown_rate >= float(max(1, unknown_alert_threshold_per_min))
+                and int(now_ms - last_unknown_alert_ms) >= int(max(1, unknown_alert_cooldown_ms))
+            ):
+                last_unknown_alert_ms = int(now_ms)
+                db.append_alert(
+                    ts_ms=now_ms,
+                    severity="warning",
+                    code="WS_UNKNOWN_RATE_HIGH",
+                    message=f"unknown_market_msgs_per_min={unknown_rate:.1f}",
+                    payload={
+                        "unknown_msg_count": int(unknown_count),
+                        "unknown_rate_per_min": float(unknown_rate),
+                        "threshold_per_min": int(unknown_alert_threshold_per_min),
+                    },
+                )
             await asyncio.sleep(max(0.1, stats_interval_ms / 1000.0))
+
+    async def _rollover_loop() -> None:
+        if rollover_manager is None:
+            return
+        confirm_timeout_secs = max(
+            1.0,
+            float(trading_cfg.get("rollover_confirm_timeout_ms", 5_000)) / 1000.0,
+        )
+        check_period_secs = max(
+            0.25,
+            float(trading_cfg.get("rollover_check_period_ms", 1_000)) / 1000.0,
+        )
+        health_gate = RolloverHealthGate(
+            abort_threshold=int(trading_cfg.get("rollover_abort_threshold", 3)),
+            abort_window_ms=int(trading_cfg.get("rollover_abort_window_ms", 10 * 60_000)),
+            cooldown_ms=int(trading_cfg.get("rollover_health_cooldown_ms", trading_cfg.get("rollover_abort_window_ms", 10 * 60_000))),
+        )
+        readiness_pass_count = 0
+        readiness_fail_count = 0
+        readiness_last_reasons: List[str] = []
+
+        def _emit_rollover_abort(
+            *,
+            now_ms: int,
+            current_state: MarketState,
+            intent_payload: Dict[str, Any],
+            abort_reason: str,
+            extra_payload: Optional[Dict[str, Any]] = None,
+            log_level: str = "WARNING",
+            log_code: str = "rollover_abort",
+            count_toward_health: bool = True,
+        ) -> None:
+            abort_payload = {
+                **intent_payload,
+                "abort_reason": str(abort_reason),
+            }
+            if extra_payload:
+                abort_payload.update(extra_payload)
+            _write_rollover_event(
+                event_tape=event_tape,
+                event_type="ROLLOVER_ABORT",
+                now_ms=now_ms,
+                market=current_state.market_slug,
+                payload=abort_payload,
+            )
+            _write_rollover_decision_boundary(
+                decision_tape=decision_tape,
+                time_mapper=time_mapper,
+                event_type="ROLLOVER_ABORT",
+                now_ms=now_ms,
+                payload=abort_payload,
+            )
+            db.append_log(now_ms, log_level, log_code, abort_payload)
+            db.append_rollover_status(
+                ts_ms=now_ms,
+                event_type="ABORT",
+                market_slug=current_state.market_slug,
+                selection_key=current_state.selection_key,
+                end_ts_source=current_state.market_end_source,
+                readiness_ok=False,
+                readiness_reason_codes=[str(code) for code in abort_payload.get("readiness_reason_codes", [])],
+                confirm_wait_ms=_maybe_float(abort_payload.get("confirm_wait_ms")),
+                commit_block_ms=_maybe_float(abort_payload.get("commit_block_ms")),
+                unsubscribe_ms=_maybe_float(abort_payload.get("unsubscribe_ms")),
+                unknown_msg_count=metrics.market_unknown_count(),
+                ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
+                payload=abort_payload,
+            )
+            if not count_toward_health:
+                return
+            freeze_diag = health_gate.note_abort(now_ms)
+            if freeze_diag is None:
+                return
+            freeze_payload = {
+                **abort_payload,
+                **freeze_diag,
+                "event": "ROLLOVER_HEALTH_FREEZE",
+            }
+            _write_rollover_event(
+                event_tape=event_tape,
+                event_type="ROLLOVER_HEALTH_FREEZE",
+                now_ms=now_ms,
+                market=current_state.market_slug,
+                payload=freeze_payload,
+            )
+            _write_rollover_decision_boundary(
+                decision_tape=decision_tape,
+                time_mapper=time_mapper,
+                event_type="ROLLOVER_HEALTH_FREEZE",
+                now_ms=now_ms,
+                payload=freeze_payload,
+            )
+            db.append_alert(
+                now_ms,
+                "critical",
+                "ROLLOVER_HEALTH_FREEZE",
+                "Rollover aborted too frequently; freezing rollover attempts",
+                payload=freeze_payload,
+            )
+            db.append_log(now_ms, "ERROR", "rollover_health_freeze", freeze_payload)
+            db.append_rollover_status(
+                ts_ms=now_ms,
+                event_type="HEALTH_FREEZE",
+                market_slug=current_state.market_slug,
+                selection_key=current_state.selection_key,
+                end_ts_source=current_state.market_end_source,
+                readiness_ok=False,
+                readiness_reason_codes=[str(code) for code in freeze_payload.get("readiness_reason_codes", [])],
+                confirm_wait_ms=_maybe_float(freeze_payload.get("confirm_wait_ms")),
+                commit_block_ms=_maybe_float(freeze_payload.get("commit_block_ms")),
+                unsubscribe_ms=_maybe_float(freeze_payload.get("unsubscribe_ms")),
+                unknown_msg_count=metrics.market_unknown_count(),
+                ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
+                payload=freeze_payload,
+            )
+
+        while not stop_event.is_set():
+            now_mono_ns = time.monotonic_ns()
+            now_ms = int(time_mapper.wall_ms(now_mono_ns))
+            if health_gate.is_frozen(now_ms):
+                await asyncio.sleep(check_period_secs)
+                continue
+            last_book_recv_mono_ns = market_client.active_last_book_recv_mono_ns()
+            last_book_recv_wall_ms = (
+                int(time_mapper.wall_ms(last_book_recv_mono_ns)) if last_book_recv_mono_ns > 0 else None
+            )
+            trigger_reasons = rollover_manager.evaluate_reasons(
+                now_ms=now_ms,
+                last_book_recv_wall_ms=last_book_recv_wall_ms,
+                market_closed=market_client.active_market_closed(),
+            )
+            if not rollover_manager.should_attempt_discovery(now_ms, trigger_reasons):
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            rollover_manager.mark_discovery_attempt(now_ms)
+            current_state = rollover_manager.current
+            active_sub_before = market_client.active_subscription_id()
+            intent_payload = {
+                "market_slug_prev": current_state.market_slug,
+                "market_slug_new": None,
+                "condition_id_prev": current_state.condition_id,
+                "condition_id_new": None,
+                "token_ids_prev": list(current_state.token_ids),
+                "token_ids_new": None,
+                "market_end_ts_ms_prev": current_state.market_end_ts_ms,
+                "market_end_ts_ms_new": None,
+                "market_end_source_prev": current_state.market_end_source,
+                "market_end_source_new": None,
+                "selection_key_prev": current_state.selection_key,
+                "selection_key_new": None,
+                "trigger_reasons": sorted(set(trigger_reasons)),
+                "as_of_ts_ms": now_ms,
+                "rollover_count": int(rollover_manager.rollover_count),
+                "active_subscription_id_before": int(active_sub_before),
+                "active_subscription_id_after": int(active_sub_before),
+                "confirm_diag": {},
+            }
+            _write_rollover_event(
+                event_tape=event_tape,
+                event_type="ROLLOVER_INTENT",
+                now_ms=now_ms,
+                market=current_state.market_slug,
+                payload=intent_payload,
+            )
+            _write_rollover_decision_boundary(
+                decision_tape=decision_tape,
+                time_mapper=time_mapper,
+                event_type="ROLLOVER_INTENT",
+                now_ms=now_ms,
+                payload=intent_payload,
+            )
+            db.append_log(now_ms, "INFO", "rollover_intent", intent_payload)
+            db.append_rollover_status(
+                ts_ms=now_ms,
+                event_type="INTENT",
+                market_slug=current_state.market_slug,
+                selection_key=current_state.selection_key,
+                end_ts_source=current_state.market_end_source,
+                readiness_ok=None,
+                readiness_reason_codes=None,
+                confirm_wait_ms=None,
+                commit_block_ms=None,
+                unsubscribe_ms=None,
+                unknown_msg_count=metrics.market_unknown_count(),
+                ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
+                payload=intent_payload,
+            )
+
+            discovery_summary: Dict[str, Any] = {}
+            try:
+                discovered_markets, discovered_asset_meta = await resolve_markets(
+                    markets=markets,
+                    auto_discover=auto_discover_enabled,
+                    cache_path=log_dir / "cache_gamma_markets.json",
+                    gamma_base_url=GAMMA_BASE_URL,
+                    now_ts=int(now_ms / 1000),
+                    discovery_summary=discovery_summary,
+                )
+                _append_discovery_request_rows(
+                    db=db,
+                    ts_ms=now_ms,
+                    discovery_requests=_discovery_requests_from_summary(discovery_summary),
+                )
+            except NoActiveMarketError as exc:
+                discovery_requests = _discovery_requests_from_summary(discovery_summary)
+                if exc.request_payload:
+                    discovery_requests.append(dict(exc.request_payload))
+                discovery_requests = _dedupe_discovery_requests(discovery_requests)
+                _append_discovery_request_rows(
+                    db=db,
+                    ts_ms=now_ms,
+                    discovery_requests=discovery_requests,
+                )
+                db.append_alert(
+                    ts_ms=now_ms,
+                    severity="warning",
+                    code="NO_ACTIVE_BTC_15M",
+                    message="No active BTC 15m market found during rollover discovery",
+                    payload={
+                        "error": str(exc),
+                        "diagnostics": dict(exc.diagnostics),
+                        "discovery_requests": discovery_requests,
+                    },
+                )
+                _emit_rollover_abort(
+                    now_ms=now_ms,
+                    current_state=current_state,
+                    intent_payload=intent_payload,
+                    abort_reason="DISCOVERY_NO_ACTIVE_MARKET",
+                    extra_payload={
+                        "error": str(exc),
+                        "diagnostics": dict(exc.diagnostics),
+                        "discovery_summary": discovery_summary,
+                        "discovery_requests": discovery_requests,
+                    },
+                    log_level="WARNING",
+                    log_code="rollover_abort_discovery_no_active_market",
+                    count_toward_health=False,
+                )
+                await asyncio.sleep(check_period_secs)
+                continue
+            except Exception as exc:
+                _append_discovery_request_rows(
+                    db=db,
+                    ts_ms=now_ms,
+                    discovery_requests=_discovery_requests_from_summary(discovery_summary),
+                )
+                _emit_rollover_abort(
+                    now_ms=now_ms,
+                    current_state=current_state,
+                    intent_payload=intent_payload,
+                    abort_reason="DISCOVERY_ERROR",
+                    extra_payload={"error": str(exc)},
+                    log_level="WARNING",
+                    log_code="rollover_abort_discovery_error",
+                )
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            candidate_state = _resolve_primary_market_state(discovered_markets, discovered_asset_meta)
+            if candidate_state is None:
+                _emit_rollover_abort(
+                    now_ms=now_ms,
+                    current_state=current_state,
+                    intent_payload=intent_payload,
+                    abort_reason="DISCOVERY_NOT_SINGLE_MARKET",
+                    extra_payload={"discovery_summary": discovery_summary},
+                    log_level="WARNING",
+                    log_code="rollover_abort_discovery_not_single",
+                )
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            candidate_payload = {
+                "market_slug_new": candidate_state.market_slug,
+                "condition_id_new": candidate_state.condition_id,
+                "token_ids_new": list(candidate_state.token_ids),
+                "market_end_ts_ms_new": candidate_state.market_end_ts_ms,
+                "market_end_source_new": candidate_state.market_end_source,
+                "selection_key_new": candidate_state.selection_key,
+            }
+
+            if not rollover_manager.has_market_changed(candidate_state):
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            if not rollover_manager.can_commit_switch(now_ms, trigger_reasons):
+                _emit_rollover_abort(
+                    now_ms=now_ms,
+                    current_state=current_state,
+                    intent_payload=intent_payload,
+                    abort_reason="PREFETCH_WAIT_UNTIL_END",
+                    extra_payload=candidate_payload,
+                    log_level="INFO",
+                    log_code="rollover_deferred_prefetch",
+                    count_toward_health=False,
+                )
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            candidate_live, candidate_liveness_state, candidate_liveness_details = _candidate_liveness(
+                asset_meta=discovered_asset_meta,
+                token_ids=candidate_state.token_ids,
+                now_ms=now_ms,
+                market_end_ts_ms=candidate_state.market_end_ts_ms,
+            )
+            if not candidate_live:
+                _emit_rollover_abort(
+                    now_ms=now_ms,
+                    current_state=current_state,
+                    intent_payload=intent_payload,
+                    abort_reason="CANDIDATE_NOT_LIVE",
+                    extra_payload={
+                        **candidate_payload,
+                        "candidate_liveness_state": candidate_liveness_state,
+                        "candidate_liveness_details": candidate_liveness_details,
+                        "discovery_summary": discovery_summary,
+                    },
+                    log_level="WARNING",
+                    log_code="rollover_abort_candidate_not_live",
+                )
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            token_ids_changed = sorted(current_state.token_ids) != sorted(candidate_state.token_ids)
+            prepare_diag: Dict[str, Any] = {"removed_tokens": [], "cancelled_orders": 0}
+            switch_result: ResubscribeResult
+            committed_books: Dict[str, OrderBook]
+            if token_ids_changed:
+                try:
+                    prepare_diag = await runtime.prepare_rollover(
+                        next_token_ids=list(candidate_state.token_ids),
+                        now_ms=now_ms,
+                    )
+                except Exception as exc:
+                    market_client.set_books(runtime.books)
+                    _emit_rollover_abort(
+                        now_ms=now_ms,
+                        current_state=current_state,
+                        intent_payload=intent_payload,
+                        abort_reason="PREPARE_ERROR",
+                        extra_payload={
+                            **candidate_payload,
+                            "error": str(exc),
+                        },
+                        log_level="ERROR",
+                        log_code="rollover_abort_prepare_error",
+                    )
+                    await asyncio.sleep(check_period_secs)
+                    continue
+
+                candidate_books: Dict[str, OrderBook] = dict(runtime.books)
+                for token_id in candidate_state.token_ids:
+                    if token_id not in candidate_books:
+                        candidate_books[token_id] = OrderBook(asset_id=token_id, bids={}, asks={})
+                market_client.set_books(candidate_books)
+                switch_result = await market_client.resubscribe(
+                    new_asset_ids=list(candidate_state.token_ids),
+                    first_book_timeout_secs=confirm_timeout_secs,
+                )
+                if switch_result.status != "committed":
+                    market_client.set_books(runtime.books)
+                    db.append_rollover_metric(
+                        ts_ms=now_ms,
+                        metric_name="rollover_confirm_wait_ms",
+                        metric_value=_maybe_float(switch_result.confirm_wait_ms),
+                        market_slug=candidate_state.market_slug,
+                        selection_key=candidate_state.selection_key,
+                        payload={"status": switch_result.status, "abort": True},
+                    )
+                    db.append_rollover_metric(
+                        ts_ms=now_ms,
+                        metric_name="rollover_unsubscribe_ms",
+                        metric_value=_maybe_float(switch_result.unsubscribe_ms),
+                        market_slug=candidate_state.market_slug,
+                        selection_key=candidate_state.selection_key,
+                        payload={"status": switch_result.status, "abort": True},
+                    )
+                    _emit_rollover_abort(
+                        now_ms=now_ms,
+                        current_state=current_state,
+                        intent_payload=intent_payload,
+                        abort_reason=switch_result.abort_reason or "SWITCH_ABORT",
+                        extra_payload={
+                            **candidate_payload,
+                            "confirm_diag": switch_result.confirm_diag,
+                            "switch_status": switch_result.status,
+                            "active_subscription_id_after": int(switch_result.active_subscription_id),
+                            "prepare_diag": prepare_diag,
+                            "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
+                            "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
+                        },
+                        log_level="WARNING",
+                        log_code="rollover_abort_switch",
+                    )
+                    await asyncio.sleep(check_period_secs)
+                    continue
+                committed_books = {
+                    token_id: candidate_books.get(token_id, OrderBook(asset_id=token_id, bids={}, asks={}))
+                    for token_id in candidate_state.token_ids
+                }
+            else:
+                switch_result = ResubscribeResult(
+                    status="commit_metadata_only",
+                    previous_asset_ids=list(current_state.token_ids),
+                    new_asset_ids=list(candidate_state.token_ids),
+                    active_subscription_id=market_client.active_subscription_id(),
+                    confirm_diag={},
+                )
+                committed_books = dict(runtime.books)
+
+            db.append_rollover_status(
+                ts_ms=now_ms,
+                event_type="CONFIRM",
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                end_ts_source=candidate_state.market_end_source,
+                readiness_ok=None,
+                readiness_reason_codes=None,
+                confirm_wait_ms=_maybe_float(switch_result.confirm_wait_ms),
+                commit_block_ms=None,
+                unsubscribe_ms=_maybe_float(switch_result.unsubscribe_ms),
+                unknown_msg_count=metrics.market_unknown_count(),
+                ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
+                payload={
+                    "status": switch_result.status,
+                    "confirm_diag": switch_result.confirm_diag,
+                    "active_subscription_id": int(switch_result.active_subscription_id),
+                },
+            )
+
+            readiness_result = runtime.evaluate_market_readiness(
+                token_ids=list(candidate_state.token_ids),
+                now_ms=now_ms,
+                books_override=committed_books,
+                market_meta_override=discovered_asset_meta,
+            )
+            if readiness_result.ready:
+                readiness_pass_count += 1
+            else:
+                readiness_fail_count += 1
+                readiness_last_reasons = list(readiness_result.reason_codes)
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="readiness_pass_count",
+                metric_value=float(readiness_pass_count),
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                payload={"last_reasons": list(readiness_last_reasons)},
+            )
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="readiness_fail_count",
+                metric_value=float(readiness_fail_count),
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                payload={"last_reasons": list(readiness_last_reasons)},
+            )
+            liveness_ok, liveness_details = _pending_books_liveness(candidate_state.token_ids, committed_books)
+            commit_decision = _rollover_commit_decision(
+                now_ms=now_ms,
+                readiness_ready=bool(readiness_result.ready),
+                escape_hatch_open=rollover_manager.escape_hatch_open(now_ms),
+                liveness_ok=bool(liveness_ok),
+            )
+            readiness_payload = {
+                **candidate_payload,
+                "readiness_ok": bool(readiness_result.ready),
+                "readiness_reason_codes": list(readiness_result.reason_codes),
+                "readiness_details": readiness_result.details,
+                "readiness_pass_count": int(readiness_pass_count),
+                "readiness_fail_count": int(readiness_fail_count),
+                "readiness_last_reasons": list(readiness_last_reasons),
+                "commit_decision": commit_decision.action,
+                "commit_decision_reason": commit_decision.reason,
+                "liveness_ok": bool(liveness_ok),
+                "liveness_details": liveness_details,
+            }
+            db.append_rollover_status(
+                ts_ms=now_ms,
+                event_type="READINESS_CHECK",
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                end_ts_source=candidate_state.market_end_source,
+                readiness_ok=bool(readiness_result.ready),
+                readiness_reason_codes=list(readiness_result.reason_codes),
+                confirm_wait_ms=_maybe_float(switch_result.confirm_wait_ms),
+                commit_block_ms=None,
+                unsubscribe_ms=_maybe_float(switch_result.unsubscribe_ms),
+                unknown_msg_count=metrics.market_unknown_count(),
+                ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
+                payload=readiness_payload,
+            )
+            if commit_decision.action != "COMMIT":
+                market_client.set_books(runtime.books)
+                _emit_rollover_abort(
+                    now_ms=now_ms,
+                    current_state=current_state,
+                    intent_payload=intent_payload,
+                    abort_reason=commit_decision.reason,
+                    extra_payload={
+                        **readiness_payload,
+                        "prepare_diag": prepare_diag,
+                        "confirm_diag": switch_result.confirm_diag,
+                        "switch_status": switch_result.status,
+                        "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
+                        "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
+                    },
+                    log_level="INFO",
+                    log_code="rollover_abort_readiness_or_liveness",
+                    count_toward_health=not rollover_manager.escape_hatch_open(now_ms),
+                )
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            candidate_constraints = _build_constraints(discovered_markets, policy_cfg, settings)
+            runtime_diag: Dict[str, Any]
+            commit_block_ms: Optional[float] = None
+
+            try:
+                commit_block_start_ns = time.monotonic_ns()
+                async with runtime_lock:
+                    runtime_diag = runtime.commit_rollover_swap(
+                        books=committed_books,
+                        constraints=candidate_constraints,
+                        market_meta=discovered_asset_meta,
+                        now_ms=now_ms,
+                    )
+                commit_block_ms = float(max(0.0, (time.monotonic_ns() - commit_block_start_ns) / 1_000_000.0))
+                market_client.set_books(runtime.books)
+                previous_state = rollover_manager.commit(candidate_state)
+                resolved_markets[:] = discovered_markets
+                asset_meta.clear()
+                asset_meta.update(discovered_asset_meta)
+            except Exception as exc:
+                market_client.set_books(runtime.books)
+                abort_payload = {
+                    **intent_payload,
+                    "abort_reason": "RUNTIME_ROLLOVER_ERROR",
+                    "error": str(exc),
+                    **candidate_payload,
+                    "prepare_diag": prepare_diag,
+                    "confirm_diag": switch_result.confirm_diag,
+                    "switch_status": switch_result.status,
+                    "active_subscription_id_after": int(switch_result.active_subscription_id),
+                    "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
+                    "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
+                    "readiness_reason_codes": list(readiness_result.reason_codes),
+                }
+                _emit_rollover_abort(
+                    now_ms=now_ms,
+                    current_state=current_state,
+                    intent_payload=intent_payload,
+                    abort_reason="RUNTIME_ROLLOVER_ERROR",
+                    extra_payload=abort_payload,
+                    log_level="ERROR",
+                    log_code="rollover_abort_runtime_error",
+                )
+                await asyncio.sleep(check_period_secs)
+                continue
+
+            commit_payload = {
+                "market_slug_prev": previous_state.market_slug,
+                "market_slug_new": candidate_state.market_slug,
+                "condition_id_prev": previous_state.condition_id,
+                "condition_id_new": candidate_state.condition_id,
+                "token_ids_prev": list(previous_state.token_ids),
+                "token_ids_new": list(candidate_state.token_ids),
+                "market_end_ts_ms_prev": previous_state.market_end_ts_ms,
+                "market_end_ts_ms_new": candidate_state.market_end_ts_ms,
+                "market_end_source_prev": previous_state.market_end_source,
+                "market_end_source_new": candidate_state.market_end_source,
+                "selection_key_prev": previous_state.selection_key,
+                "selection_key_new": candidate_state.selection_key,
+                "as_of_ts_ms": now_ms,
+                "trigger_reasons": sorted(set(list(trigger_reasons) + ["DISCOVERY_NEW_MARKET_FOUND"])),
+                "rollover_count": int(rollover_manager.rollover_count),
+                "prepare_diag": prepare_diag,
+                "confirm_diag": switch_result.confirm_diag,
+                "switch_status": switch_result.status,
+                "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
+                "commit_block_ms": _maybe_float(commit_block_ms),
+                "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
+                "readiness_ok": bool(readiness_result.ready),
+                "readiness_reason_codes": list(readiness_result.reason_codes),
+                "readiness_details": readiness_result.details,
+                "commit_decision_reason": commit_decision.reason,
+                "liveness_ok": bool(liveness_ok),
+                "liveness_details": liveness_details,
+                "runtime_diag": runtime_diag,
+                "discovery_summary": discovery_summary,
+                "active_subscription_id_before": int(active_sub_before),
+                "active_subscription_id_after": int(switch_result.active_subscription_id),
+            }
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="rollover_confirm_wait_ms",
+                metric_value=_maybe_float(switch_result.confirm_wait_ms),
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                payload={"status": switch_result.status},
+            )
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="rollover_commit_block_ms",
+                metric_value=_maybe_float(commit_block_ms),
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                payload={"status": switch_result.status},
+            )
+            db.append_rollover_metric(
+                ts_ms=now_ms,
+                metric_name="rollover_unsubscribe_ms",
+                metric_value=_maybe_float(switch_result.unsubscribe_ms),
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                payload={"status": switch_result.status},
+            )
+            db.append_rollover_status(
+                ts_ms=now_ms,
+                event_type="COMMIT",
+                market_slug=candidate_state.market_slug,
+                selection_key=candidate_state.selection_key,
+                end_ts_source=candidate_state.market_end_source,
+                readiness_ok=bool(readiness_result.ready),
+                readiness_reason_codes=list(readiness_result.reason_codes),
+                confirm_wait_ms=_maybe_float(switch_result.confirm_wait_ms),
+                commit_block_ms=_maybe_float(commit_block_ms),
+                unsubscribe_ms=_maybe_float(switch_result.unsubscribe_ms),
+                unknown_msg_count=metrics.market_unknown_count(),
+                ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
+                payload=commit_payload,
+            )
+            quiet_until_ms = int(now_ms + max(0, rollover_quiet_window_ms))
+            async with runtime_lock:
+                runtime.activate_rollover_guard(
+                    token_ids=list(candidate_state.token_ids),
+                    quiet_until_ms=quiet_until_ms,
+                    require_readiness=True,
+                )
+            if commit_decision.force_observe_only:
+                db.append_log(
+                    now_ms,
+                    "INFO",
+                    "rollover_commit_observe_only",
+                    {
+                        "market_slug": candidate_state.market_slug,
+                        "quiet_until_ts_ms": quiet_until_ms,
+                        "reason": commit_decision.reason,
+                        "readiness_reason_codes": list(readiness_result.reason_codes),
+                    },
+                )
+            _write_rollover_event(
+                event_tape=event_tape,
+                event_type="ROLLOVER_COMMIT",
+                now_ms=now_ms,
+                market=candidate_state.market_slug,
+                payload=commit_payload,
+            )
+            _write_rollover_decision_boundary(
+                decision_tape=decision_tape,
+                time_mapper=time_mapper,
+                event_type="ROLLOVER_COMMIT",
+                now_ms=now_ms,
+                payload=commit_payload,
+            )
+            db.append_log(now_ms, "INFO", "rollover_commit", commit_payload)
+            await asyncio.sleep(check_period_secs)
 
     tasks.append(asyncio.create_task(_quote_loop()))
     tasks.append(asyncio.create_task(_stats_loop()))
+    tasks.append(asyncio.create_task(_rollover_loop()))
 
     def _shutdown(*_args) -> None:
         stop_event.set()
@@ -1590,6 +4124,28 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stats-interval-ms", type=int, default=None, help="Stats loop interval in ms")
     parser.add_argument("--dry-run", action="store_true", help="Dry-run live broker methods")
     return parser.parse_args()
+
+
+def _effective_auto_discover(cli_auto_discover: bool, settings_auto_discover: bool) -> bool:
+    return bool(cli_auto_discover or settings_auto_discover)
+
+
+def _handle_startup_guard_result(
+    db: SQLiteStore,
+    mode: str,
+    guard_ok: bool,
+    guard_payload: Dict[str, Any],
+) -> bool:
+    if guard_ok:
+        return False
+    db.append_alert(
+        _now_ms(),
+        "critical",
+        "FEED_NOT_WIRED",
+        f"startup_feed_guard_failed mode={mode}",
+        payload=guard_payload,
+    )
+    return mode in {"PAPER", "TRADE"}
 
 
 def main() -> None:

@@ -73,9 +73,48 @@ Commands executed:
 - `python3 -m unittest discover -s tests -p 'test_*.py'`
 
 Current result:
-- Full suite passing: `Ran 143 tests ... OK`
-- Known non-fatal warning still present from legacy async test path:
-  - `ResourceWarning: unclosed event loop`
+- Full suite passing: `Ran 194 tests ... OK`
+- Warning-strict suite passing: `PYTHONWARNINGS=error::ResourceWarning ... OK`
+
+## Reconciliation V2 Hardening (This Update)
+1. Startup quoting invariant is explicit and enforced.
+- Runtime now enforces single-level quoting mode by startup slot key `(token_id, side, quote_slot=0)`.
+- If duplicates violate invariant in PAPER/TRADE, startup fails fast with `RECON_STARTUP_INVARIANT_VIOLATION`.
+- Invariant checks are persisted via `recovery_events.recovery_action=STARTUP_QUOTING_INVARIANT_CHECK`.
+
+2. Freeze/unfreeze anti-flap semantics are explicit.
+- Freeze remains edge-triggered and emits `RECONCILIATION_FROZEN_EDGE` once per freeze episode.
+- Unfreeze now requires `reconcile_clean_unfreeze_cycles` consecutive clean cycles (default `3`) and emits `RECONCILIATION_UNFROZEN_EDGE`.
+- Safety cancel path remains active while frozen; cancel coverage assertion alerts as `RECON_FREEZE_CANCEL_ASSERT_FAIL` if incomplete.
+
+3. Deterministic mismatch comparisons moved to integer units.
+- Quantity and USDC mismatch comparisons now use canonical scales:
+  - `qty_scale` (default `1_000_000`)
+  - `usdc_scale` (default `1_000_000`)
+- Reconciliation payload records both float and integer-unit deltas/tolerances each cycle.
+
+4. Missed-fill correction is now idempotent across restart.
+- Added SQLite table `seen_fill_events(fill_event_key PRIMARY KEY, first_seen_ts_ms, source, payload_json)`.
+- Reconciliation inserts seen keys before applying corrections; duplicates are skipped and logged as `MISSED_FILL_DUPLICATE_SKIPPED`.
+
+5. Promotion checker diagnostics now fail closed with explicit missing verification surfaces.
+- `scripts/check_promotion_gates.py` now emits one `MISSING_TABLE` gate per missing table with impacted gate codes.
+- Added anti-flap reconciliation readiness gate `R_RECON_FROZEN_EDGE_ZERO`.
+
+## Operator Runbook: Freeze/Resume
+1. Freeze trigger indicators:
+- `alerts.code = RECONCILIATION_FROZEN_EDGE`
+- `reconciliation_stats.freeze_state = 1`
+
+2. Mismatch diagnosis order:
+- `payload.only_local` / `payload.only_broker`
+- `payload.inventory_delta_qty_units` and `payload.inventory_delta_usdc_units`
+- `consecutive_onchain_disagree_cycles` and `freeze_reason`
+
+3. Safe resume criteria:
+- `reconcile_clean_unfreeze_cycles` consecutive clean cycles (default `3`)
+- `alerts.code = RECONCILIATION_UNFROZEN_EDGE`
+- `reconciliation_stats.freeze_state` transitions back to `0`
 
 ## Remaining Logical / Production Gaps
 1. Live Polymarket API method contract verification.

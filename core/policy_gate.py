@@ -40,6 +40,7 @@ class PolicyContext:
     expected_slippage_bps: Optional[float]
     depth_at_qty: Optional[float]
     book_health_state: Optional[str] = None
+    reconciliation_mismatch_critical: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,11 +131,16 @@ def evaluate_policy(ctx: PolicyContext, thresholds: PolicyThresholds) -> PolicyV
     diagnostics["ack_p95_ms"] = ctx.ack_p95_ms
     diagnostics["ws_lag_ms"] = ctx.ws_lag_ms
 
+    if bool(ctx.reconciliation_mismatch_critical):
+        reasons.append("RECONCILIATION_MISMATCH_CRITICAL")
+        diagnostics["reconciliation_mismatch_critical"] = True
+
     if reasons:
         critical = any(
             code.startswith("A_")
             or code.startswith("B_")
             or code in {"D_HEDGE_TIMEOUT", "C_BOOK_DOWN"}
+            or code == "RECONCILIATION_MISMATCH_CRITICAL"
             for code in reasons
         )
         return PolicyVerdict(

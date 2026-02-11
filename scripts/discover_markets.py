@@ -9,6 +9,7 @@ from typing import List
 from config.settings import load_markets, validate_markets_config
 from core.market_discovery import (
     GAMMA_BASE_URL,
+    NoActiveMarketError,
     load_gamma_markets,
     resolve_markets,
     select_latest_by_prefix,
@@ -20,14 +21,33 @@ def main() -> None:
     if args.markets:
         markets_cfg = load_markets(args.markets)
         validate_markets_config(markets_cfg, auto_discover=True)
-        resolved, _ = asyncio.run(
-            resolve_markets(
-                markets=markets_cfg,
-                auto_discover=True,
-                cache_path=Path(args.cache_path),
-                gamma_base_url=args.gamma_url,
+        summary: dict = {}
+        try:
+            resolved, _ = asyncio.run(
+                resolve_markets(
+                    markets=markets_cfg,
+                    auto_discover=True,
+                    cache_path=Path(args.cache_path),
+                    gamma_base_url=args.gamma_url,
+                    discovery_summary=summary,
+                )
             )
-        )
+        except NoActiveMarketError as exc:
+            payload = {
+                "error": str(exc),
+                "diagnostics": exc.diagnostics,
+                "request_payload": exc.request_payload,
+                "discovery_summary": summary,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            raise
+        except ValueError as exc:
+            payload = {
+                "error": str(exc),
+                "discovery_summary": summary,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            raise
         output = json.dumps(
             [
                 {

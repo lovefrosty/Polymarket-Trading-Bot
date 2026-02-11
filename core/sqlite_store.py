@@ -35,8 +35,10 @@ _SCHEMA = [
         symbol TEXT NOT NULL,
         value REAL,
         ts_event_ms INTEGER,
+        pstar_recv_ts_ms INTEGER,
         confidence REAL NOT NULL,
         valid INTEGER NOT NULL,
+        invalid_reason TEXT,
         sources_used TEXT NOT NULL,
         diagnostics_json TEXT NOT NULL
     )
@@ -124,6 +126,18 @@ _SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS evidence_rows (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        entity TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        reason_code TEXT,
+        payload_json TEXT NOT NULL,
+        severity TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS inventory (
         ts_ms INTEGER NOT NULL,
         token_id TEXT NOT NULL,
@@ -152,7 +166,11 @@ _SCHEMA = [
         p95_ack_fill_ms REAL,
         ws_lag_ms REAL,
         p50_signal_age_ms REAL,
-        p95_signal_age_ms REAL
+        p95_signal_age_ms REAL,
+        p50_ws_lag_ms REAL,
+        p95_ws_lag_ms REAL,
+        p50_pstar_age_ms REAL,
+        p95_pstar_age_ms REAL
     )
     """,
     """
@@ -188,11 +206,23 @@ _SCHEMA = [
     CREATE TABLE IF NOT EXISTS reconciliation_stats (
         ts_ms INTEGER NOT NULL,
         event_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        mode TEXT,
         broker_open_orders INTEGER NOT NULL,
         broker_inventory REAL,
         onchain_inventory REAL,
+        derived_inventory REAL,
+        inventory_delta_qty REAL,
+        inventory_delta_usdc REAL,
+        tolerance_qty REAL,
+        tolerance_usdc REAL,
+        outside_tolerance INTEGER,
         mismatch_count INTEGER NOT NULL,
         unresolved_mismatch_count INTEGER NOT NULL,
+        consecutive_mismatch_cycles INTEGER,
+        consecutive_onchain_disagree_cycles INTEGER,
+        freeze_state INTEGER,
+        freeze_reason TEXT,
         payload_json TEXT NOT NULL
     )
     """,
@@ -200,11 +230,128 @@ _SCHEMA = [
     CREATE TABLE IF NOT EXISTS recovery_events (
         ts_ms INTEGER NOT NULL,
         event_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        mode TEXT,
         recovery_action TEXT NOT NULL,
         token_id TEXT,
         side TEXT,
         order_id TEXT,
+        price REAL,
+        size REAL,
         adopted_order_count INTEGER,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS open_orders_snapshot (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        mode TEXT,
+        token_id TEXT,
+        side TEXT,
+        order_id TEXT NOT NULL,
+        price REAL,
+        size REAL,
+        status TEXT,
+        client_order_id TEXT,
+        quote_group_id TEXT,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS seen_fill_events (
+        fill_event_key TEXT PRIMARY KEY,
+        first_seen_ts_ms INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS decision_ticks (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        decision_ts_ms INTEGER NOT NULL,
+        token_id TEXT NOT NULL,
+        decision_id TEXT,
+        book_asof_ts_ms INTEGER,
+        book_recv_ts_ms INTEGER,
+        book_seq INTEGER,
+        book_level_count INTEGER,
+        book_health_state TEXT,
+        pstar_value REAL,
+        pstar_asof_ts_ms INTEGER,
+        pstar_recv_ts_ms INTEGER,
+        pstar_sourceset TEXT,
+        pstar_confidence REAL,
+        pstar_valid INTEGER NOT NULL,
+        invalid_reason TEXT,
+        max_feature_ts_ms INTEGER NOT NULL,
+        ws_lag_ms REAL,
+        pstar_age_ms REAL,
+        signal_age_ms REAL,
+        allow_action INTEGER NOT NULL,
+        block_reason_codes TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS book_health_stats (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        token_id TEXT NOT NULL,
+        book_asof_ts_ms INTEGER,
+        book_recv_ts_ms INTEGER,
+        book_seq INTEGER,
+        book_level_count INTEGER,
+        book_health_state TEXT NOT NULL,
+        book_age_p50_ms REAL,
+        book_age_p95_ms REAL,
+        ws_recv_rate_msgs_min REAL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS rollover_metrics (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        metric_name TEXT NOT NULL,
+        metric_value REAL,
+        market_slug TEXT,
+        selection_key TEXT,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS rollover_status (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        market_slug TEXT,
+        selection_key TEXT,
+        end_ts_source TEXT,
+        readiness_ok INTEGER,
+        readiness_reason_codes TEXT,
+        confirm_wait_ms REAL,
+        commit_block_ms REAL,
+        unsubscribe_ms REAL,
+        unknown_msg_count INTEGER,
+        ignored_old_rate_per_min REAL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS discovery_requests (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        requested_symbol TEXT NOT NULL,
+        requested_horizon TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        now_ms INTEGER NOT NULL,
+        selected_slug TEXT,
+        end_ts_ms INTEGER,
+        end_ts_source TEXT,
+        reason_code TEXT,
+        counts_json TEXT NOT NULL,
         payload_json TEXT NOT NULL
     )
     """,
@@ -234,6 +381,7 @@ class SQLiteStore:
         sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
         with self._lock:
             self._cx.execute(sql, values)
+            self._insert_evidence_from_row_locked(table, row)
             self._cx.commit()
 
     def insert_many(self, table: str, rows: Iterable[Dict[str, Any]]) -> None:
@@ -247,12 +395,80 @@ class SQLiteStore:
         values = [[_coerce_sql(row.get(key)) for key in keys] for row in rows_list]
         with self._lock:
             self._cx.executemany(sql, values)
+            for row in rows_list:
+                self._insert_evidence_from_row_locked(table, row)
             self._cx.commit()
+
+    def _insert_evidence_from_row_locked(self, table: str, row: Dict[str, Any]) -> None:
+        if table == "evidence_rows":
+            return
+        if table not in {"decisions", "orders", "fills"}:
+            return
+
+        ts_ms = _maybe_int(row.get("ts_ms"))
+        if ts_ms is None:
+            return
+
+        severity = "info"
+        reason_code = None
+        entity = ""
+        event_type = table
+        payload: Dict[str, Any] = {}
+
+        if table == "decisions":
+            event_type = str(row.get("action") or "decision")
+            entity = ":".join(
+                [
+                    str(row.get("market") or ""),
+                    str(row.get("token_id") or ""),
+                    str(row.get("decision_id") or ""),
+                ]
+            )
+            reason_code = str(row.get("reason_codes") or "") or None
+            if str(event_type).upper() == "FREEZE":
+                severity = "error"
+            payload = {"decision_id": row.get("decision_id"), "p_hat": row.get("p_hat")}
+        elif table == "orders":
+            event_type = str(row.get("status") or "order")
+            entity = ":".join([str(row.get("token_id") or ""), str(row.get("order_id") or "")])
+            reason_code = str(row.get("reason") or "") or None
+            status = str(row.get("status") or "").lower()
+            if "reject" in status:
+                severity = "error"
+            elif "cancel" in status:
+                severity = "warn"
+            payload = {"event_id": row.get("event_id"), "fsm_state": row.get("fsm_state")}
+        elif table == "fills":
+            event_type = "fill"
+            entity = ":".join([str(row.get("token_id") or ""), str(row.get("order_id") or "")])
+            payload = {"event_id": row.get("event_id"), "fill_price": row.get("fill_price"), "fill_qty": row.get("fill_qty")}
+
+        self._cx.execute(
+            """
+            INSERT INTO evidence_rows (ts_ms, event_id, source, entity, event_type, reason_code, payload_json, severity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(ts_ms),
+                uuid4_hex(),
+                "runtime",
+                entity,
+                event_type,
+                reason_code,
+                _as_json(payload),
+                severity,
+            ),
+        )
 
     def query(self, sql: str, params: Sequence[Any] | None = None) -> List[Tuple[Any, ...]]:
         with self._lock:
             cur = self._cx.execute(sql, params or [])
             return cur.fetchall()
+
+    def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
+        with self._lock:
+            self._cx.execute(sql, params or [])
+            self._cx.commit()
 
     def export_table_jsonl(self, table: str, out_path: str | Path, order_by: str = "ts_ms") -> None:
         out = Path(out_path)
@@ -301,6 +517,15 @@ class SQLiteStore:
                 "payload_json": _as_json(payload or {}),
             },
         )
+        self.append_evidence_row(
+            ts_ms=int(ts_ms),
+            source="runtime",
+            entity=str(level).upper(),
+            event_type=str(msg),
+            reason_code=None,
+            payload=payload or {},
+            severity="error" if str(level).upper() == "ERROR" else ("warn" if str(level).upper() == "WARN" else "info"),
+        )
 
     def append_alert(
         self,
@@ -320,6 +545,159 @@ class SQLiteStore:
                 "payload_json": _as_json(payload or {}),
             },
         )
+        self.append_evidence_row(
+            ts_ms=int(ts_ms),
+            source="runtime",
+            entity=str(code),
+            event_type=str(code),
+            reason_code=str(code),
+            payload=payload or {},
+            severity=str(severity).lower(),
+        )
+
+    def append_evidence_row(
+        self,
+        ts_ms: int,
+        source: str,
+        entity: str,
+        event_type: str,
+        reason_code: Optional[str],
+        payload: Optional[Dict[str, Any]] = None,
+        severity: str = "info",
+    ) -> None:
+        self.insert(
+            "evidence_rows",
+            {
+                "ts_ms": int(ts_ms),
+                "event_id": uuid4_hex(),
+                "source": str(source),
+                "entity": str(entity),
+                "event_type": str(event_type),
+                "reason_code": str(reason_code) if reason_code is not None else None,
+                "payload_json": _as_json(payload or {}),
+                "severity": str(severity).lower(),
+            },
+        )
+
+    def append_rollover_metric(
+        self,
+        ts_ms: int,
+        metric_name: str,
+        metric_value: Optional[float],
+        market_slug: Optional[str] = None,
+        selection_key: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.insert(
+            "rollover_metrics",
+            {
+                "ts_ms": int(ts_ms),
+                "event_id": uuid4_hex(),
+                "metric_name": str(metric_name),
+                "metric_value": _maybe_float(metric_value),
+                "market_slug": str(market_slug) if market_slug is not None else None,
+                "selection_key": str(selection_key) if selection_key is not None else None,
+                "payload_json": _as_json(payload or {}),
+            },
+        )
+
+    def append_rollover_status(
+        self,
+        ts_ms: int,
+        event_type: str,
+        market_slug: Optional[str],
+        selection_key: Optional[str],
+        end_ts_source: Optional[str],
+        readiness_ok: Optional[bool],
+        readiness_reason_codes: Optional[Sequence[str]],
+        confirm_wait_ms: Optional[float],
+        commit_block_ms: Optional[float],
+        unsubscribe_ms: Optional[float],
+        unknown_msg_count: Optional[int],
+        ignored_old_rate_per_min: Optional[float],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.insert(
+            "rollover_status",
+            {
+                "ts_ms": int(ts_ms),
+                "event_id": uuid4_hex(),
+                "event_type": str(event_type),
+                "market_slug": str(market_slug) if market_slug is not None else None,
+                "selection_key": str(selection_key) if selection_key is not None else None,
+                "end_ts_source": str(end_ts_source) if end_ts_source is not None else None,
+                "readiness_ok": None if readiness_ok is None else (1 if readiness_ok else 0),
+                "readiness_reason_codes": ",".join(sorted(set(readiness_reason_codes or []))),
+                "confirm_wait_ms": _maybe_float(confirm_wait_ms),
+                "commit_block_ms": _maybe_float(commit_block_ms),
+                "unsubscribe_ms": _maybe_float(unsubscribe_ms),
+                "unknown_msg_count": None if unknown_msg_count is None else int(unknown_msg_count),
+                "ignored_old_rate_per_min": _maybe_float(ignored_old_rate_per_min),
+                "payload_json": _as_json(payload or {}),
+            },
+        )
+
+    def append_discovery_request(
+        self,
+        ts_ms: int,
+        requested_symbol: str,
+        requested_horizon: str,
+        mode: str,
+        now_ms: int,
+        selected_slug: Optional[str],
+        end_ts_ms: Optional[int],
+        end_ts_source: Optional[str],
+        reason_code: Optional[str],
+        counts: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.insert(
+            "discovery_requests",
+            {
+                "ts_ms": int(ts_ms),
+                "event_id": uuid4_hex(),
+                "requested_symbol": str(requested_symbol),
+                "requested_horizon": str(requested_horizon),
+                "mode": str(mode),
+                "now_ms": int(now_ms),
+                "selected_slug": str(selected_slug) if selected_slug is not None else None,
+                "end_ts_ms": _maybe_int(end_ts_ms),
+                "end_ts_source": str(end_ts_source) if end_ts_source is not None else None,
+                "reason_code": str(reason_code) if reason_code is not None else None,
+                "counts_json": _as_json(counts or {}),
+                "payload_json": _as_json(payload or {}),
+            },
+        )
+
+    def mark_fill_event_seen(
+        self,
+        fill_event_key: str,
+        first_seen_ts_ms: int,
+        source: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        with self._lock:
+            try:
+                self._cx.execute(
+                    """
+                    INSERT INTO seen_fill_events (
+                        fill_event_key,
+                        first_seen_ts_ms,
+                        source,
+                        payload_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        str(fill_event_key),
+                        int(first_seen_ts_ms),
+                        str(source),
+                        _as_json(payload or {}),
+                    ),
+                )
+                self._cx.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -337,7 +715,68 @@ class SQLiteStore:
                 {
                     "p50_signal_age_ms": "REAL",
                     "p95_signal_age_ms": "REAL",
+                    "p50_ws_lag_ms": "REAL",
+                    "p95_ws_lag_ms": "REAL",
+                    "p50_pstar_age_ms": "REAL",
+                    "p95_pstar_age_ms": "REAL",
                 },
+            )
+            self._ensure_columns(
+                "pstar",
+                {
+                    "pstar_recv_ts_ms": "INTEGER",
+                    "invalid_reason": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                "reconciliation_stats",
+                {
+                    "run_id": "TEXT",
+                    "mode": "TEXT",
+                    "derived_inventory": "REAL",
+                    "inventory_delta_qty": "REAL",
+                    "inventory_delta_usdc": "REAL",
+                    "tolerance_qty": "REAL",
+                    "tolerance_usdc": "REAL",
+                    "outside_tolerance": "INTEGER",
+                    "consecutive_mismatch_cycles": "INTEGER",
+                    "consecutive_onchain_disagree_cycles": "INTEGER",
+                    "freeze_state": "INTEGER",
+                    "freeze_reason": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                "recovery_events",
+                {
+                    "run_id": "TEXT",
+                    "mode": "TEXT",
+                    "price": "REAL",
+                    "size": "REAL",
+                },
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_decision_ticks_ts ON decision_ticks(ts_ms)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_book_health_stats_ts_token ON book_health_stats(ts_ms, token_id)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_open_orders_snapshot_ts_token_side ON open_orders_snapshot(ts_ms, token_id, side)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_seen_fill_events_first_seen ON seen_fill_events(first_seen_ts_ms)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rollover_metrics_name_ts ON rollover_metrics(metric_name, ts_ms)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rollover_status_ts ON rollover_status(ts_ms)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_discovery_requests_ts ON discovery_requests(ts_ms)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evidence_rows_ts ON evidence_rows(ts_ms)"
             )
             self._cx.commit()
 
@@ -361,3 +800,27 @@ def _coerce_sql(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple, set)):
         return json.dumps(value, separators=(",", ":"), ensure_ascii=True, sort_keys=True)
     return value
+
+
+def _maybe_float(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_int(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def uuid4_hex() -> str:
+    import uuid
+
+    return uuid.uuid4().hex

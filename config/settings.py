@@ -8,6 +8,13 @@ from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
+class AutoDiscoverSpec:
+    symbol: str
+    horizon: str
+    mode: str
+
+
+@dataclass(frozen=True)
 class MarketConfig:
     name: str
     condition_id: Optional[str]
@@ -21,6 +28,7 @@ class MarketConfig:
     discovery_backend: Optional[str] = None
     selection_regex: Optional[str] = None
     allow_unknown_symbol: bool = False
+    auto_discover: Optional[AutoDiscoverSpec] = None
 
 
 @dataclass(frozen=True)
@@ -241,6 +249,19 @@ def _load_yaml_or_json(path: Path) -> Dict:
         ) from exc
 
 
+def _parse_auto_discover_spec(value: object) -> Optional[AutoDiscoverSpec]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("market:auto_discover must be an object when provided")
+    symbol = str(value.get("symbol", "")).strip().upper()
+    horizon = str(value.get("horizon", "")).strip().lower()
+    mode = str(value.get("mode", "")).strip().lower()
+    if not symbol or not horizon or not mode:
+        raise ValueError("market:auto_discover requires symbol, horizon, and mode")
+    return AutoDiscoverSpec(symbol=symbol, horizon=horizon, mode=mode)
+
+
 def load_markets(path: str) -> List[MarketConfig]:
     data = _load_yaml_or_json(Path(path))
     markets_raw = data.get("markets", []) if isinstance(data, dict) else []
@@ -260,6 +281,7 @@ def load_markets(path: str) -> List[MarketConfig]:
                 discovery_backend=entry.get("discovery_backend"),
                 selection_regex=entry.get("selection_regex"),
                 allow_unknown_symbol=bool(entry.get("allow_unknown_symbol", False)),
+                auto_discover=_parse_auto_discover_spec(entry.get("auto_discover")),
             )
         )
     return markets
@@ -278,12 +300,29 @@ def validate_markets_config(markets: List[MarketConfig], auto_discover: bool) ->
         has_tokens = any(token.strip() != "" for token in token_ids)
         has_condition = bool(market.condition_id)
         has_slug_prefix = bool(market.slug_prefix)
+        auto_discover_spec = market.auto_discover
 
         if has_empty_tokens:
             raise ValueError(
                 f"market:{name} token_ids contains empty strings. "
                 "Fix token_ids (remove blanks) or rely on slug_prefix with auto-discovery."
             )
+
+        if auto_discover_spec is not None:
+            symbol = auto_discover_spec.symbol.strip().upper()
+            horizon = auto_discover_spec.horizon.strip().lower()
+            mode = auto_discover_spec.mode.strip().lower()
+            if (symbol, horizon, mode) != ("BTC", "15m", "latest_active"):
+                raise ValueError(
+                    f"market:{name} auto_discover unsupported tuple: "
+                    f"symbol={symbol}, horizon={horizon}, mode={mode}. "
+                    "Supported: BTC/15m/latest_active."
+                )
+            if market.reference_symbol and market.reference_symbol.strip().upper() != symbol:
+                raise ValueError(
+                    f"market:{name} auto_discover symbol={symbol} "
+                    f"must match reference_symbol={market.reference_symbol.strip().upper()}."
+                )
 
         if not has_condition and not auto_discover:
             raise ValueError(

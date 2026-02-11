@@ -130,44 +130,51 @@ class ReplayRunner:
         )
         self.market_client.decision_engine = self._decision_engine
 
-        loop = _ensure_loop()
+        loop, loop_created = _ensure_loop()
         last_mono_ns = mono_ns
-        for record in events:
-            mono_ns = int(record.get("t_recv_mono_ns", 0))
-            wall_iso = record.get("t_recv_wall_iso") or ""
-            wall_ms = _parse_wall_ms(wall_iso)
-            channel = record.get("channel")
-            if channel == "reference":
-                if self._reference_aggregator is not None:
-                    quote = parse_reference_event(
-                        record.get("raw"),
-                        mono_ns,
-                        wall_iso,
-                        record.get("t_recv_wall_ms"),
-                    )
-                    if quote is not None:
-                        self._reference_aggregator.ingest(quote)
-                        if self._decision_engine is not None:
-                            self._decision_engine.on_reference_event(quote)
-                if self._reference_store is not None:
-                    self._reference_store.ingest_record(record)
-                continue
-            if channel == "onchain":
-                onchain_state.ingest_record(record)
-                continue
-            if channel != "market":
-                continue
-            if self._decision_engine is not None:
-                self._decision_engine.emit_heartbeats_until(mono_ns)
-            raw = record.get("raw")
-            if raw is None:
-                continue
-            raw_str = json.dumps(raw, separators=(",", ":"), ensure_ascii=True)
-            loop.run_until_complete(self.market_client._handle_message(raw_str, mono_ns, wall_ms, wall_iso))
-            last_mono_ns = mono_ns
+        try:
+            for record in events:
+                mono_ns = int(record.get("t_recv_mono_ns", 0))
+                wall_iso = record.get("t_recv_wall_iso") or ""
+                wall_ms = _parse_wall_ms(wall_iso)
+                channel = record.get("channel")
+                if channel == "reference":
+                    if self._reference_aggregator is not None:
+                        quote = parse_reference_event(
+                            record.get("raw"),
+                            mono_ns,
+                            wall_iso,
+                            record.get("t_recv_wall_ms"),
+                        )
+                        if quote is not None:
+                            self._reference_aggregator.ingest(quote)
+                            if self._decision_engine is not None:
+                                self._decision_engine.on_reference_event(quote)
+                    if self._reference_store is not None:
+                        self._reference_store.ingest_record(record)
+                    continue
+                if channel == "onchain":
+                    onchain_state.ingest_record(record)
+                    continue
+                if channel != "market":
+                    continue
+                if self._decision_engine is not None:
+                    self._decision_engine.emit_heartbeats_until(mono_ns)
+                raw = record.get("raw")
+                if raw is None:
+                    continue
+                raw_str = json.dumps(raw, separators=(",", ":"), ensure_ascii=True)
+                loop.run_until_complete(self.market_client._handle_message(raw_str, mono_ns, wall_ms, wall_iso))
+                last_mono_ns = mono_ns
 
-        if self._decision_engine is not None:
-            self._decision_engine.emit_heartbeats_until(last_mono_ns + 1_000_000_000)
+            if self._decision_engine is not None:
+                self._decision_engine.emit_heartbeats_until(last_mono_ns + 1_000_000_000)
+        finally:
+            if loop_created:
+                import asyncio
+
+                asyncio.set_event_loop(None)
+                loop.close()
 
     def _load_events(self, event_files: Iterable[str]) -> List[Dict[str, object]]:
         records: List[Tuple[int, int, Dict[str, object]]] = []
@@ -245,8 +252,8 @@ def _ensure_loop():
 
     try:
         loop = asyncio.get_running_loop()
-        return loop
+        return loop, False
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return loop
+        return loop, True

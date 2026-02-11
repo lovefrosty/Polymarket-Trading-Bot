@@ -111,6 +111,13 @@ def generate_report(
         "overall": overall,
         "folds": folds,
         "stability": _stability_stats(folds),
+        "reliability": _reliability_diagnostics(
+            trades=trades,
+            fee_bps_shift=fee_bps_shift,
+            slippage_bps_shift=slippage_bps_shift,
+            latency_threshold_ms=latency_threshold_ms,
+            latency_shift_ms=latency_shift_ms,
+        ),
     }
 
 
@@ -347,10 +354,12 @@ def _compute_metrics(
     losses = 0
     gross_profit = 0.0
     gross_loss = 0.0
+    latency_blocked = 0
 
     for trade in trades:
         if trade.latency_ms is not None:
             if trade.latency_ms + latency_shift_ms > latency_threshold_ms:
+                latency_blocked += 1
                 continue
         pnl = _trade_pnl(trade, fee_bps_shift, slippage_bps_shift)
         pnl_series.append((trade.ts_ms, pnl))
@@ -382,6 +391,7 @@ def _compute_metrics(
         "max_drawdown": drawdown,
         "profit_factor": profit_factor,
         "cumulative_pnl_end": cumulative[-1] if cumulative else 0.0,
+        "latency_blocked": latency_blocked,
         "by_symbol": {symbol: _summary_for_trades(rows, fee_bps_shift, slippage_bps_shift, latency_threshold_ms, latency_shift_ms) for symbol, rows in per_symbol.items()},
         "by_outcome": {outcome: _summary_for_trades(rows, fee_bps_shift, slippage_bps_shift, latency_threshold_ms, latency_shift_ms) for outcome, rows in per_outcome.items()},
     }
@@ -476,6 +486,70 @@ def _stability_stats(folds: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _reliability_diagnostics(
+    trades: List[Trade],
+    fee_bps_shift: float,
+    slippage_bps_shift: float,
+    latency_threshold_ms: int,
+    latency_shift_ms: int,
+) -> Dict[str, Any]:
+    baseline = _compute_metrics(
+        trades,
+        fee_bps_shift=fee_bps_shift,
+        slippage_bps_shift=slippage_bps_shift,
+        latency_threshold_ms=latency_threshold_ms,
+        latency_shift_ms=latency_shift_ms,
+    )
+    scenarios = {
+        "fee_plus_5bps": _compute_metrics(
+            trades,
+            fee_bps_shift=fee_bps_shift + 5.0,
+            slippage_bps_shift=slippage_bps_shift,
+            latency_threshold_ms=latency_threshold_ms,
+            latency_shift_ms=latency_shift_ms,
+        ),
+        "slippage_plus_5bps": _compute_metrics(
+            trades,
+            fee_bps_shift=fee_bps_shift,
+            slippage_bps_shift=slippage_bps_shift + 5.0,
+            latency_threshold_ms=latency_threshold_ms,
+            latency_shift_ms=latency_shift_ms,
+        ),
+        "latency_plus_250ms": _compute_metrics(
+            trades,
+            fee_bps_shift=fee_bps_shift,
+            slippage_bps_shift=slippage_bps_shift,
+            latency_threshold_ms=latency_threshold_ms,
+            latency_shift_ms=latency_shift_ms + 250,
+        ),
+    }
+    baseline_pnl = float(baseline.get("pnl_total") or 0.0)
+    sensitivity: Dict[str, Any] = {}
+    worst_source = None
+    worst_pnl = baseline_pnl
+    for name, metrics in scenarios.items():
+        pnl = float(metrics.get("pnl_total") or 0.0)
+        delta = pnl - baseline_pnl
+        sensitivity[name] = {
+            "pnl_total": pnl,
+            "pnl_delta_vs_baseline": delta,
+            "win_rate": metrics.get("win_rate"),
+            "latency_blocked": metrics.get("latency_blocked"),
+        }
+        if pnl < worst_pnl:
+            worst_pnl = pnl
+            worst_source = name
+    return {
+        "baseline": {
+            "pnl_total": baseline_pnl,
+            "win_rate": baseline.get("win_rate"),
+            "latency_blocked": baseline.get("latency_blocked"),
+        },
+        "sensitivity": sensitivity,
+        "top_degradation_source": worst_source or "none",
+    }
+
+
 def _mean(values: List[float]) -> float:
     if not values:
         return 0.0
@@ -530,6 +604,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             ]
         )
     stability = report.get("stability", {})
+    reliability = report.get("reliability", {})
     lines.extend(
         [
             "",
@@ -540,8 +615,14 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             f"- PnL std: {stability.get('pnl_std')}",
             f"- Win rate mean: {stability.get('win_rate_mean')}",
             f"- Win rate std: {stability.get('win_rate_std')}",
+            "",
+            "## Reliability",
+            "",
+            f"- Top degradation source: {reliability.get('top_degradation_source')}",
         ]
     )
+    for name, row in (reliability.get("sensitivity") or {}).items():
+        lines.append(f"- {name}: pnl_delta={row.get('pnl_delta_vs_baseline')} latency_blocked={row.get('latency_blocked')}")
     return "\n".join(lines) + "\n"
 
 

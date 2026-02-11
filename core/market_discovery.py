@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -9,7 +10,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
-from config.settings import MarketConfig
+from config.settings import AutoDiscoverSpec, MarketConfig
 
 
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
@@ -31,6 +32,8 @@ class ResolvedMarket:
     min_size: float
     min_price: float
     max_price: float
+    end_ts_ms: Optional[int] = None
+    end_ts_source: Optional[str] = None
 
 
 PathLike = Union[str, Path]
@@ -60,11 +63,11 @@ async def resolve_markets(
 
     needs_data = any(_needs_discovery(market) for market in markets)
     needs_slug = markets_data is None and any(
-        _needs_discovery(market) and market.reference_symbol.upper() in CRYPTO_SYMBOLS
+        _needs_discovery(market) and _discovery_symbol_for_market(market) in CRYPTO_SYMBOLS
         for market in markets
     )
     needs_legacy = any(
-        _needs_discovery(market) and market.reference_symbol.upper() not in CRYPTO_SYMBOLS
+        _needs_discovery(market) and _discovery_symbol_for_market(market) not in CRYPTO_SYMBOLS
         for market in markets
     )
     if needs_data and auto_discover and needs_legacy:
@@ -75,7 +78,13 @@ async def resolve_markets(
 
     slug_results: Dict[str, List[Dict[str, Any]]] = {}
     if needs_data and auto_discover and needs_slug:
-        symbols = sorted({market.reference_symbol for market in markets if _needs_discovery(market)})
+        symbols = sorted(
+            {
+                symbol
+                for symbol in (_discovery_symbol_for_market(market) for market in markets if _needs_discovery(market))
+                if symbol in CRYPTO_SYMBOLS
+            }
+        )
         slug_cache_path = None
         if cache_path:
             slug_cache_path = Path(cache_path).with_name("cache_gamma_slug_markets.json")
@@ -90,33 +99,89 @@ async def resolve_markets(
         )
         if discovery_summary is not None:
             discovery_summary.update(summary)
+        # If slug-window discovery returns no candidates, fallback to events endpoint.
+        if markets_data is None and not any(slug_results.get(symbol) for symbol in symbols):
+            markets_data = await asyncio.to_thread(load_gamma_markets, gamma_base_url, cache_path)
+            if discovery_summary is not None:
+                discovery_summary["slug_discovery_empty_fallback"] = "events"
+                discovery_summary["events_fallback_market_count"] = len(markets_data)
 
     for market in markets:
+        mode_spec = market.auto_discover
+        discovery_symbol = _discovery_symbol_for_market(market)
         if _needs_discovery(market):
             if not auto_discover:
                 raise ValueError(_discovery_required_message(market))
-            if markets_data is not None and market.reference_symbol not in slug_results:
-                if market.slug_prefix:
-                    selected = select_latest_by_prefix(markets_data, market.slug_prefix, now_ts=now_ts)
-                else:
-                    selected = select_latest_by_fee_rate(
-                        markets_data,
-                        reference_symbol=market.reference_symbol,
-                        fee_rate_fetcher=fee_rate_fetcher,
-                        now_ts=now_ts,
+            if _is_latest_active_btc_15m_mode(mode_spec):
+                now_ms = _resolve_now_ms(now_ts)
+                candidates = _collect_mode_candidates(
+                    slug_results=slug_results,
+                    markets_data=markets_data,
+                    requested_symbol=discovery_symbol,
+                )
+                try:
+                    selected, request_payload = _resolve_latest_active_btc_15m_selection(
+                        market=market,
+                        candidates=candidates,
+                        now_ms=now_ms,
                     )
+                except NoActiveMarketError as exc:
+                    _append_discovery_request_summary(discovery_summary, exc.request_payload)
+                    raise
+                _append_discovery_request_summary(discovery_summary, request_payload)
             else:
-                discovered = slug_results.get(market.reference_symbol) or []
-                selected = discovered[-1] if discovered else None
+                if markets_data is not None and discovery_symbol not in slug_results:
+                    if market.slug_prefix:
+                        selected = select_latest_by_prefix(markets_data, market.slug_prefix, now_ts=now_ts)
+                    else:
+                        selected = select_latest_by_fee_rate(
+                            markets_data,
+                            reference_symbol=discovery_symbol,
+                            fee_rate_fetcher=fee_rate_fetcher,
+                            now_ts=now_ts,
+                        )
+                else:
+                    discovered = slug_results.get(discovery_symbol) or []
+                    selected = discovered[-1] if discovered else None
+                    if selected is None and markets_data is not None:
+                        fallback_prefix = market.slug_prefix or f"{discovery_symbol.lower()}-updown-15m-"
+                        selected = select_latest_by_prefix(markets_data, fallback_prefix, now_ts=now_ts)
+                        if selected is not None and discovery_summary is not None:
+                            _append_discovery_request_summary(
+                                discovery_summary,
+                                {
+                                    "event": "DISCOVERY_REQUEST",
+                                    "requested_symbol": discovery_symbol,
+                                    "requested_horizon": "15m",
+                                    "requested_mode": "prefix_fallback",
+                                    "fallback_prefix": fallback_prefix,
+                                    "selected_slug": _coerce_str(selected.get("slug")),
+                                    "selected_condition_id": _coerce_str(
+                                        selected.get("conditionId") or selected.get("condition_id")
+                                    ),
+                                },
+                            )
             if selected is None:
                 if market.slug_prefix and markets_data is not None:
                     raise ValueError(f"no_markets_found_for_slug_prefix:{market.slug_prefix}")
-                raise ValueError(f"no_markets_found_for_symbol:{market.reference_symbol}")
+                slug_hits = len(slug_results.get(discovery_symbol) or [])
+                events_hits = 0
+                if markets_data is not None:
+                    events_hits = sum(
+                        1 for item in markets_data if isinstance(item, dict) and _matches_mode_symbol(item, discovery_symbol)
+                    )
+                raise ValueError(
+                    f"no_markets_found_for_symbol:{market.reference_symbol}|slug_hits={slug_hits}|events_hits={events_hits}"
+                )
             condition_id = _coerce_str(selected.get("conditionId") or selected.get("condition_id"))
             token_ids = _coerce_list(selected.get("clobTokenIds"))
             outcomes = _coerce_list(selected.get("outcomes"))
             slug = _coerce_str(selected.get("slug"))
             question = _coerce_str(selected.get("question"))
+            end_ts_ms, end_ts_source = _market_end_ts_ms_and_source(selected, slug)
+            active_flag = _coerce_bool(selected.get("active"))
+            closed_flag = _coerce_bool(selected.get("closed"))
+            accepting_orders_flag = _coerce_bool(selected.get("accepting_orders") or selected.get("acceptingOrders"))
             if not condition_id:
                 raise ValueError(f"missing_condition_id_for_slug_prefix:{market.slug_prefix}")
             if not token_ids:
@@ -131,9 +196,24 @@ async def resolve_markets(
             outcomes = []
             slug = None
             question = None
+            end_ts_ms, end_ts_source = _market_end_ts_ms_and_source({}, slug)
+            active_flag = None
+            closed_flag = None
+            accepting_orders_flag = None
 
         outcome_by_token = dict(zip(token_ids, outcomes)) if outcomes else {}
         token_by_outcome = {outcome: token for token, outcome in outcome_by_token.items()}
+        selection_key = deterministic_market_selection_key_str(
+            {
+                "slug": slug,
+                "conditionId": condition_id,
+                "clobTokenIds": token_ids,
+                "endDate": int(end_ts_ms / 1000) if end_ts_ms is not None else None,
+                "active": active_flag,
+                "closed": closed_flag,
+                "accepting_orders": accepting_orders_flag,
+            }
+        )
         entry = ResolvedMarket(
             name=market.name,
             reference_symbol=market.reference_symbol,
@@ -149,6 +229,8 @@ async def resolve_markets(
             min_size=market.min_size,
             min_price=market.min_price,
             max_price=market.max_price,
+            end_ts_ms=end_ts_ms,
+            end_ts_source=end_ts_source,
         )
         resolved.append(entry)
         meta = {
@@ -161,6 +243,12 @@ async def resolve_markets(
             "question": entry.question,
             "reference_symbol": entry.reference_symbol,
             "name": entry.name,
+            "end_ts_ms": entry.end_ts_ms,
+            "end_ts_source": entry.end_ts_source,
+            "selection_key": selection_key,
+            "active": active_flag,
+            "closed": closed_flag,
+            "accepting_orders": accepting_orders_flag,
         }
         for token_id in entry.token_ids:
             token_meta = dict(meta)
@@ -227,9 +315,25 @@ def load_gamma_markets(
 
 
 WINDOW_SEC_15M = 900
+WINDOW_MS_15M = WINDOW_SEC_15M * 1000
 DEFAULT_BACK_WINDOWS = 2
 DEFAULT_FORWARD_WINDOWS = 16
 CRYPTO_SYMBOLS = {"BTC", "ETH", "SOL", "XRP"}
+
+
+class NoActiveMarketError(ValueError):
+    def __init__(
+        self,
+        market_key: str,
+        now_ms: int,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        request_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.market_key = str(market_key)
+        self.now_ms = int(now_ms)
+        self.diagnostics = dict(diagnostics or {})
+        self.request_payload = dict(request_payload or {})
+        super().__init__(f"no_active_market:{self.market_key}")
 
 
 async def discover_15m_crypto_by_slug(
@@ -332,7 +436,7 @@ async def discover_15m_crypto_by_slug(
         if candidate is None:
             _count_reject(rejected_counts, "missing_clob_candidate")
         existing = by_condition.get(condition_id)
-        if existing is None or _market_sort_key(market) > _market_sort_key(existing):
+        if existing is None or deterministic_market_selection_key(market) > deterministic_market_selection_key(existing):
             market["clob_candidate"] = candidate is not None
             by_condition[condition_id] = market
 
@@ -362,7 +466,7 @@ async def discover_15m_crypto_by_slug(
     ]
 
     for symbol, markets_list in selected_by_symbol.items():
-        markets_list.sort(key=lambda item: _market_sort_key(item))
+        markets_list.sort(key=lambda item: deterministic_market_selection_key(item))
     return selected_by_symbol
 
 
@@ -512,7 +616,7 @@ def select_latest_by_prefix(
     prefix: str,
     now_ts: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    candidates: List[Tuple[int, Dict[str, Any]]] = []
+    candidates: List[Tuple[Tuple[int, int, str, str, str], Dict[str, Any]]] = []
     if now_ts is None:
         now_ts = int(time.time())
     for market in markets:
@@ -524,9 +628,7 @@ def select_latest_by_prefix(
         token_ids = _coerce_list(market.get("clobTokenIds"))
         if not token_ids:
             continue
-        slug_ts = _parse_slug_ts(slug)
-        fallback_ts = _parse_market_timestamp(market)
-        sort_key = slug_ts or fallback_ts or 0
+        sort_key = deterministic_market_selection_key(market)
         candidates.append((sort_key, market))
     if not candidates:
         return None
@@ -544,7 +646,7 @@ def select_latest_by_fee_rate(
         fee_rate_fetcher = _fetch_fee_rate_bps
     if now_ts is None:
         now_ts = int(time.time())
-    candidates: List[Tuple[Tuple[int, str], Dict[str, Any]]] = []
+    candidates: List[Tuple[Tuple[int, int, str, str, str], Dict[str, Any]]] = []
     for market in _sorted_markets(markets):
         if not _is_active_event(market, now_ts):
             continue
@@ -563,7 +665,7 @@ def select_latest_by_fee_rate(
                 _log_fee_rate_hit(market, token_id, fee_rate_bps)
         if not fee_rates:
             continue
-        sort_key = _market_sort_key(market)
+        sort_key = deterministic_market_selection_key(market)
         candidates.append((sort_key, market))
     if not candidates:
         return None
@@ -627,17 +729,319 @@ def _matches_reference_symbol(market: Dict[str, Any], symbol: str) -> bool:
 def _sorted_markets(markets: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         list(markets),
-        key=lambda item: _market_sort_key(item),
+        key=lambda item: deterministic_market_selection_key(item),
     )
 
 
 def _market_sort_key(market: Dict[str, Any]) -> Tuple[int, str]:
+    # Backward-compatible alias for legacy callers.
+    key = deterministic_market_selection_key(market)
+    return key[0], key[3]
+
+
+def deterministic_market_selection_key(market: Dict[str, Any]) -> Tuple[int, int, str, str, str]:
     slug = _coerce_str(market.get("slug")) or ""
     condition_id = _coerce_str(market.get("conditionId") or market.get("condition_id")) or ""
     end_ts = _parse_event_end_ts(market) or 0
     slug_ts = _parse_slug_ts(slug) or 0
     created_ts = _parse_market_timestamp(market) or 0
-    return (max(end_ts, slug_ts, created_ts), condition_id)
+    token_ids_hash = _token_ids_hash(_coerce_list(market.get("clobTokenIds")))
+    tradability_score = _tradability_score(market)
+    return (max(end_ts, slug_ts, created_ts), tradability_score, slug, condition_id, token_ids_hash)
+
+
+def deterministic_market_selection_key_str(market: Dict[str, Any]) -> str:
+    end_ts, tradability_score, slug, condition_id, token_ids_hash = deterministic_market_selection_key(market)
+    return f"{end_ts}:{tradability_score}:{slug}:{condition_id}:{token_ids_hash}"
+
+
+def select_latest_active_btc_15m(candidates: List[ResolvedMarket], now_ms: int) -> ResolvedMarket:
+    diagnostics = _latest_active_btc_15m_diagnostics(candidates, now_ms)
+    eligible = [
+        candidate
+        for candidate in candidates
+        if _is_btc_15m_candidate(candidate)
+        and _has_trusted_end_ts(candidate)
+        and _is_candidate_active_now(candidate, now_ms)
+    ]
+    if not eligible:
+        raise NoActiveMarketError(
+            market_key="btc_15m",
+            now_ms=now_ms,
+            diagnostics=diagnostics,
+        )
+    eligible.sort(key=_latest_active_btc_15m_sort_key)
+    return eligible[-1]
+
+
+def _resolve_latest_active_btc_15m_selection(
+    market: MarketConfig,
+    candidates: List[Dict[str, Any]],
+    now_ms: int,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    requested_symbol = _discovery_symbol_for_market(market)
+    resolved_pairs = [
+        (_resolved_market_from_candidate(market, candidate, requested_symbol), candidate)
+        for candidate in candidates
+        if isinstance(candidate, dict)
+    ]
+    resolved_candidates = [resolved for resolved, _ in resolved_pairs]
+    diagnostics = _latest_active_btc_15m_diagnostics(
+        resolved_candidates,
+        now_ms=now_ms,
+        n_total=len(candidates),
+    )
+    payload_base: Dict[str, Any] = {
+        "event": "DISCOVERY_REQUEST",
+        "requested_symbol": requested_symbol,
+        "requested_horizon": "15m",
+        "requested_mode": "latest_active",
+        "now_wall_ms": int(now_ms),
+        "n_total": int(diagnostics.get("n_total", len(candidates))),
+        "n_btc_15m": int(diagnostics.get("n_btc_15m", 0)),
+        "n_with_end_ts": int(diagnostics.get("n_with_end_ts", 0)),
+        "n_active_now": int(diagnostics.get("n_active_now", 0)),
+    }
+    try:
+        selected_resolved = select_latest_active_btc_15m(resolved_candidates, now_ms=now_ms)
+    except NoActiveMarketError as exc:
+        error_payload = {
+            **payload_base,
+            "error_code": "NO_ACTIVE_BTC_15M",
+            "closest_candidates": diagnostics.get("closest_candidates", []),
+        }
+        raise NoActiveMarketError(
+            market_key="btc_15m",
+            now_ms=now_ms,
+            diagnostics=diagnostics,
+            request_payload=error_payload,
+        ) from exc
+
+    selected_raw: Optional[Dict[str, Any]] = None
+    selected_identity = _resolved_market_identity(selected_resolved)
+    for candidate_resolved, candidate_raw in resolved_pairs:
+        if _resolved_market_identity(candidate_resolved) == selected_identity:
+            selected_raw = candidate_raw
+            break
+    if selected_raw is None:
+        raise ValueError("selected_market_not_found_in_candidates")
+
+    selection_key = deterministic_market_selection_key_str(selected_raw)
+    success_payload = {
+        **payload_base,
+        "selected_slug": selected_resolved.slug,
+        "selected_end_ts_ms": selected_resolved.end_ts_ms,
+        "selected_end_ts_source": selected_resolved.end_ts_source,
+        "selected_condition_id": selected_resolved.condition_id,
+        "selected_clobTokenIds": list(selected_resolved.token_ids),
+        "selection_key": selection_key,
+    }
+    return selected_raw, success_payload
+
+
+def _append_discovery_request_summary(
+    discovery_summary: Optional[Dict[str, Any]],
+    request_payload: Optional[Dict[str, Any]],
+) -> None:
+    if discovery_summary is None or not request_payload:
+        return
+    requests = discovery_summary.setdefault("discovery_requests", [])
+    if isinstance(requests, list):
+        requests.append(dict(request_payload))
+
+
+def _latest_active_btc_15m_diagnostics(
+    candidates: List[ResolvedMarket],
+    now_ms: int,
+    n_total: Optional[int] = None,
+) -> Dict[str, Any]:
+    btc_candidates = [candidate for candidate in candidates if _is_btc_15m_candidate(candidate)]
+    btc_with_end = [candidate for candidate in btc_candidates if _has_trusted_end_ts(candidate)]
+    active_now = [candidate for candidate in btc_with_end if _is_candidate_active_now(candidate, now_ms)]
+    closest = sorted(
+        btc_with_end,
+        key=lambda candidate: _closest_candidate_key(candidate, now_ms),
+    )[:3]
+    return {
+        "n_total": int(len(candidates) if n_total is None else n_total),
+        "n_btc_15m": int(len(btc_candidates)),
+        "n_with_end_ts": int(len(btc_with_end)),
+        "n_active_now": int(len(active_now)),
+        "closest_candidates": [_discovery_candidate_payload(candidate) for candidate in closest],
+    }
+
+
+def _closest_candidate_key(candidate: ResolvedMarket, now_ms: int) -> Tuple[int, Tuple[int, int, str, str, str]]:
+    end_ts_ms = candidate.end_ts_ms
+    distance = abs(int(end_ts_ms) - int(now_ms)) if end_ts_ms is not None else (1 << 62)
+    return distance, _latest_active_btc_15m_sort_key(candidate)
+
+
+def _latest_active_btc_15m_sort_key(candidate: ResolvedMarket) -> Tuple[int, int, str, str, str]:
+    end_ts_ms = int(candidate.end_ts_ms or 0)
+    end_source_rank = 1 if (candidate.end_ts_source or "").lower() == "metadata" else 0
+    slug = candidate.slug or ""
+    condition_id = candidate.condition_id or ""
+    first_token = sorted([token for token in candidate.token_ids if token])[0] if candidate.token_ids else ""
+    return (end_ts_ms, end_source_rank, slug, condition_id, first_token)
+
+
+def _is_candidate_active_now(candidate: ResolvedMarket, now_ms: int) -> bool:
+    if candidate.end_ts_ms is None:
+        return False
+    end_ts_ms = int(candidate.end_ts_ms)
+    start_ts_ms = end_ts_ms - WINDOW_MS_15M
+    now = int(now_ms)
+    return start_ts_ms <= now < end_ts_ms
+
+
+def _is_btc_15m_candidate(candidate: ResolvedMarket) -> bool:
+    slug = (candidate.slug or "").strip().lower()
+    if not slug.startswith("btc-updown-15m-"):
+        return False
+    symbol = (candidate.reference_symbol or "").strip().upper()
+    return symbol in {"", "BTC"}
+
+
+def _has_trusted_end_ts(candidate: ResolvedMarket) -> bool:
+    if candidate.end_ts_ms is None:
+        return False
+    source = (candidate.end_ts_source or "").strip().lower()
+    return source in {"metadata", "slug_fallback"}
+
+
+def _discovery_candidate_payload(candidate: ResolvedMarket) -> Dict[str, Any]:
+    return {
+        "slug": candidate.slug,
+        "end_ts_ms": candidate.end_ts_ms,
+        "end_ts_source": candidate.end_ts_source,
+        "condition_id": candidate.condition_id,
+        "clobTokenIds": list(candidate.token_ids),
+        "selection_key": _selection_key_from_resolved(candidate),
+    }
+
+
+def _selection_key_from_resolved(candidate: ResolvedMarket) -> str:
+    return deterministic_market_selection_key_str(
+        {
+            "slug": candidate.slug,
+            "conditionId": candidate.condition_id,
+            "clobTokenIds": list(candidate.token_ids),
+            "endDate": int(candidate.end_ts_ms / 1000) if candidate.end_ts_ms is not None else None,
+            "active": None,
+            "closed": None,
+            "accepting_orders": None,
+        }
+    )
+
+
+def _resolved_market_identity(candidate: ResolvedMarket) -> Tuple[str, str, Tuple[str, ...], Optional[int], Optional[str]]:
+    return (
+        candidate.slug or "",
+        candidate.condition_id or "",
+        tuple(candidate.token_ids),
+        candidate.end_ts_ms,
+        candidate.end_ts_source,
+    )
+
+
+def _resolved_market_from_candidate(
+    market: MarketConfig,
+    candidate: Dict[str, Any],
+    requested_symbol: str,
+) -> ResolvedMarket:
+    condition_id = _coerce_str(candidate.get("conditionId") or candidate.get("condition_id")) or ""
+    token_ids = _coerce_list(candidate.get("clobTokenIds"))
+    outcomes = _coerce_list(candidate.get("outcomes"))
+    outcome_by_token = dict(zip(token_ids, outcomes)) if outcomes else {}
+    token_by_outcome = {outcome: token for token, outcome in outcome_by_token.items()}
+    slug = _coerce_str(candidate.get("slug"))
+    question = _coerce_str(candidate.get("question"))
+    end_ts_ms, end_ts_source = _market_end_ts_ms_and_source(candidate, slug)
+    return ResolvedMarket(
+        name=market.name,
+        reference_symbol=requested_symbol,
+        slug_prefix=market.slug_prefix,
+        slug=slug,
+        condition_id=condition_id,
+        token_ids=token_ids,
+        outcomes=outcomes,
+        outcome_by_token=outcome_by_token,
+        token_by_outcome=token_by_outcome,
+        question=question,
+        min_tick=market.min_tick,
+        min_size=market.min_size,
+        min_price=market.min_price,
+        max_price=market.max_price,
+        end_ts_ms=end_ts_ms,
+        end_ts_source=end_ts_source,
+    )
+
+
+def _collect_mode_candidates(
+    slug_results: Dict[str, List[Dict[str, Any]]],
+    markets_data: Optional[List[Dict[str, Any]]],
+    requested_symbol: str,
+) -> List[Dict[str, Any]]:
+    symbol = requested_symbol.strip().upper()
+    discovered = slug_results.get(symbol)
+    if discovered:
+        return [item for item in discovered if isinstance(item, dict)]
+    if not markets_data:
+        return []
+    return [
+        item
+        for item in markets_data
+        if isinstance(item, dict) and _matches_mode_symbol(item, symbol)
+    ]
+
+
+def _matches_mode_symbol(candidate: Dict[str, Any], symbol: str) -> bool:
+    slug = (_coerce_str(candidate.get("slug")) or "").lower()
+    if slug.startswith(f"{symbol.lower()}-"):
+        return True
+    return _matches_reference_symbol(candidate, symbol)
+
+
+def _resolve_now_ms(now_ts: Optional[int]) -> int:
+    if now_ts is None:
+        return int(time.time() * 1000)
+    return int(now_ts) * 1000
+
+
+def _discovery_symbol_for_market(market: MarketConfig) -> str:
+    if market.auto_discover is not None and market.auto_discover.symbol:
+        return market.auto_discover.symbol.strip().upper()
+    return market.reference_symbol.strip().upper()
+
+
+def _is_latest_active_btc_15m_mode(spec: Optional[AutoDiscoverSpec]) -> bool:
+    if spec is None:
+        return False
+    return (
+        spec.symbol.strip().upper() == "BTC"
+        and spec.horizon.strip().lower() == "15m"
+        and spec.mode.strip().lower() == "latest_active"
+    )
+
+
+def _token_ids_hash(token_ids: List[str]) -> str:
+    canonical = ",".join(sorted(str(token) for token in token_ids if token))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def _tradability_score(market: Dict[str, Any]) -> int:
+    score = 0
+    closed = _coerce_bool(market.get("closed"))
+    active = _coerce_bool(market.get("active"))
+    accepting = _coerce_bool(market.get("accepting_orders") or market.get("acceptingOrders"))
+    if closed is False:
+        score += 1
+    if active is True:
+        score += 2
+    if accepting is True:
+        score += 4
+    return score
 
 
 def _log_fee_rate_hit(market: Dict[str, Any], token_id: str, fee_rate_bps: float) -> None:
@@ -671,6 +1075,16 @@ def _parse_event_end_ts(event: Dict[str, Any]) -> Optional[int]:
             if parsed is not None:
                 return parsed
     return None
+
+
+def _market_end_ts_ms_and_source(market: Dict[str, Any], slug: Optional[str]) -> Tuple[Optional[int], Optional[str]]:
+    end_ts_sec = _parse_event_end_ts(market)
+    if end_ts_sec is not None and end_ts_sec > 0:
+        return int(end_ts_sec * 1000), "metadata"
+    slug_ts = _parse_slug_ts(slug or "")
+    if slug_ts is not None and slug_ts > 0:
+        return int(slug_ts * 1000), "slug_fallback"
+    return None, None
 
 
 def _parse_timestamp_value(value: Any) -> Optional[int]:
@@ -708,6 +1122,10 @@ def _load_resolved_markets_v1(
         outcome_by_token = {str(token.get("token_id")): str(token.get("outcome")) for token in tokens if token}
         token_by_outcome = {outcome: token for token, outcome in outcome_by_token.items()}
         constraints = entry.get("constraints") or {}
+        end_ts_ms = _coerce_optional_int(entry.get("end_ts_ms"))
+        end_ts_source = _coerce_str(entry.get("end_ts_source"))
+        if end_ts_ms is None:
+            end_ts_ms, end_ts_source = _market_end_ts_ms_and_source({}, _coerce_str(entry.get("market_slug")))
         market = ResolvedMarket(
             name=str(entry.get("name", "")),
             reference_symbol=str(entry.get("reference_symbol", "")),
@@ -723,6 +1141,8 @@ def _load_resolved_markets_v1(
             min_size=float(constraints.get("min_size", 1.0)),
             min_price=float(constraints.get("min_price", 0.01)),
             max_price=float(constraints.get("max_price", 0.99)),
+            end_ts_ms=end_ts_ms,
+            end_ts_source=end_ts_source,
         )
         resolved.append(market)
         meta = {
@@ -735,6 +1155,12 @@ def _load_resolved_markets_v1(
             "question": market.question,
             "reference_symbol": market.reference_symbol,
             "name": market.name,
+            "end_ts_ms": market.end_ts_ms,
+            "end_ts_source": market.end_ts_source,
+            "selection_key": _coerce_str(entry.get("selection_key")),
+            "active": _coerce_bool(entry.get("active")),
+            "closed": _coerce_bool(entry.get("closed")),
+            "accepting_orders": _coerce_bool(entry.get("accepting_orders")),
         }
         for token_id in market.token_ids:
             token_meta = dict(meta)
@@ -757,6 +1183,10 @@ def _load_resolved_markets_legacy(
         token_by_outcome = entry.get("token_by_outcome") or {
             outcome: token for token, outcome in outcome_by_token.items()
         }
+        end_ts_ms = _coerce_optional_int(entry.get("end_ts_ms"))
+        end_ts_source = _coerce_str(entry.get("end_ts_source"))
+        if end_ts_ms is None:
+            end_ts_ms, end_ts_source = _market_end_ts_ms_and_source({}, _coerce_str(entry.get("slug")))
         market = ResolvedMarket(
             name=str(entry.get("name", "")),
             reference_symbol=str(entry.get("reference_symbol", "")),
@@ -772,6 +1202,8 @@ def _load_resolved_markets_legacy(
             min_size=float(entry.get("min_size", 1.0)),
             min_price=float(entry.get("min_price", 0.01)),
             max_price=float(entry.get("max_price", 0.99)),
+            end_ts_ms=end_ts_ms,
+            end_ts_source=end_ts_source,
         )
         resolved.append(market)
         meta = {
@@ -784,6 +1216,12 @@ def _load_resolved_markets_legacy(
             "question": market.question,
             "reference_symbol": market.reference_symbol,
             "name": market.name,
+            "end_ts_ms": market.end_ts_ms,
+            "end_ts_source": market.end_ts_source,
+            "selection_key": _coerce_str(entry.get("selection_key")),
+            "active": _coerce_bool(entry.get("active")),
+            "closed": _coerce_bool(entry.get("closed")),
+            "accepting_orders": _coerce_bool(entry.get("accepting_orders")),
         }
         for token_id in market.token_ids:
             token_meta = dict(meta)
@@ -937,3 +1375,29 @@ def _coerce_list(value: Any) -> List[str]:
             if isinstance(parsed, list):
                 return [str(item) for item in parsed if str(item)]
     return []
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
