@@ -46,11 +46,14 @@ def table_exists(table: str, db_path: Optional[Path] = None) -> bool:
     path = db_path or resolve_db_path()
     if not path.exists():
         return False
-    with _connect(path) as cx:
+    cx = _connect(path)
+    try:
         row = cx.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             (table,),
         ).fetchone()
+    finally:
+        cx.close()
     return row is not None
 
 
@@ -58,8 +61,11 @@ def existing_tables(db_path: Optional[Path] = None) -> List[str]:
     path = db_path or resolve_db_path()
     if not path.exists():
         return []
-    with _connect(path) as cx:
+    cx = _connect(path)
+    try:
         rows = cx.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    finally:
+        cx.close()
     return sorted(str(row[0]) for row in rows if row and row[0])
 
 
@@ -78,11 +84,13 @@ def query_df(sql: str, params: Sequence[Any] = (), db_path: Optional[Path] = Non
     path = db_path or resolve_db_path()
     if not path.exists():
         return pd.DataFrame()
-    with _connect(path) as cx:
-        try:
-            return pd.read_sql_query(sql, cx, params=params)
-        except (DatabaseError, sqlite3.OperationalError):
-            return pd.DataFrame()
+    cx = _connect(path)
+    try:
+        return pd.read_sql_query(sql, cx, params=params)
+    except (DatabaseError, sqlite3.OperationalError):
+        return pd.DataFrame()
+    finally:
+        cx.close()
 
 
 def q(sql: str, db_path: Optional[Path] = None) -> pd.DataFrame:

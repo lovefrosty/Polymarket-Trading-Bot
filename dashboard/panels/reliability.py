@@ -17,7 +17,17 @@ from core.metrics import classify_reliability_rows
 HEALTH_DEP = PanelDependency(
     panel_id="health_a_to_e",
     required_sources=("pstar_stats", "decisions", "alerts", "latency_stats"),
-    optional_sources=("book_health_stats", "fills", "decision_ticks", "reconciliation_stats", "system_state"),
+    optional_sources=(
+        "book_health_stats",
+        "fills",
+        "decision_ticks",
+        "reconciliation_stats",
+        "system_state",
+        "execution_quality_stats",
+        "queue_quality_stats",
+        "liveness_stats",
+        "recovery_events",
+    ),
 )
 
 LOGS_DEP = PanelDependency(
@@ -120,6 +130,82 @@ def render_health_panel(filters: DashboardFilters, gate_map: Dict[str, HealthGat
     if not lat.empty:
         lat["ts"] = pd.to_datetime(lat["ts_ms"], unit="ms", utc=True)
     st.dataframe(lat, use_container_width=True, height=200)
+
+    st.subheader("Critical alerts (latest 10)")
+    critical = query_df(
+        """
+        SELECT ts_ms, code, message
+        FROM alerts
+        WHERE LOWER(severity)='critical'
+        ORDER BY ts_ms DESC
+        LIMIT 10
+        """
+    )
+    if not critical.empty:
+        critical["ts"] = pd.to_datetime(critical["ts_ms"], unit="ms", utc=True)
+    st.dataframe(critical, use_container_width=True, height=180)
+
+    st.subheader("Execution quality")
+    exec_quality = query_df(
+        """
+        SELECT ts_ms, token_id, sample_count, p50_realized_spread_bps, p95_realized_spread_bps,
+               p50_markout_5s_bps, p95_markout_5s_bps, p50_net_edge_bps, p95_net_edge_bps
+        FROM execution_quality_stats
+        ORDER BY ts_ms DESC
+        LIMIT 100
+        """
+    )
+    if not exec_quality.empty:
+        exec_quality["ts"] = pd.to_datetime(exec_quality["ts_ms"], unit="ms", utc=True)
+    st.dataframe(exec_quality, use_container_width=True, height=180)
+
+    st.subheader("Queue / fill quality")
+    queue_quality = query_df(
+        """
+        SELECT ts_ms, token_id, post_only_reject_rate, cancel_to_fill_ratio,
+               time_to_first_fill_p50_s, time_to_first_fill_p95_s,
+               partial_fill_count, orders_per_min, cancels_per_min, fills_per_min
+        FROM queue_quality_stats
+        ORDER BY ts_ms DESC
+        LIMIT 200
+        """
+    )
+    if not queue_quality.empty:
+        queue_quality["ts"] = pd.to_datetime(queue_quality["ts_ms"], unit="ms", utc=True)
+    st.dataframe(queue_quality, use_container_width=True, height=180)
+
+    st.subheader("Liveness")
+    liveness = query_df(
+        """
+        SELECT ts_ms, mode, clock_drift_ms, sequence_gap_rate_per_min, ws_starvation_token_count,
+               max_ws_starvation_ms, active_market_lag_ms, freeze_state, reason_codes
+        FROM liveness_stats
+        ORDER BY ts_ms DESC
+        LIMIT 200
+        """
+    )
+    if not liveness.empty:
+        liveness["ts"] = pd.to_datetime(liveness["ts_ms"], unit="ms", utc=True)
+    st.dataframe(liveness, use_container_width=True, height=180)
+
+    st.subheader("Quarantine / freeze timeline")
+    quarantine = query_df(
+        """
+        SELECT ts_ms, recovery_action, token_id, side, order_id
+        FROM recovery_events
+        WHERE recovery_action IN (
+            'UNKNOWN_OPEN_ORDER_QUARANTINE',
+            'STARTUP_QUOTING_INVARIANT_CHECK',
+            'CANCEL_OPEN_QUOTE_ON_FREEZE',
+            'MISSED_FILL_CORRECTION'
+        )
+        ORDER BY ts_ms DESC
+        LIMIT 200
+        """
+    )
+    if not quarantine.empty:
+        quarantine["ts"] = pd.to_datetime(quarantine["ts_ms"], unit="ms", utc=True)
+    st.dataframe(quarantine, use_container_width=True, height=180)
 
     st.subheader("Reliability Scoreboard")
     scoreboard = compute_reliability_scoreboard(latency_df=lat)

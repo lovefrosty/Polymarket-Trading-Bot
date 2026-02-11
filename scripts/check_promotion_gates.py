@@ -117,10 +117,15 @@ def main() -> None:
     settings = load_settings()
     constitution = _load_constitution(Path(args.constitution))
     policy = constitution.get("policy", {}) if isinstance(constitution, dict) else {}
+    trading = constitution.get("trading", {}) if isinstance(constitution, dict) else {}
 
     ws_lag_max_ms = float(policy.get("ws_lag_max_ms", settings.ws_lag_max_ms))
     pstar_max_age_ms = int(policy.get("pstar_max_age_ms", settings.pstar_max_age_ms))
     signal_age_max_ms = int(policy.get("signal_age_max_ms", settings.signal_age_max_ms))
+    econ_min_net_edge_p50_bps = float(trading.get("econ_min_net_edge_p50_bps", 0.0))
+    econ_max_adverse_markout_5s_p95_bps = float(trading.get("econ_max_adverse_markout_5s_p95_bps", 20.0))
+    clock_drift_max_ms = float(trading.get("clock_drift_max_ms", 250.0))
+    ws_starvation_max_ms = float(trading.get("ws_starvation_max_ms", 5000.0))
     now_ms = int(time.time() * 1000)
     lookback_start_ms = now_ms - int(args.lookback_hours) * 3_600_000
 
@@ -136,6 +141,8 @@ def main() -> None:
         has_latency_stats = _has_table(cx, "latency_stats")
         has_book_health_stats = _has_table(cx, "book_health_stats")
         has_reconciliation_stats = _has_table(cx, "reconciliation_stats")
+        has_execution_quality = _has_table(cx, "execution_quality")
+        has_liveness_stats = _has_table(cx, "liveness_stats")
 
         missing_table_impacts = {
             "decision_ticks": ["B_CAUSALITY_ZERO", "A_PSTAR_VALID_RATIO", "E_WS_LAG_P95", "E_PSTAR_AGE_P95", "E_SIGNAL_AGE_P95"],
@@ -143,6 +150,8 @@ def main() -> None:
             "latency_stats": ["DASHBOARD_FRESHNESS"],
             "book_health_stats": ["DASHBOARD_FRESHNESS"],
             "reconciliation_stats": ["R_RECON_STATS_PRESENT", "R_RECON_UNRESOLVED_ZERO", "R_RECON_FREEZE_ZERO"],
+            "execution_quality": ["ECON_NET_EDGE_P50_NONNEG", "ECON_ADVERSE_MARKOUT_5S_P95_MAX"],
+            "liveness_stats": ["L_CLOCK_DRIFT_P95", "L_WS_STARVATION_P95"],
         }
         for table, impacts in sorted(missing_table_impacts.items()):
             if _has_table(cx, table):
@@ -341,6 +350,104 @@ def main() -> None:
                             0,
                             int(freeze_count),
                             f"last_{int(args.lookback_hours)}h",
+                        )
+                )
+
+        # Liveness gates.
+        if has_liveness_stats:
+            liveness_rows = cx.execute(
+                """
+                SELECT ts_ms, clock_drift_ms, max_ws_starvation_ms
+                FROM liveness_stats
+                WHERE ts_ms >= ?
+                ORDER BY ts_ms
+                """,
+                [lookback_start_ms],
+            ).fetchall()
+            drift_groups: Dict[int, List[float]] = {}
+            starvation_groups: Dict[int, List[float]] = {}
+            for ts_ms, drift, starvation in liveness_rows:
+                bucket = _window_start(int(ts_ms))
+                if drift is not None:
+                    drift_groups.setdefault(bucket, []).append(float(drift))
+                if starvation is not None:
+                    starvation_groups.setdefault(bucket, []).append(float(starvation))
+            for bucket in sorted(drift_groups.keys()):
+                p95 = _quantile(drift_groups[bucket], 0.95)
+                if p95 is not None and p95 > float(clock_drift_max_ms):
+                    failed.append(
+                        _gate_entry(
+                            "L_CLOCK_DRIFT_P95",
+                            "clock_drift_ms_p95",
+                            clock_drift_max_ms,
+                            _round(p95),
+                            _iso_window(bucket),
+                        )
+                    )
+            for bucket in sorted(starvation_groups.keys()):
+                p95 = _quantile(starvation_groups[bucket], 0.95)
+                if p95 is not None and p95 > float(ws_starvation_max_ms):
+                    failed.append(
+                        _gate_entry(
+                            "L_WS_STARVATION_P95",
+                            "ws_starvation_ms_p95",
+                            ws_starvation_max_ms,
+                            _round(p95),
+                            _iso_window(bucket),
+                        )
+                    )
+
+        # Economic execution-quality gates.
+        if has_execution_quality:
+            exec_rows = cx.execute(
+                """
+                SELECT ts_ms, net_edge_bps, markout_5s_bps
+                FROM execution_quality
+                WHERE ts_ms >= ?
+                ORDER BY ts_ms
+                """,
+                [lookback_start_ms],
+            ).fetchall()
+            net_groups: Dict[int, List[float]] = {}
+            adverse_groups: Dict[int, List[float]] = {}
+            for ts_ms, net_edge, markout_5s in exec_rows:
+                bucket = _window_start(int(ts_ms))
+                if net_edge is not None:
+                    net_groups.setdefault(bucket, []).append(float(net_edge))
+                if markout_5s is not None:
+                    adverse_groups.setdefault(bucket, []).append(max(0.0, -float(markout_5s)))
+            if not net_groups:
+                failed.append(
+                    _gate_entry(
+                        "ECON_NET_EDGE_P50_NONNEG",
+                        "net_edge_bps_p50",
+                        f">={_round(econ_min_net_edge_p50_bps)}",
+                        None,
+                        f"last_{int(args.lookback_hours)}h",
+                    )
+                )
+            for bucket in sorted(net_groups.keys()):
+                p50 = _quantile(net_groups[bucket], 0.50)
+                if p50 is not None and p50 < float(econ_min_net_edge_p50_bps):
+                    failed.append(
+                        _gate_entry(
+                            "ECON_NET_EDGE_P50_NONNEG",
+                            "net_edge_bps_p50",
+                            econ_min_net_edge_p50_bps,
+                            _round(p50),
+                            _iso_window(bucket),
+                        )
+                    )
+            for bucket in sorted(adverse_groups.keys()):
+                p95 = _quantile(adverse_groups[bucket], 0.95)
+                if p95 is not None and p95 > float(econ_max_adverse_markout_5s_p95_bps):
+                    failed.append(
+                        _gate_entry(
+                            "ECON_ADVERSE_MARKOUT_5S_P95_MAX",
+                            "adverse_markout_5s_bps_p95",
+                            econ_max_adverse_markout_5s_p95_bps,
+                            _round(p95),
+                            _iso_window(bucket),
                         )
                     )
 

@@ -86,6 +86,51 @@ class TestPromotionGateCheckerV1(unittest.TestCase):
                     "payload_json": "{}",
                 },
             )
+            store.insert(
+                "execution_quality",
+                {
+                    "ts_ms": now_ms,
+                    "event_id": "eq-ok-1",
+                    "run_id": "run-test",
+                    "mode": "OBSERVE",
+                    "token_id": "token-a",
+                    "order_id": "o-1",
+                    "side": "buy",
+                    "fill_ts_ms": now_ms - 1000,
+                    "fill_price": 0.50,
+                    "fill_qty": 1.0,
+                    "fee_bps": 2.0,
+                    "mid_at_send": 0.5010,
+                    "mid_at_ack": 0.5015,
+                    "mid_at_fill": 0.5012,
+                    "mid_1s": 0.5018,
+                    "mid_5s": 0.5020,
+                    "mid_30s": 0.5022,
+                    "realized_spread_bps": 20.0,
+                    "markout_1s_bps": 25.0,
+                    "markout_5s_bps": 28.0,
+                    "markout_30s_bps": 30.0,
+                    "net_edge_bps": 18.0,
+                    "payload_json": "{}",
+                },
+            )
+            store.insert(
+                "liveness_stats",
+                {
+                    "ts_ms": now_ms,
+                    "event_id": "live-ok-1",
+                    "mode": "OBSERVE",
+                    "clock_drift_ms": 5.0,
+                    "sequence_gap_rate_per_min": 0.0,
+                    "sequence_gap_count_1m": 0,
+                    "ws_starvation_token_count": 0,
+                    "max_ws_starvation_ms": 50.0,
+                    "active_market_lag_ms": 30.0,
+                    "freeze_state": 0,
+                    "reason_codes": "",
+                    "payload_json": "{}",
+                },
+            )
             store.close()
 
             result = self._run_checker(db_path)

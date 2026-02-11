@@ -31,15 +31,19 @@ def _sha256(path: Path) -> str:
 def _table_exists(db_path: Path, name: str) -> bool:
     if not db_path.exists():
         return False
-    with sqlite3.connect(db_path.as_posix()) as cx:
+    cx = sqlite3.connect(db_path.as_posix())
+    try:
         row = cx.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+    finally:
+        cx.close()
     return row is not None
 
 
 def _export_query_jsonl(db_path: Path, sql: str, params: Sequence[Any], out_path: Path) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     row_count = 0
-    with sqlite3.connect(db_path.as_posix()) as cx:
+    cx = sqlite3.connect(db_path.as_posix())
+    try:
         cur = cx.execute(sql, params)
         columns = [d[0] for d in cur.description]
         with out_path.open("w", encoding="utf-8") as fh:
@@ -48,6 +52,8 @@ def _export_query_jsonl(db_path: Path, sql: str, params: Sequence[Any], out_path
                 fh.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True))
                 fh.write("\n")
                 row_count += 1
+    finally:
+        cx.close()
     return row_count
 
 
@@ -175,10 +181,13 @@ def _build_incident_bundle(
 
     system_state_path = bundle_dir / "system_state.json"
     if _table_exists(db_path, "system_state"):
-        with sqlite3.connect(db_path.as_posix()) as cx:
+        cx = sqlite3.connect(db_path.as_posix())
+        try:
             row = cx.execute(
                 "SELECT as_of_ts, is_frozen, reasons, mode, payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1"
             ).fetchone()
+        finally:
+            cx.close()
         payload = {
             "as_of_ts": row[0] if row else None,
             "is_frozen": row[1] if row else None,

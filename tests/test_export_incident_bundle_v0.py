@@ -13,7 +13,8 @@ class TestExportIncidentBundleV0(unittest.TestCase):
             tmp_path = Path(tmp)
             db_path = tmp_path / "runtime.db"
             out_dir = tmp_path / "export"
-            with sqlite3.connect(db_path.as_posix()) as cx:
+            cx = sqlite3.connect(db_path.as_posix())
+            try:
                 cx.execute("CREATE TABLE logs(ts_ms INTEGER, level TEXT, msg TEXT, payload_json TEXT)")
                 cx.execute(
                     "CREATE TABLE decisions(ts_ms INTEGER, decision_id TEXT, market TEXT, token_id TEXT, action TEXT, reason_codes TEXT, p_hat REAL, expected_edge REAL, expected_cost REAL, decision_ts_event_ms INTEGER, book_asof_ts_ms INTEGER, pstar_asof_ts_ms INTEGER, max_feature_ts_ms INTEGER, policy_json TEXT)"
@@ -25,6 +26,8 @@ class TestExportIncidentBundleV0(unittest.TestCase):
                 cx.execute("INSERT INTO market_data_book VALUES (1000,'t','buy',0.5,1.0,'ws')")
                 cx.execute("INSERT INTO system_state VALUES (1000,0,'','OBSERVE','{}')")
                 cx.commit()
+            finally:
+                cx.close()
 
             manifest_path = _build_incident_bundle(
                 db_path=db_path,

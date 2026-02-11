@@ -1183,8 +1183,31 @@ class RuntimeEngine:
             fill_price = float(event.payload.get("fill_price") or 0.0)
             fee_bps = float(event.payload.get("fees_bps") or 0.0)
             fill_key = str(event.payload.get("fill_event_id") or f"{event.order_id}:{fill_ts}:{fill_qty:.8f}:{side}")
-            self._seen_reconcile_fill_ids.add(fill_key)
-            self.db.mark_fill_event_seen(
+            if fill_key in self._seen_reconcile_fill_ids:
+                self.db.insert(
+                    "recovery_events",
+                    {
+                        "ts_ms": int(fill_ts),
+                        "event_id": uuid.uuid4().hex,
+                        "run_id": self.run_id,
+                        "mode": self.mode,
+                        "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                        "token_id": str(token_id),
+                        "side": str(side),
+                        "order_id": str(event.order_id),
+                        "price": _maybe_float(fill_price),
+                        "size": _maybe_float(fill_qty),
+                        "adopted_order_count": None,
+                        "payload_json": json.dumps(
+                            {"fill_event_key": fill_key, "reason": "in_memory_seen"},
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    },
+                )
+                return
+            marked = self.db.mark_fill_event_seen(
                 fill_event_key=str(fill_key),
                 first_seen_ts_ms=int(fill_ts),
                 source="broker_event",
@@ -1196,6 +1219,32 @@ class RuntimeEngine:
                     "fill_price": float(fill_price),
                 },
             )
+            if not marked:
+                self._seen_reconcile_fill_ids.add(fill_key)
+                self.db.insert(
+                    "recovery_events",
+                    {
+                        "ts_ms": int(fill_ts),
+                        "event_id": uuid.uuid4().hex,
+                        "run_id": self.run_id,
+                        "mode": self.mode,
+                        "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                        "token_id": str(token_id),
+                        "side": str(side),
+                        "order_id": str(event.order_id),
+                        "price": _maybe_float(fill_price),
+                        "size": _maybe_float(fill_qty),
+                        "adopted_order_count": None,
+                        "payload_json": json.dumps(
+                            {"fill_event_key": fill_key, "reason": "persistent_seen"},
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    },
+                )
+                return
+            self._seen_reconcile_fill_ids.add(fill_key)
             fill_event_id = str(event.payload.get("fill_event_id") or uuid.uuid4().hex)
             self.db.insert(
                 "fills",

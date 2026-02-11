@@ -10,9 +10,12 @@ class TestDashboardSourceGuards(unittest.TestCase):
     def test_require_sources_reports_missing_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "runtime.db"
-            with sqlite3.connect(db_path.as_posix()) as cx:
+            cx = sqlite3.connect(db_path.as_posix())
+            try:
                 cx.execute("CREATE TABLE alerts(ts_ms INTEGER)")
                 cx.commit()
+            finally:
+                cx.close()
 
             ok, missing_required, missing_optional = require_sources(
                 required_sources=["alerts", "decisions"],
