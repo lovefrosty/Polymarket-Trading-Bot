@@ -85,7 +85,7 @@ def _build_runtime(db_path: Path, broker: _PatternBroker) -> RuntimeEngine:
 
 
 class TestReconcileFreezeDeterminismReplay(unittest.TestCase):
-    def _run_pattern(self) -> tuple[list[tuple[str, int]], list[tuple[int, int]]]:
+    def _run_pattern(self) -> tuple[list[tuple[str, int]], list[tuple[int, int]], list[tuple[int, str]]]:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "runtime.db"
             runtime = _build_runtime(db_path=db_path, broker=_PatternBroker())
@@ -107,16 +107,54 @@ class TestReconcileFreezeDeterminismReplay(unittest.TestCase):
                 ORDER BY ts_ms
                 """
             )
+            event_ids = runtime.db.query(
+                """
+                SELECT ts_ms, event_id
+                FROM reconciliation_stats
+                ORDER BY ts_ms, event_id
+                """
+            )
             runtime.trade_tape.close()
             runtime.decision_tape.close()
             runtime.db.close()
-            return [(str(code), int(ts)) for code, ts in edges], [(int(ts), int(state)) for ts, state in freeze_states]
+            return (
+                [(str(code), int(ts)) for code, ts in edges],
+                [(int(ts), int(state)) for ts, state in freeze_states],
+                [(int(ts), str(event_id)) for ts, event_id in event_ids],
+            )
 
     def test_replay_produces_same_freeze_edges(self) -> None:
-        edges_1, states_1 = self._run_pattern()
-        edges_2, states_2 = self._run_pattern()
+        edges_1, states_1, event_ids_1 = self._run_pattern()
+        edges_2, states_2, event_ids_2 = self._run_pattern()
         self.assertEqual(edges_1, edges_2)
         self.assertEqual(states_1, states_2)
+        self.assertEqual(event_ids_1, event_ids_2)
+
+    def test_quote_quantization_stabilizes_boundary_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.db"
+            runtime = _build_runtime(db_path=db_path, broker=_PatternBroker())
+            constraint = runtime.constraints["token-1"]
+            bid_a, ask_a = runtime._compute_quotes(
+                q=0.5000000000001,
+                mid=None,
+                constraint=constraint,
+                half_spread_bps=40.0,
+                inventory_skew=0.0,
+                risk_padding_bps=5.0,
+            )
+            bid_b, ask_b = runtime._compute_quotes(
+                q=0.5,
+                mid=None,
+                constraint=constraint,
+                half_spread_bps=40.0,
+                inventory_skew=0.0,
+                risk_padding_bps=5.0,
+            )
+            self.assertEqual((bid_a, ask_a), (bid_b, ask_b))
+            runtime.trade_tape.close()
+            runtime.decision_tape.close()
+            runtime.db.close()
 
 
 if __name__ == "__main__":

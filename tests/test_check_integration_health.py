@@ -111,6 +111,8 @@ class TestCheckIntegrationHealth(unittest.TestCase):
                     now_ms=now_ms,
                     clock_drift_max_ms=250.0,
                     ws_starvation_max_ms=5000.0,
+                    min_liveness_green_pct=0.0,
+                    min_pstar_valid_dwell_pct=0.0,
                 )
             finally:
                 cx.close()

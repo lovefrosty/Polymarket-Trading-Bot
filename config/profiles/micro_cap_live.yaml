@@ -1,0 +1,10 @@
+trading:
+  mode_default: OBSERVE
+  quote_interval_ms: 2000
+  max_orders_per_min: 30
+  max_daily_loss_usdc: 50.0
+  cap_gross_usd: 200.0
+  cap_total_gross_usd: 400.0
+  max_position_per_side: 500.0
+policy:
+  book_stale_after_ms: 30000

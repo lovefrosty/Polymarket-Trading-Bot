@@ -16,7 +16,7 @@ from dashboard.data_access import query_df, require_sources
 ROLLOVER_DEP = PanelDependency(
     panel_id="rollover",
     required_sources=("rollover_status",),
-    optional_sources=("rollover_metrics", "discovery_requests"),
+    optional_sources=("rollover_metrics", "discovery_requests", "ws_subscribe_attempts"),
 )
 
 
@@ -187,6 +187,36 @@ def render_rollover_panel(filters: DashboardFilters, panel_budget_ms: int = 300)
         )
     st.subheader("Discovery / retry")
     st.dataframe(discovery, width="stretch", height=180)
+
+    attempts = _to_ts(
+        query_df(
+            """
+            SELECT
+                ts_ms,
+                attempt_id,
+                action,
+                pending_sub_id,
+                ack_status,
+                ack_error,
+                preclass_pending_hits,
+                preclass_active_hits,
+                preclass_unknown_schema,
+                preclass_missing_asset,
+                preclass_missing_sub,
+                confirm_counts_by_asset_json,
+                confirm_preclass_hits_by_asset_json,
+                first_pending_recv_ts_ms,
+                last_pending_recv_ts_ms,
+                confirm_wait_ms,
+                result
+            FROM ws_subscribe_attempts
+            ORDER BY ts_ms DESC
+            LIMIT 50
+            """
+        )
+    )
+    st.subheader("WS Subscribe Attempts")
+    st.dataframe(attempts, width="stretch", height=220)
 
     elapsed = (perf_counter() - t0) * 1000.0
     if elapsed > panel_budget_ms:

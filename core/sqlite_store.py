@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import weakref
 
@@ -66,6 +67,10 @@ _SCHEMA = [
     CREATE TABLE IF NOT EXISTS orders (
         ts_ms INTEGER NOT NULL,
         event_id TEXT NOT NULL,
+        run_id TEXT,
+        mode TEXT,
+        market_slug TEXT,
+        condition_id TEXT,
         order_id TEXT NOT NULL,
         client_order_id TEXT,
         token_id TEXT NOT NULL,
@@ -76,6 +81,7 @@ _SCHEMA = [
         tif TEXT,
         status TEXT NOT NULL,
         reason TEXT,
+        reason_code TEXT,
         quote_group_id TEXT,
         idempotency_key TEXT,
         fsm_state TEXT,
@@ -86,6 +92,10 @@ _SCHEMA = [
     CREATE TABLE IF NOT EXISTS fills (
         ts_ms INTEGER NOT NULL,
         event_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        mode TEXT,
+        market_slug TEXT,
+        condition_id TEXT,
         order_id TEXT NOT NULL,
         token_id TEXT NOT NULL,
         side TEXT NOT NULL,
@@ -93,6 +103,7 @@ _SCHEMA = [
         fill_qty REAL NOT NULL,
         fee REAL,
         liquidity TEXT,
+        reason_code TEXT,
         payload_json TEXT NOT NULL
     )
     """,
@@ -374,6 +385,20 @@ _SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS decision_trace (
+        ts_ms INTEGER NOT NULL,
+        event_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL,
+        token_id TEXT NOT NULL,
+        market_slug TEXT,
+        action TEXT NOT NULL,
+        allow_action INTEGER NOT NULL,
+        input_asof_ts_ms INTEGER NOT NULL,
+        gate_reason_codes TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS book_health_stats (
         ts_ms INTEGER NOT NULL,
         event_id TEXT PRIMARY KEY,
@@ -436,10 +461,41 @@ _SCHEMA = [
         payload_json TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS ws_subscribe_attempts (
+        run_id TEXT NOT NULL,
+        ts_ms INTEGER NOT NULL,
+        attempt_id INTEGER NOT NULL,
+        action TEXT,
+        active_sub_id_before INTEGER,
+        pending_sub_id INTEGER,
+        asset_ids_json TEXT,
+        payload_json TEXT,
+        ack_status TEXT,
+        ack_ts_ms INTEGER,
+        ack_error TEXT,
+        preclass_pending_hits INTEGER,
+        preclass_active_hits INTEGER,
+        preclass_unknown_schema INTEGER,
+        preclass_missing_asset INTEGER,
+        preclass_missing_sub INTEGER,
+        confirm_required_updates INTEGER,
+        confirm_counts_by_asset_json TEXT,
+        confirm_preclass_hits_by_asset_json TEXT,
+        first_pending_recv_ts_ms INTEGER,
+        last_pending_recv_ts_ms INTEGER,
+        confirm_wait_ms REAL,
+        result TEXT
+    )
+    """,
 ]
 
 
 class SQLiteStore:
+    _BATCH_TABLES = {"market_data_book", "market_trades"}
+    _BATCH_MAX_ROWS = 64
+    _BATCH_MAX_AGE_MS = 100
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,6 +503,8 @@ class SQLiteStore:
         self._cx.execute("PRAGMA journal_mode=WAL")
         self._cx.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()
+        self._pending_batch_rows: int = 0
+        self._pending_batch_started_ns: Optional[int] = None
         self._closed = False
         self._finalizer = weakref.finalize(self, SQLiteStore._close_connection, self._cx)
         self._init_schema()
@@ -455,6 +513,7 @@ class SQLiteStore:
         with self._lock:
             if self._closed:
                 return
+            self._flush_batch_locked(force=True)
             self._finalizer()
             self._closed = True
 
@@ -481,6 +540,34 @@ class SQLiteStore:
         except Exception:
             pass
 
+    def _is_batched_table(self, table: str) -> bool:
+        return table in self._BATCH_TABLES
+
+    def _note_batched_rows_locked(self, count: int) -> None:
+        if count <= 0:
+            return
+        if self._pending_batch_rows <= 0:
+            self._pending_batch_started_ns = time.monotonic_ns()
+        self._pending_batch_rows += count
+
+    def _batch_age_ms_locked(self) -> float:
+        if self._pending_batch_rows <= 0 or self._pending_batch_started_ns is None:
+            return 0.0
+        return max(0.0, (time.monotonic_ns() - self._pending_batch_started_ns) / 1_000_000.0)
+
+    def _reset_batch_state_locked(self) -> None:
+        self._pending_batch_rows = 0
+        self._pending_batch_started_ns = None
+
+    def _flush_batch_locked(self, force: bool = False) -> None:
+        if self._pending_batch_rows <= 0:
+            return
+        if not force:
+            if self._pending_batch_rows < self._BATCH_MAX_ROWS and self._batch_age_ms_locked() < self._BATCH_MAX_AGE_MS:
+                return
+        self._cx.commit()
+        self._reset_batch_state_locked()
+
     def insert(self, table: str, row: Dict[str, Any]) -> None:
         keys = sorted(row.keys())
         cols = ",".join(keys)
@@ -490,7 +577,12 @@ class SQLiteStore:
         with self._lock:
             self._cx.execute(sql, values)
             self._insert_evidence_from_row_locked(table, row)
-            self._cx.commit()
+            if self._is_batched_table(table):
+                self._note_batched_rows_locked(1)
+                self._flush_batch_locked(force=False)
+            else:
+                self._cx.commit()
+                self._reset_batch_state_locked()
 
     def insert_many(self, table: str, rows: Iterable[Dict[str, Any]]) -> None:
         rows_list = [dict(row) for row in rows]
@@ -505,7 +597,12 @@ class SQLiteStore:
             self._cx.executemany(sql, values)
             for row in rows_list:
                 self._insert_evidence_from_row_locked(table, row)
-            self._cx.commit()
+            if self._is_batched_table(table):
+                self._note_batched_rows_locked(len(rows_list))
+                self._flush_batch_locked(force=False)
+            else:
+                self._cx.commit()
+                self._reset_batch_state_locked()
 
     def _insert_evidence_from_row_locked(self, table: str, row: Dict[str, Any]) -> None:
         if table == "evidence_rows":
@@ -575,6 +672,7 @@ class SQLiteStore:
 
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
         with self._lock:
+            self._flush_batch_locked(force=True)
             self._cx.execute(sql, params or [])
             self._cx.commit()
 
@@ -601,6 +699,7 @@ class SQLiteStore:
     ) -> None:
         payload_json = _as_json(payload or {})
         with self._lock:
+            self._flush_batch_locked(force=True)
             self._cx.execute(
                 """
                 INSERT INTO system_state (as_of_ts, is_frozen, reasons, mode, payload_json)
@@ -783,6 +882,89 @@ class SQLiteStore:
             },
         )
 
+    def append_ws_subscribe_attempt(
+        self,
+        run_id: str,
+        ts_ms: int,
+        attempt_id: int,
+        action: str,
+        active_sub_id_before: Optional[int],
+        pending_sub_id: Optional[int],
+        asset_ids_json: str,
+        payload_json: str,
+        ack_status: Optional[str],
+        ack_ts_ms: Optional[int],
+        ack_error: Optional[str],
+        preclass_pending_hits: Optional[int],
+        preclass_active_hits: Optional[int],
+        preclass_unknown_schema: Optional[int],
+        preclass_missing_asset: Optional[int],
+        preclass_missing_sub: Optional[int],
+        confirm_required_updates: Optional[int],
+        confirm_counts_by_asset_json: str,
+        confirm_preclass_hits_by_asset_json: str,
+        first_pending_recv_ts_ms: Optional[int],
+        last_pending_recv_ts_ms: Optional[int],
+        confirm_wait_ms: Optional[float],
+        result: Optional[str],
+    ) -> None:
+        self.insert(
+            "ws_subscribe_attempts",
+            {
+                "run_id": str(run_id),
+                "ts_ms": int(ts_ms),
+                "attempt_id": int(attempt_id),
+                "action": str(action),
+                "active_sub_id_before": _maybe_int(active_sub_id_before),
+                "pending_sub_id": _maybe_int(pending_sub_id),
+                "asset_ids_json": str(asset_ids_json),
+                "payload_json": str(payload_json),
+                "ack_status": str(ack_status) if ack_status is not None else None,
+                "ack_ts_ms": _maybe_int(ack_ts_ms),
+                "ack_error": str(ack_error) if ack_error is not None else None,
+                "preclass_pending_hits": _maybe_int(preclass_pending_hits),
+                "preclass_active_hits": _maybe_int(preclass_active_hits),
+                "preclass_unknown_schema": _maybe_int(preclass_unknown_schema),
+                "preclass_missing_asset": _maybe_int(preclass_missing_asset),
+                "preclass_missing_sub": _maybe_int(preclass_missing_sub),
+                "confirm_required_updates": _maybe_int(confirm_required_updates),
+                "confirm_counts_by_asset_json": str(confirm_counts_by_asset_json),
+                "confirm_preclass_hits_by_asset_json": str(confirm_preclass_hits_by_asset_json),
+                "first_pending_recv_ts_ms": _maybe_int(first_pending_recv_ts_ms),
+                "last_pending_recv_ts_ms": _maybe_int(last_pending_recv_ts_ms),
+                "confirm_wait_ms": _maybe_float(confirm_wait_ms),
+                "result": str(result) if result is not None else None,
+            },
+        )
+
+    def append_decision_trace(
+        self,
+        ts_ms: int,
+        decision_id: str,
+        token_id: str,
+        market_slug: Optional[str],
+        action: str,
+        allow_action: bool,
+        input_asof_ts_ms: int,
+        gate_reason_codes: Sequence[str],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.insert(
+            "decision_trace",
+            {
+                "ts_ms": int(ts_ms),
+                "event_id": uuid4_hex(),
+                "decision_id": str(decision_id),
+                "token_id": str(token_id),
+                "market_slug": str(market_slug) if market_slug is not None else None,
+                "action": str(action),
+                "allow_action": 1 if bool(allow_action) else 0,
+                "input_asof_ts_ms": int(input_asof_ts_ms),
+                "gate_reason_codes": ",".join(sorted(set(str(code) for code in gate_reason_codes if code))),
+                "payload_json": _as_json(payload or {}),
+            },
+        )
+
     def mark_fill_event_seen(
         self,
         fill_event_key: str,
@@ -791,6 +973,7 @@ class SQLiteStore:
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
         with self._lock:
+            self._flush_batch_locked(force=True)
             try:
                 self._cx.execute(
                     """
@@ -817,11 +1000,27 @@ class SQLiteStore:
         with self._lock:
             for stmt in _SCHEMA:
                 self._cx.execute(stmt)
+            self._cx.execute("CREATE INDEX IF NOT EXISTS idx_ws_subscribe_attempts_ts ON ws_subscribe_attempts(ts_ms)")
             self._ensure_columns(
                 "orders",
                 {
+                    "run_id": "TEXT",
+                    "mode": "TEXT",
+                    "market_slug": "TEXT",
+                    "condition_id": "TEXT",
+                    "reason_code": "TEXT",
                     "quote_group_id": "TEXT",
                     "idempotency_key": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                "fills",
+                {
+                    "run_id": "TEXT",
+                    "mode": "TEXT",
+                    "market_slug": "TEXT",
+                    "condition_id": "TEXT",
+                    "reason_code": "TEXT",
                 },
             )
             self._ensure_columns(
@@ -904,10 +1103,16 @@ class SQLiteStore:
                 "CREATE INDEX IF NOT EXISTS idx_liveness_stats_ts ON liveness_stats(ts_ms)"
             )
             self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_event_id ON orders(event_id)"
+            )
+            self._cx.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rollover_status_ts ON rollover_status(ts_ms)"
             )
             self._cx.execute(
                 "CREATE INDEX IF NOT EXISTS idx_discovery_requests_ts ON discovery_requests(ts_ms)"
+            )
+            self._cx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_decision_trace_ts ON decision_trace(ts_ms)"
             )
             self._cx.execute(
                 "CREATE INDEX IF NOT EXISTS idx_evidence_rows_ts ON evidence_rows(ts_ms)"

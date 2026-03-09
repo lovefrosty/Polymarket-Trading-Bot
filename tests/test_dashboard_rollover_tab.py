@@ -94,6 +94,30 @@ class TestDashboardRolloverTab(unittest.TestCase):
                         }
                     ]
                 )
+            if "FROM ws_subscribe_attempts" in sql:
+                return pd.DataFrame(
+                    [
+                        {
+                            "ts_ms": 2_000,
+                            "attempt_id": 3,
+                            "action": "resubscribe",
+                            "pending_sub_id": 2,
+                            "ack_status": "UNSUPPORTED",
+                            "ack_error": None,
+                            "preclass_pending_hits": 0,
+                            "preclass_active_hits": 5,
+                            "preclass_unknown_schema": 0,
+                            "preclass_missing_asset": 0,
+                            "preclass_missing_sub": 5,
+                            "confirm_counts_by_asset_json": "{\"a\":0}",
+                            "confirm_preclass_hits_by_asset_json": "{\"a\":0}",
+                            "first_pending_recv_ts_ms": None,
+                            "last_pending_recv_ts_ms": None,
+                            "confirm_wait_ms": 5000.0,
+                            "result": "TIMEOUT",
+                        }
+                    ]
+                )
             return pd.DataFrame()
 
         with patch.object(rollover_panel, "st", dummy_st), patch.object(
@@ -101,7 +125,7 @@ class TestDashboardRolloverTab(unittest.TestCase):
         ), patch.object(rollover_panel, "query_df", side_effect=fake_query):
             rollover_panel.render_rollover_panel(filters)
 
-        self.assertGreaterEqual(dummy_st.dataframes, 5)
+        self.assertGreaterEqual(dummy_st.dataframes, 6)
 
 
 if __name__ == "__main__":

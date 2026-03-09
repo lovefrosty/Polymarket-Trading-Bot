@@ -19,26 +19,31 @@ class TestDashboardReliabilityScoreboard(unittest.TestCase):
             if "FROM pstar_stats" in sql:
                 return pd.DataFrame(
                     [
-                        {"ts_ms": 1, "disagreement_bps": 20.0, "valid": 1},
-                        {"ts_ms": 2, "disagreement_bps": 25.0, "valid": 1},
+                        {"invalid_ratio": 0.0, "disagree_ratio": 0.0},
                     ]
                 )
             if "FROM reconciliation_stats" in sql:
                 return pd.DataFrame(
                     [
-                        {"ts_ms": 1, "outside_tolerance": 0, "unresolved_mismatch_count": 0},
+                        {"outside_tolerance_ratio": 0.0, "unresolved_ratio": 0.0},
                     ]
                 )
-            if "FROM alerts" in sql:
+            if "FROM alerts" in sql and "GROUP BY hour_ms" in sql:
                 return pd.DataFrame(
                     [
-                        {"ts_ms": 1, "severity": "critical", "code": "E_LATENCY"},
+                        {"hour_ms": 0, "alerts_total": 1, "freeze_related_alerts": 1},
                     ]
                 )
-            if "FROM system_state" in sql:
+            if "FROM system_state" in sql and "GROUP BY hour_ms" in sql:
                 return pd.DataFrame(
                     [
-                        {"as_of_ts": 1, "is_frozen": 1, "reasons": "E_LATENCY"},
+                        {"hour_ms": 0, "frozen_samples": 1},
+                    ]
+                )
+            if "FROM system_state" in sql and "AVG(CASE WHEN is_frozen = 1" in sql:
+                return pd.DataFrame(
+                    [
+                        {"freeze_ratio": 1.0},
                     ]
                 )
             return pd.DataFrame()
@@ -50,6 +55,37 @@ class TestDashboardReliabilityScoreboard(unittest.TestCase):
         self.assertGreater(len(rows), 0)
         self.assertEqual(rows[0]["source"], "execution_path")
         self.assertIn("freeze_trend", scoreboard)
+
+    def test_uses_hourly_aggregate_trend_queries(self) -> None:
+        seen_sql = []
+
+        def fake_query(sql: str, params=()):
+            seen_sql.append(" ".join(sql.split()))
+            if "FROM latency_stats" in sql:
+                return pd.DataFrame(
+                    [
+                        {"ts_ms": 1, "p95_ws_lag_ms": 100.0, "p95_send_ack_ms": 100.0, "p95_signal_age_ms": 100.0},
+                    ]
+                )
+            if "FROM pstar_stats" in sql:
+                return pd.DataFrame([{"invalid_ratio": 0.0, "disagree_ratio": 0.0}])
+            if "FROM reconciliation_stats" in sql:
+                return pd.DataFrame([{"outside_tolerance_ratio": 0.0, "unresolved_ratio": 0.0}])
+            if "FROM system_state" in sql and "AVG(CASE WHEN is_frozen = 1" in sql:
+                return pd.DataFrame([{"freeze_ratio": 0.0}])
+            if "FROM alerts" in sql and "GROUP BY hour_ms" in sql:
+                return pd.DataFrame([{"hour_ms": 0, "alerts_total": 0, "freeze_related_alerts": 0}])
+            if "FROM system_state" in sql and "GROUP BY hour_ms" in sql:
+                return pd.DataFrame([{"hour_ms": 0, "frozen_samples": 0}])
+            return pd.DataFrame()
+
+        with patch("dashboard.panels.reliability.query_df", side_effect=fake_query):
+            scoreboard = compute_reliability_scoreboard()
+
+        self.assertIn("rows", scoreboard)
+        self.assertIn("freeze_trend", scoreboard)
+        self.assertTrue(any("FROM alerts" in sql and "GROUP BY hour_ms" in sql for sql in seen_sql))
+        self.assertTrue(any("FROM system_state" in sql and "GROUP BY hour_ms" in sql for sql in seen_sql))
 
 
 if __name__ == "__main__":

@@ -30,97 +30,16 @@ from dashboard.contracts import DashboardFilters, HealthGateStatus, RefreshPolic
 from dashboard import data_access as da
 from dashboard.panels.export import render_export_panel
 from dashboard.panels.market_context import render_market_context_panel
+from dashboard.panels.overview import render_live_order_newswire
 from dashboard.panels.portfolio import render_portfolio_panel
 from dashboard.panels.rollover import render_rollover_panel
 from dashboard.panels.reliability import render_health_panel, render_logs_panel
 from dashboard.panels.replay_diff import render_replay_diff_panel
 from dashboard.panels.signals import render_signals_panel
 from dashboard.panels.staleness import render_staleness_panel
+from dashboard.ui_theme import build_theme_css, inject_global_css, pill
 
-
-TERMINAL_CSS = """
-<style>
-:root {
-  --bg:#000000;
-  --panel:transparent;
-  --muted:#9aa4b2;
-  --text:#e6edf3;
-  --border:rgba(230,237,243,0.18);
-  --accent-green:#6ee7b7;
-  --accent-amber:#facc15;
-  --accent-red:#f87171;
-}
-html, body, [class*="css"], [data-testid="stAppViewContainer"]  {
-  background-color: var(--bg) !important;
-  color: var(--text) !important;
-  font-family: "IBM Plex Mono", "Menlo", "Consolas", "Courier New", monospace !important;
-}
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background-image: repeating-linear-gradient(
-    to bottom,
-    rgba(230, 237, 243, 0.02),
-    rgba(230, 237, 243, 0.02) 1px,
-    transparent 1px,
-    transparent 3px
-  );
-}
-.block-container { padding-top: 0.8rem; }
-div[data-testid="stMetric"], div[data-testid="stMetric"] > div,
-div[data-testid="stContainer"], div[data-testid="stVerticalBlock"],
-div[data-testid="stHorizontalBlock"], div[data-testid="stTable"],
-div[data-testid="stMarkdownContainer"], section[data-testid="stSidebar"],
-[data-testid="stAppViewBlockContainer"] {
-  background: transparent !important;
-  box-shadow: none !important;
-}
-div[data-testid="stMetric"] {
-  border: 1px solid var(--border);
-  padding: 10px;
-  border-radius: 10px;
-}
-div[data-testid="stDataFrame"] {
-  background: transparent !important;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 4px;
-}
-div[data-testid="stDataFrame"] * {
-  background: transparent !important;
-  color: var(--text) !important;
-}
-div[data-testid="stMetricLabel"] p,
-div[data-testid="stMetricValue"] {
-  color: var(--text) !important;
-}
-section[data-testid="stSidebar"] { border-right: 1px solid var(--border); }
-h1,h2,h3 { color: var(--text) !important; }
-small, .muted { color: var(--muted) !important; }
-.alert { background:rgba(248,113,113,0.08); border:1px solid var(--accent-red); padding:8px 10px; border-radius:10px; }
-.ok { background:rgba(110,231,183,0.06); border:1px solid var(--accent-green); padding:8px 10px; border-radius:10px; }
-.warn { background:rgba(250,204,21,0.06); border:1px solid var(--accent-amber); padding:8px 10px; border-radius:10px; }
-.topbar { border:1px solid var(--border); border-radius:12px; background:transparent; padding:12px; margin-bottom:10px; }
-.readonly-btn {
-  border:1px dashed var(--accent-amber);
-  background:rgba(250,204,21,0.06);
-  color:var(--text);
-  padding:8px;
-  border-radius:10px;
-}
-div[data-baseweb="tab-list"] {
-  background: transparent !important;
-}
-button[data-baseweb="tab"] {
-  border: 1px solid var(--border) !important;
-  border-radius: 8px !important;
-  margin-right: 6px !important;
-}
-hr { border: none; border-top: 1px solid var(--border); }
-</style>
-"""
+TERMINAL_CSS = build_theme_css()
 
 
 CODE_TO_HUMAN = {
@@ -159,6 +78,26 @@ def _status_class(level: str) -> str:
     if token in {"DEGRADED", "WARN", "CAUTION", "BOOTING", "PARTIAL", "UNKNOWN"}:
         return "warn"
     return "ok"
+
+
+def trader_tab_labels() -> List[str]:
+    return ["Health", "Signals", "Inventory & Quotes", "Portfolio", "Microstructure", "Logs"]
+
+
+def trader_toolbar_groups() -> Dict[str, List[str]]:
+    return {
+        "left": ["View Mode", "Market", "Time Window"],
+        "middle": ["Auto refresh", "Refresh interval (ms)", "Rows"],
+        "right": ["Token", "Alert Severity", "Strategy filter", "Signals with EV > 0", "Gate = ALLOW only"],
+    }
+
+
+def hero_card_layout_contract() -> Dict[str, List[str]]:
+    return {
+        "row1": ["Polymarket Terminal", "View Mode pill", "Runtime pill"],
+        "row2": ["Mode pill", "State pill", "Readiness pill"],
+        "row3": ["Status line"],
+    }
 
 
 DB_PATH = da.resolve_db_path()
@@ -1116,58 +1055,191 @@ def should_refresh_heavy(tick: int, policy: RefreshPolicy) -> bool:
     return tick % max(policy.heavy_every_ticks, 1) == 0
 
 
+def _runtime_label() -> str:
+    row = query_df(
+        """
+        SELECT payload_json
+        FROM system_state
+        ORDER BY as_of_ts DESC
+        LIMIT 1
+        """
+    )
+    if row.empty:
+        return "Runtime: unknown"
+    payload = da.safe_json(safe_first(row, "payload_json", "{}"))
+    run_id = str(payload.get("run_id") or "").strip()
+    if run_id:
+        return f"Runtime: {run_id}"
+    slug = str(payload.get("market_slug") or "").strip()
+    if slug:
+        return f"Runtime: {slug}"
+    return "Runtime: unknown"
+
+
+def build_trader_metric_display(metrics: TopBarMetrics) -> List[Tuple[str, str]]:
+    values = [
+        ("Decisions", str(metrics.decisions_1h)),
+        ("Signals", str(metrics.signals_1h)),
+        ("Fills / Rejects", f"{metrics.fills_1h}/{metrics.rejects_1h}"),
+        ("Hedge", _fmt_ratio(metrics.hedge_completeness)),
+    ]
+    if abs(metrics.net_yes) + abs(metrics.net_no) + abs(metrics.net_usd_exposure) < 1e-9:
+        values.append(("Exposure", "No open positions"))
+    else:
+        values.extend(
+            [
+                ("Net YES", f"{metrics.net_yes:.3f}"),
+                ("Net NO", f"{metrics.net_no:.3f}"),
+                ("USD exposure", f"{metrics.net_usd_exposure:.3f}"),
+            ]
+        )
+    return values
+
+
+def build_paper_limit_summary(snapshot: Dict[str, Any]) -> List[Tuple[str, str]]:
+    if not snapshot.get("available"):
+        return [("Paper limits", "Unavailable"), ("Runtime snapshot", "Waiting for PAPER telemetry")]
+    profile = dict(snapshot.get("profile") or {})
+    utilization = dict(snapshot.get("utilization") or {})
+    return [
+        (
+            "Order rate",
+            f"{int(utilization.get('orders_per_min', 0))}/{int(profile.get('max_orders_per_min', 0))} per min",
+        ),
+        (
+            "Cancel rate",
+            f"{int(utilization.get('cancels_per_min', 0))}/{int(profile.get('max_cancels_per_min', 0))} per min",
+        ),
+        (
+            "Daily notional",
+            f"${float(utilization.get('daily_notional_usdc', 0.0)):.2f}/${float(profile.get('max_daily_notional_usdc', 0.0)):.2f}",
+        ),
+        (
+            "Daily loss",
+            f"${float(utilization.get('daily_loss_usdc', 0.0)):.2f}/${float(profile.get('max_daily_loss_usdc', 0.0)):.2f}",
+        ),
+    ]
+
+
+def build_paper_limit_status(snapshot: Dict[str, Any]) -> str:
+    if not snapshot.get("available"):
+        return "Paper limits not yet published by runtime"
+    utilization = dict(snapshot.get("utilization") or {})
+    reasons = [str(code) for code in utilization.get("active_risk_reasons", []) if str(code).strip()]
+    if reasons:
+        return "Paper risk blocks active: " + ", ".join(reasons)
+    if snapshot.get("stale"):
+        return "Paper limits snapshot is stale"
+    return f"Paper limits healthy - {int(utilization.get('open_quote_count', 0))} open quote(s)"
+
+
+def _render_paper_limits_summary(view_mode: ViewMode) -> None:
+    assert st is not None
+    snapshot = da.get_latest_runtime_risk_snapshot()
+    st.markdown("**Paper Limits**")
+    cols = st.columns(2, gap="small")
+    for idx, (label, value) in enumerate(build_paper_limit_summary(snapshot)):
+        cols[idx % 2].metric(label, value)
+    status_text = build_paper_limit_status(snapshot)
+    status_class = (
+        "warn"
+        if (not snapshot.get("available")) or snapshot.get("stale") or "active:" in status_text.lower() or "blocks active" in status_text.lower()
+        else "ok"
+    )
+    st.markdown(f'<div class="{status_class}">{status_text}</div>', unsafe_allow_html=True)
+    if is_developer_mode(view_mode) and snapshot.get("available"):
+        profile = dict(snapshot.get("profile") or {})
+        util = dict(snapshot.get("utilization") or {})
+        st.caption(
+            " | ".join(
+                [
+                    f"single_level={bool(profile.get('single_level_quoting'))}",
+                    f"fill_model={profile.get('fill_model') or 'book_vwap'}",
+                    f"latency_ms={profile.get('sim_latency_ms') if profile.get('sim_latency_ms') is not None else 0}",
+                    f"fee_mode={profile.get('sim_fee_mode') or 'unknown'}",
+                    f"orders_ratio={float(util.get('orders_per_min_ratio', 0.0)) * 100.0:.1f}%",
+                    f"cancels_ratio={float(util.get('cancels_per_min_ratio', 0.0)) * 100.0:.1f}%",
+                ]
+            )
+        )
+
+
 def _build_filters() -> Tuple[DashboardFilters, RefreshPolicy, ViewMode]:
     assert st is not None
-    st.sidebar.header("Controls")
+    toolbar_groups = trader_toolbar_groups()
     stored_view = _normalize_view_mode(str(st.session_state.get("view_mode", "trader")))
-    selected_view = st.sidebar.radio(
-        "View Mode",
-        ["Trader", "Developer"],
-        index=0 if stored_view == "trader" else 1,
-        horizontal=True,
-    )
-    view_mode: ViewMode = _normalize_view_mode(selected_view)
-    st.session_state["view_mode"] = view_mode
 
     markets_df = query_df(
         "SELECT market, MAX(ts_ms) AS max_ts FROM decisions GROUP BY market ORDER BY max_ts DESC"
     )
-    markets = ["ALL"] + markets_df["market"].dropna().astype(str).tolist() if not markets_df.empty else ["ALL"]
+    market_pairs = [("All markets", "ALL")]
+    if not markets_df.empty:
+        market_pairs.extend((value, value) for value in markets_df["market"].dropna().astype(str).tolist())
+    market_labels = [item[0] for item in market_pairs]
+    market_values = {label: value for label, value in market_pairs}
 
-    selected_market = st.sidebar.selectbox("Market", markets, index=0)
-
-    window_label = st.sidebar.selectbox("Time Window", ["5m", "15m", "1h", "6h", "24h"], index=2)
     window_map = {"5m": 5, "15m": 15, "1h": 60, "6h": 360, "24h": 1440}
+    with st.container():
+        st.markdown('<div class="pm-toolbar">', unsafe_allow_html=True)
+        left_col, middle_col, right_col = st.columns([3, 3, 4], gap="small")
 
-    st.sidebar.divider()
-    auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
-    refresh_ms = st.sidebar.selectbox("Refresh interval (ms)", [1000, 1500, 2000], index=0)
-    heavy_every_ticks = 5
-    tokens = _selected_market_tokens(selected_market)
-    selected_token = "ALL"
-    lookback_rows = 200
-    severity_filter = "ALL"
-    strategy_filter = ""
-    positive_ev_only = False
-    allow_only = False
+        with left_col:
+            selected_view = st.radio(
+                toolbar_groups["left"][0],
+                ["Trader", "Developer"],
+                index=0 if stored_view == "trader" else 1,
+                horizontal=True,
+                key="toolbar_view_mode",
+            )
+            view_mode = _normalize_view_mode(selected_view)
+            st.session_state["view_mode"] = view_mode
+            selected_market_label = st.selectbox(toolbar_groups["left"][1], market_labels, index=0, key="toolbar_market")
+            selected_market = market_values[selected_market_label]
+            window_label = st.selectbox(toolbar_groups["left"][2], ["5m", "15m", "1h", "6h", "24h"], index=2, key="toolbar_window")
+
+        tokens = _selected_market_tokens(selected_market)
+        token_pairs = [("All tokens", "ALL")] + [(token, token) for token in tokens]
+        token_labels = [item[0] for item in token_pairs]
+        token_values = {label: value for label, value in token_pairs}
+        severity_pairs = [("All severities", "ALL"), ("critical", "critical"), ("warn", "warn"), ("info", "info")]
+        severity_labels = [item[0] for item in severity_pairs]
+        severity_values = {label: value for label, value in severity_pairs}
+
+        with middle_col:
+            auto_refresh = st.checkbox(toolbar_groups["middle"][0], value=True, key="toolbar_autorefresh")
+            refresh_ms = st.selectbox(toolbar_groups["middle"][1], [1000, 1500, 2000], index=0, key="toolbar_refresh_ms")
+            lookback_rows = st.slider(toolbar_groups["middle"][2], 50, 2000, 200, step=50, key="toolbar_rows")
+
+        with right_col:
+            selected_token_label = st.selectbox(toolbar_groups["right"][0], token_labels, index=0, key="toolbar_token")
+            selected_token = token_values[selected_token_label]
+            severity_label = st.selectbox(toolbar_groups["right"][1], severity_labels, index=0, key="toolbar_severity")
+            severity_filter = severity_values[severity_label]
+            strategy_filter = st.text_input(toolbar_groups["right"][2], value="", key="toolbar_strategy")
+            c1, c2 = st.columns(2)
+            with c1:
+                positive_ev_only = st.checkbox(toolbar_groups["right"][3], value=False, key="toolbar_ev_only")
+            with c2:
+                allow_only = st.checkbox(toolbar_groups["right"][4], value=False, key="toolbar_allow_only")
+            heavy_every_ticks = st.number_input(
+                "Heavy panels every N ticks",
+                min_value=2,
+                max_value=10,
+                value=5,
+                step=1,
+                key="toolbar_heavy_ticks",
+            )
+            st.markdown(f'<span class="pm-meta">{pill(f"heavy={int(heavy_every_ticks)}", "ok")}</span>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    view_mode = _normalize_view_mode(str(st.session_state.get("view_mode", "trader")))
 
     if is_developer_mode(view_mode):
-        selected_token = st.sidebar.selectbox("Token", ["ALL"] + tokens, index=0)
-        lookback_rows = st.sidebar.slider("Rows", 50, 2000, 200, step=50)
-        severity_filter = st.sidebar.selectbox("Alert Severity", ["ALL", "critical", "warn", "info"], index=0)
-        strategy_filter = st.sidebar.text_input("Strategy filter", value="")
-        positive_ev_only = st.sidebar.checkbox("Signals with EV > 0", value=False)
-        allow_only = st.sidebar.checkbox("Gate = ALLOW only", value=False)
-        heavy_every_ticks = st.sidebar.slider("Heavy chart every N ticks", 2, 10, 5)
-    else:
-        advanced = st.sidebar.expander("Advanced", expanded=False)
-        selected_token = advanced.selectbox("Token", ["ALL"] + tokens, index=0)
-        lookback_rows = advanced.slider("Rows", 50, 2000, 200, step=50)
-        severity_filter = advanced.selectbox("Alert Severity", ["ALL", "critical", "warn", "info"], index=0)
-        strategy_filter = advanced.text_input("Strategy filter", value="")
-        positive_ev_only = advanced.checkbox("Signals with EV > 0", value=False)
-        allow_only = advanced.checkbox("Gate = ALLOW only", value=False)
-        heavy_every_ticks = advanced.slider("Heavy chart every N ticks", 2, 10, 5)
+        st.sidebar.header("Developer Controls")
+        st.sidebar.caption("Additional diagnostics controls stay visible in Developer mode.")
+        st.sidebar.write(f"Market: {selected_market}")
+        st.sidebar.write(f"Token: {selected_token}")
+        st.sidebar.write(f"Rows: {lookback_rows}")
 
     policy = RefreshPolicy(
         auto_refresh=auto_refresh,
@@ -1226,6 +1298,7 @@ def _render_topbar(
     reasons = ", ".join(format_trader_reason(reason, None, None) for reason in metrics.freeze_reasons) if metrics.freeze_reasons else "none"
     market_label = label_token(label_registry, metrics.market_slug, None)["market_label"]
     market_text = f"{market_label} - closes in {metrics.time_to_window_end}"
+    runtime_text = _runtime_label()
 
     c_details = (health_map.get("C").details if health_map.get("C") is not None else {}) if health_map else {}
     spread_bps = c_details.get("latest_spread_bps") if isinstance(c_details, dict) else None
@@ -1242,74 +1315,66 @@ def _render_topbar(
         if reasons != "none":
             state_line = f"{state_line} | {reasons}"
 
-    st.markdown('<div class="topbar">', unsafe_allow_html=True)
+    st.markdown('<div class="pm-card">', unsafe_allow_html=True)
+    row1_left, row1_right = st.columns([3, 2], gap="small")
+    row1_left.markdown('<div class="pm-title">Polymarket Terminal</div>', unsafe_allow_html=True)
+    row1_right.markdown(
+        f'{pill("Developer" if is_developer_mode(view_mode) else "Trader", "ok")} {pill(runtime_text, "warn")}',
+        unsafe_allow_html=True,
+    )
+
+    row2 = st.columns(3, gap="small")
+    row2[0].markdown(f"{pill(f'Mode: {metrics.mode}', 'ok')}", unsafe_allow_html=True)
+    row2[1].markdown(f"{pill(f'State: {freeze_label}', freeze_class)}", unsafe_allow_html=True)
+    row2[2].markdown(f"{pill(f'Readiness: {metrics.readiness_state}', _status_class(metrics.readiness_state))}", unsafe_allow_html=True)
+
+    status_class = "pm-status alert" if freeze_class == "alert" else "pm-status"
+    st.markdown(f'<div class="{status_class}">{state_line}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="pm-meta">{market_text}</div>', unsafe_allow_html=True)
 
     if is_developer_mode(view_mode):
-        st.markdown(
-            f'<div class="{freeze_class}"><b>Mode:</b> {metrics.mode} &nbsp; <b>State:</b> {freeze_label} '
-            f'&nbsp; <b>Readiness:</b> {metrics.readiness_state} &nbsp; <b>Status:</b> {state_line}</div>',
-            unsafe_allow_html=True,
+        st.caption(
+            f"P*_age cur/p95={_fmt_ms(metrics.pstar_age_current_ms)}/{_fmt_ms(metrics.pstar_age_p95_5m_ms)} | "
+            f"ws_lag cur/p95={_fmt_ms(metrics.ws_lag_current_ms)}/{_fmt_ms(metrics.ws_lag_p95_5m_ms)} | "
+            f"ack p50/p95={_fmt_ms(metrics.ack_p50_5m_ms)}/{_fmt_ms(metrics.ack_p95_5m_ms)} | "
+            f"signal_age p95={_fmt_ms(metrics.signal_age_p95_5m_ms)}"
         )
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Market", metrics.market_slug)
-        c2.metric("Tokens", str(len(metrics.token_ids)))
-        c3.metric("Window End ETA", metrics.time_to_window_end)
-        c4.metric("P*_age_ms cur/p95", f"{_fmt_ms(metrics.pstar_age_current_ms)}/{_fmt_ms(metrics.pstar_age_p95_5m_ms)}")
-        c5.metric("ws_lag_ms cur/p95", f"{_fmt_ms(metrics.ws_lag_current_ms)}/{_fmt_ms(metrics.ws_lag_p95_5m_ms)}")
-        c6.metric("ack_ms p50/p95", f"{_fmt_ms(metrics.ack_p50_5m_ms)}/{_fmt_ms(metrics.ack_p95_5m_ms)}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        q1, q2, q3, q4, q5, q6 = st.columns(6)
-        q1.metric("signal_age_ms p95", _fmt_ms(metrics.signal_age_p95_5m_ms))
-        q2.metric("decisions (1h)", metrics.decisions_1h)
-        q3.metric("signals (1h)", metrics.signals_1h)
-        q4.metric("cancels/replaces", f"{metrics.cancels_1h}/{metrics.replaces_1h}")
-        q5.metric("fills/rejects", f"{metrics.fills_1h}/{metrics.rejects_1h}")
-        q6.metric("hedge completeness", _fmt_ratio(metrics.hedge_completeness))
 
-        i1, i2, i3 = st.columns(3)
-        i1.metric("net YES", f"{metrics.net_yes:.3f}")
-        i2.metric("net NO", f"{metrics.net_no:.3f}")
-        i3.metric("net USD exposure", f"{metrics.net_usd_exposure:.3f}")
-        token_preview = ", ".join(metrics.token_ids[:6]) if metrics.token_ids else "N/A"
-        st.caption(f"Token IDs: {token_preview}")
-    else:
-        b1, b2, b3 = st.columns(3)
-        b1.markdown(f'<div class="ok"><b>Mode</b><br/>{metrics.mode}</div>', unsafe_allow_html=True)
-        b2.markdown(f'<div class="{freeze_class}"><b>State</b><br/>{freeze_label}</div>', unsafe_allow_html=True)
-        b3.markdown(
-            f'<div class="{_status_class(metrics.readiness_state)}"><b>Readiness</b><br/>{metrics.readiness_state}</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="{freeze_class}"><b>Current status:</b> {state_line}</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="ok"><b>Market:</b> {market_text}</div>',
-            unsafe_allow_html=True,
-        )
-        chips = build_trader_health_chips(metrics, health_map)
-        if chips:
-            chip_cols = st.columns(max(1, min(4, len(chips))))
-            for idx, chip in enumerate(chips[:4]):
-                klass = chip.get("klass", "ok")
-                chip_cols[idx].markdown(
-                    f'<div class="{klass}"><b>{chip.get("label")}:</b> {chip.get("state")}<br/><small>{chip.get("detail")}</small></div>',
-                    unsafe_allow_html=True,
-                )
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Decisions (1h)", metrics.decisions_1h)
-        s2.metric("Signals (1h)", metrics.signals_1h)
-        s3.metric("Fills / Rejects", f"{metrics.fills_1h}/{metrics.rejects_1h}")
-        s4.metric("Hedge completeness", _fmt_ratio(metrics.hedge_completeness))
-        net_position = abs(metrics.net_yes) + abs(metrics.net_no) + abs(metrics.net_usd_exposure)
-        if net_position < 1e-9:
-            st.info(EMPTY_STATE_MESSAGES["positions"])
-        else:
-            i1, i2, i3 = st.columns(3)
-            i1.metric("Net YES", f"{metrics.net_yes:.3f}")
-            i2.metric("Net NO", f"{metrics.net_no:.3f}")
-            i3.metric("Net USD exposure", f"{metrics.net_usd_exposure:.3f}")
+def _render_market_summary_card(
+    metrics: TopBarMetrics,
+    health_map: Dict[str, HealthGateStatus],
+    view_mode: ViewMode,
+    label_registry: Dict[str, Dict[str, Any]],
+) -> None:
+    assert st is not None
+    market_label = label_token(label_registry, metrics.market_slug, None)["market_label"]
+    tradeable, reason = _latest_tradeability_summary()
+    tradeable_class = "ok" if tradeable == "YES" else "warn"
+    st.markdown('<div class="pm-card">', unsafe_allow_html=True)
+    st.markdown(f"**Market Summary**")
+    st.markdown(f'<div class="pm-meta">{market_label} - closes in {metrics.time_to_window_end}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"{pill(f'Mode {metrics.mode}', 'ok')} {pill(f'State {metrics.alert_state}', _status_class(metrics.alert_state))} "
+        f"{pill(f'Readiness {metrics.readiness_state}', _status_class(metrics.readiness_state))}",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="{tradeable_class}"><b>Tradeability:</b> {tradeable} | {reason}</div>',
+        unsafe_allow_html=True,
+    )
+    metric_items = build_trader_metric_display(metrics)
+    cols = st.columns(2, gap="small")
+    for idx, (label, value) in enumerate(metric_items):
+        cols[idx % 2].metric(label, value)
+    _render_paper_limits_summary(view_mode)
+    chips = build_trader_health_chips(metrics, health_map)
+    if chips and not is_developer_mode(view_mode):
+        st.markdown("**Health Snapshot**")
+        for chip in chips[:4]:
+            chip_text = f"{chip['label']}: {chip['state']} ({chip['detail']})"
+            st.markdown(pill(chip_text, chip.get("klass", "warn")), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1321,36 +1386,14 @@ def _render_overview(
 ) -> None:
     assert st is not None
     start_ts, _ = _time_filter(filters.window_minutes)
+    _render_paper_limits_summary(view_mode)
+    render_live_order_newswire(filters, view_mode, label_registry)
 
     decisions = adapt_decisions(
         query_df(
             """
             SELECT ts_ms, decision_id, market, token_id, action, reason_codes, p_hat, expected_edge, expected_cost, policy_json
             FROM decisions
-            WHERE ts_ms >= ?
-            ORDER BY ts_ms DESC
-            LIMIT ?
-            """,
-            (start_ts, max(filters.lookback_rows, 100)),
-        )
-    )
-    orders = adapt_orders(
-        query_df(
-            """
-            SELECT ts_ms, event_id, order_id, token_id, side, price, qty, status, reason, fsm_state, post_only, payload_json
-            FROM orders
-            WHERE ts_ms >= ?
-            ORDER BY ts_ms DESC
-            LIMIT ?
-            """,
-            (start_ts, max(filters.lookback_rows, 100)),
-        )
-    )
-    fills = adapt_fills(
-        query_df(
-            """
-            SELECT ts_ms, event_id, order_id, token_id, side, fill_price, fill_qty, payload_json
-            FROM fills
             WHERE ts_ms >= ?
             ORDER BY ts_ms DESC
             LIMIT ?
@@ -1374,35 +1417,6 @@ def _render_overview(
                 "strategy": row.get("strategy"),
             }
         )
-    for _, row in orders.head(100).iterrows():
-        feed_rows.append(
-            {
-                "ts_ms": row.get("ts_ms"),
-                "type": "order",
-                "market": None,
-                "token_id": row.get("token_id"),
-                "event": row.get("event_kind"),
-                "details": row.get("status"),
-                "p_hat": None,
-                "ev": None,
-                "strategy": row.get("fsm_state"),
-            }
-        )
-    for _, row in fills.head(100).iterrows():
-        fill_label = "hedge_fill" if bool(row.get("is_hedge")) else "primary_fill"
-        feed_rows.append(
-            {
-                "ts_ms": row.get("ts_ms"),
-                "type": "fill",
-                "market": None,
-                "token_id": row.get("token_id"),
-                "event": fill_label,
-                "details": f"price={row.get('fill_price')} qty={row.get('fill_qty')}",
-                "p_hat": None,
-                "ev": None,
-                "strategy": None,
-            }
-        )
 
     feed_df = pd.DataFrame(feed_rows)
     if not feed_df.empty:
@@ -1417,7 +1431,7 @@ def _render_overview(
             unsafe_allow_html=True,
         )
 
-    st.subheader("Live Feed")
+    st.subheader("Decision Feed")
     if not feed_df.empty:
         feed_df["ts"] = pd.to_datetime(feed_df["ts_ms"], unit="ms", utc=True)
         labels = feed_df.apply(lambda row: label_token(label_registry, row.get("market"), row.get("token_id")), axis=1)
@@ -1768,9 +1782,7 @@ def render_dashboard() -> None:
         raise RuntimeError("streamlit_not_installed")
 
     st.set_page_config(page_title="Polymarket Terminal", layout="wide")
-    st.markdown(TERMINAL_CSS, unsafe_allow_html=True)
-    st.title("Polymarket Terminal")
-    st.caption("Retro operator console for SQLite runtime telemetry and A-E safety gates.")
+    inject_global_css(st)
 
     if _runtime_schema_missing():
         st.markdown(
@@ -1782,38 +1794,41 @@ def render_dashboard() -> None:
 
     topbar_slot = st.empty()
     status_slot = st.empty()
+    summary_slot = None
 
     if is_developer_mode(view_mode):
         tab_overview, tab_rollover, tab_health, tab_signals, tab_inventory, tab_portfolio, tab_micro, tab_logs = st.tabs(
-            ["Overview", "Rollover", "Health (A-E)", "Signals", "Inventory & Quotes", "Portfolio", "Microstructure", "Logs"]
+            ["Overview", "Rollover / WS Subscribe", "Health (A-E)", "Signals", "Inventory & Quotes", "Portfolio", "Microstructure", "Logs"]
         )
     else:
-        tab_overview, tab_health, tab_signals, tab_inventory, tab_micro, tab_logs = st.tabs(
-            ["Overview", "Health (A-E)", "Signals", "Inventory & Quotes", "Microstructure", "Logs"]
-        )
+        left_col, right_col = st.columns([1, 2], gap="large")
+        with left_col:
+            summary_slot = st.empty()
+        with right_col:
+            tab_health, tab_signals, tab_inventory, tab_portfolio, tab_micro, tab_logs = st.tabs(trader_tab_labels())
         tab_rollover = None
-        tab_portfolio = None
+        tab_overview = None
 
-    with tab_overview:
-        overview_slot = st.empty()
+    overview_slot = None
+    if tab_overview is not None:
+        with tab_overview:
+            overview_slot = st.empty()
     with tab_health:
         health_slot = st.empty()
     with tab_signals:
         signals_slot = st.empty()
     with tab_inventory:
         inventory_slot = st.empty()
+    with tab_portfolio:
+        portfolio_slot = st.empty()
     with tab_micro:
         micro_slot = st.empty()
     with tab_logs:
         logs_slot = st.empty()
     rollover_slot = None
-    portfolio_slot = None
     if tab_rollover is not None:
         with tab_rollover:
             rollover_slot = st.empty()
-    if tab_portfolio is not None:
-        with tab_portfolio:
-            portfolio_slot = st.empty()
 
     use_fragment = bool(policy.auto_refresh and hasattr(st, "fragment"))
 
@@ -1828,16 +1843,20 @@ def render_dashboard() -> None:
             _render_topbar(metrics, health, view_mode, label_registry)
         with status_slot.container():
             st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
+        if summary_slot is not None:
+            with summary_slot.container():
+                _render_market_summary_card(metrics, health, view_mode, label_registry)
 
         start_ts, end_ts = _time_filter(filters.window_minutes)
 
-        with overview_slot.container():
-            _render_panel(
-                "market_context",
-                lambda: render_market_context_panel(filters, metrics, view_mode=view_mode, label_token_fn=lambda market, token: label_token(label_registry, market, token)),
-                budget_ms=200,
-            )
-            _render_panel("overview", lambda: _render_overview(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
+        if overview_slot is not None:
+            with overview_slot.container():
+                _render_panel(
+                    "market_context",
+                    lambda: render_market_context_panel(filters, metrics, view_mode=view_mode, label_token_fn=lambda market, token: label_token(label_registry, market, token)),
+                    budget_ms=200,
+                )
+                _render_panel("overview", lambda: _render_overview(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
 
         if rollover_slot is not None:
             with rollover_slot.container():
@@ -1890,13 +1909,18 @@ def render_dashboard() -> None:
         with inventory_slot.container():
             _render_panel("inventory", lambda: _render_inventory_quotes(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
 
-        if portfolio_slot is not None:
-            with portfolio_slot.container():
-                _render_panel(
-                    "portfolio",
-                    lambda: render_portfolio_panel(filters, start_ts, end_ts),
-                    budget_ms=450,
-                )
+        with portfolio_slot.container():
+            _render_panel(
+                "portfolio",
+                lambda: render_portfolio_panel(
+                    filters,
+                    start_ts,
+                    end_ts,
+                    view_mode=view_mode,
+                    label_token_fn=lambda market, token: label_token(label_registry, market, token),
+                ),
+                budget_ms=450,
+            )
 
         with micro_slot.container():
             _render_panel("microstructure", lambda: _render_microstructure(filters, heavy_refresh, view_mode, label_registry), budget_ms=500)

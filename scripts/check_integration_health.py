@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -44,6 +44,8 @@ def _build_report(
     now_ms: int,
     clock_drift_max_ms: float,
     ws_starvation_max_ms: float,
+    min_liveness_green_pct: float = 95.0,
+    min_pstar_valid_dwell_pct: float = 98.0,
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "window": {"start_ts_ms": int(lookback_start_ms), "end_ts_ms": int(now_ms)},
@@ -57,6 +59,7 @@ def _build_report(
         "pstar_state_counts": {},
         "pstar_valid_dwell_pct": 0.0,
         "a_invalid_alert_count": 0,
+        "failed_checks": [],
     }
 
     required = ["liveness_stats", "reconciliation_stats", "alerts", "rollover_metrics"]
@@ -217,11 +220,16 @@ def _build_report(
             abort_by_reason[reason] = int(abort_by_reason.get(reason, 0)) + 1
             if reason == "CONFIRM_TIMEOUT":
                 confirm_timeout_count += 1
+        intent_count = 0
         report["rollover"] = {
             "commit_count": int(commit_count),
+            "intent_count": int(intent_count),
             "confirm_timeout_count": int(confirm_timeout_count),
             "abort_by_reason": {key: abort_by_reason[key] for key in sorted(abort_by_reason.keys())},
         }
+        for event_type, _payload_json in rows:
+            if str(event_type or "") == "INTENT":
+                report["rollover"]["intent_count"] = int(report["rollover"].get("intent_count", 0) + 1)
 
     if _table_exists(cx, "pstar"):
         rows = cx.execute(
@@ -290,7 +298,73 @@ def _build_report(
         if report.get("liveness", {}).get("green_pct", 100.0) < 100.0:
             unexplained += 1
     report["unexplained_freeze_count"] = int(unexplained)
-    if missing or unexplained > 0:
+    failed_checks: List[Dict[str, Any]] = []
+    for table in sorted(missing):
+        failed_checks.append(
+            {
+                "code": "MISSING_TABLE",
+                "metric": str(table),
+                "threshold": "present",
+                "observed": "missing",
+                "window": "latest",
+            }
+        )
+    if report.get("unknown_rate_health", {}).get("status") == "CRITICAL":
+        failed_checks.append(
+            {
+                "code": "UNKNOWN_RATE_CRITICAL",
+                "metric": "unknown_rate_health",
+                "threshold": "!=CRITICAL",
+                "observed": "CRITICAL",
+                "window": "latest",
+            }
+        )
+    liveness = report.get("liveness", {})
+    if int(liveness.get("sample_count", 0)) > 0 and float(liveness.get("green_pct", 0.0)) < float(min_liveness_green_pct):
+        failed_checks.append(
+            {
+                "code": "LIVENESS_GREEN_PCT",
+                "metric": "green_pct",
+                "threshold": float(min_liveness_green_pct),
+                "observed": float(liveness.get("green_pct", 0.0)),
+                "window": "lookback",
+            }
+        )
+    if report.get("pstar_state_counts"):
+        if float(report.get("pstar_valid_dwell_pct", 0.0)) < float(min_pstar_valid_dwell_pct):
+            failed_checks.append(
+                {
+                    "code": "PSTAR_VALID_DWELL_PCT",
+                    "metric": "pstar_valid_dwell_pct",
+                    "threshold": float(min_pstar_valid_dwell_pct),
+                    "observed": float(report.get("pstar_valid_dwell_pct", 0.0)),
+                    "window": "lookback",
+                }
+            )
+    rollover = report.get("rollover", {})
+    if int(rollover.get("intent_count", 0)) > 0 and int(rollover.get("commit_count", 0)) == 0:
+        failed_checks.append(
+            {
+                "code": "ROLLOVER_ZERO_COMMITS",
+                "metric": "commit_count",
+                "threshold": ">=1 when intents>0",
+                "observed": int(rollover.get("commit_count", 0)),
+                "window": "lookback",
+            }
+        )
+    if unexplained > 0:
+        failed_checks.append(
+            {
+                "code": "UNEXPLAINED_FREEZE",
+                "metric": "unexplained_freeze_count",
+                "threshold": 0,
+                "observed": int(unexplained),
+                "window": "lookback",
+            }
+        )
+    failed_checks.sort(key=lambda row: (str(row.get("code")), str(row.get("window")), str(row.get("metric"))))
+    report["failed_checks"] = failed_checks
+    if failed_checks:
         report["status"] = "FAIL"
     return report
 
@@ -306,6 +380,8 @@ def main() -> None:
     trading = constitution.get("trading", {}) if isinstance(constitution, dict) else {}
     clock_drift_max_ms = float(trading.get("clock_drift_max_ms", 250.0))
     ws_starvation_max_ms = float(trading.get("ws_starvation_max_ms", 5000.0))
+    min_liveness_green_pct = float(trading.get("integration_min_liveness_green_pct", 95.0))
+    min_pstar_valid_dwell_pct = float(trading.get("integration_min_pstar_valid_dwell_pct", 98.0))
 
     now_ms = int(time.time() * 1000)
     lookback_start_ms = int(now_ms - max(1, int(args.lookback_hours)) * 3_600_000)
@@ -318,6 +394,8 @@ def main() -> None:
             now_ms=now_ms,
             clock_drift_max_ms=clock_drift_max_ms,
             ws_starvation_max_ms=ws_starvation_max_ms,
+            min_liveness_green_pct=min_liveness_green_pct,
+            min_pstar_valid_dwell_pct=min_pstar_valid_dwell_pct,
         )
     finally:
         cx.close()

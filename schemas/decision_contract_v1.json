@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "decision_contract_v1",
+  "title": "Decision Contract V1",
+  "type": "object",
+  "required": [
+    "decision_id",
+    "as_of_ts_ms",
+    "action",
+    "reasons",
+    "evidence",
+    "outputs",
+    "mode",
+    "gate_version"
+  ],
+  "properties": {
+    "decision_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "as_of_ts_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "action": {
+      "type": "string",
+      "enum": ["ALLOW", "BLOCK"]
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["pointers"],
+      "properties": {
+        "pointers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "mode": {
+      "type": "string",
+      "minLength": 1
+    },
+    "gate_version": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "additionalProperties": true
+}

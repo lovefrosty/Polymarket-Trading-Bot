@@ -57,6 +57,7 @@ async def resolve_markets(
     now_ts: Optional[int] = None,
     fee_rate_fetcher: Optional[Any] = None,
     discovery_summary: Optional[Dict[str, Any]] = None,
+    max_candidates_considered: Optional[int] = None,
 ) -> Tuple[List[ResolvedMarket], Dict[str, Dict[str, Any]]]:
     resolved: List[ResolvedMarket] = []
     asset_meta: Dict[str, Dict[str, Any]] = {}
@@ -124,6 +125,7 @@ async def resolve_markets(
                         market=market,
                         candidates=candidates,
                         now_ms=now_ms,
+                        max_candidates_considered=max_candidates_considered,
                     )
                 except NoActiveMarketError as exc:
                     _append_discovery_request_summary(discovery_summary, exc.request_payload)
@@ -318,6 +320,7 @@ WINDOW_SEC_15M = 900
 WINDOW_MS_15M = WINDOW_SEC_15M * 1000
 DEFAULT_BACK_WINDOWS = 2
 DEFAULT_FORWARD_WINDOWS = 16
+DEFAULT_MAX_CANDIDATES_CONSIDERED = 10
 CRYPTO_SYMBOLS = {"BTC", "ETH", "SOL", "XRP"}
 
 
@@ -778,6 +781,7 @@ def _resolve_latest_active_btc_15m_selection(
     market: MarketConfig,
     candidates: List[Dict[str, Any]],
     now_ms: int,
+    max_candidates_considered: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     requested_symbol = _discovery_symbol_for_market(market)
     resolved_pairs = [
@@ -791,6 +795,11 @@ def _resolve_latest_active_btc_15m_selection(
         now_ms=now_ms,
         n_total=len(candidates),
     )
+    max_candidates_considered = int(
+        max(1, max_candidates_considered if max_candidates_considered is not None else DEFAULT_MAX_CANDIDATES_CONSIDERED)
+    )
+    rejected_reason_counts: Dict[str, int] = {}
+    n_tradable_now = 0
     payload_base: Dict[str, Any] = {
         "event": "DISCOVERY_REQUEST",
         "requested_symbol": requested_symbol,
@@ -801,33 +810,75 @@ def _resolve_latest_active_btc_15m_selection(
         "n_btc_15m": int(diagnostics.get("n_btc_15m", 0)),
         "n_with_end_ts": int(diagnostics.get("n_with_end_ts", 0)),
         "n_active_now": int(diagnostics.get("n_active_now", 0)),
+        "n_tradable_now": int(diagnostics.get("n_tradable_now", 0)),
+        "max_candidates_considered": int(max_candidates_considered),
+        "rejected_reason_counts": dict(diagnostics.get("rejected_reason_counts", {})),
     }
-    try:
-        selected_resolved = select_latest_active_btc_15m(resolved_candidates, now_ms=now_ms)
-    except NoActiveMarketError as exc:
+    active_entries: List[Dict[str, Any]] = []
+    for candidate_resolved, candidate_raw in resolved_pairs:
+        if not _is_btc_15m_candidate(candidate_resolved):
+            continue
+        if not _has_trusted_end_ts(candidate_resolved):
+            continue
+        if not _is_candidate_active_now(candidate_resolved, now_ms):
+            continue
+        meta_state = _candidate_meta_tradability_state(candidate_raw)
+        if meta_state.startswith("NON_TRADABLE_"):
+            rejected_reason_counts[meta_state] = int(rejected_reason_counts.get(meta_state, 0) + 1)
+        if not meta_state.startswith("NON_TRADABLE_"):
+            n_tradable_now += 1
+        active_entries.append(
+            {
+                "resolved": candidate_resolved,
+                "raw": candidate_raw,
+                "meta_state": meta_state,
+            }
+        )
+    payload_base["n_tradable_now"] = int(n_tradable_now)
+    payload_base["rejected_reason_counts"] = {
+        key: int(rejected_reason_counts[key]) for key in sorted(rejected_reason_counts.keys())
+    }
+    def _select_sort_key(entry: Dict[str, Any]) -> Tuple[int, int, str, str, str]:
+        resolved = entry["resolved"]
+        assert isinstance(resolved, ResolvedMarket)
+        meta_state = str(entry.get("meta_state") or "")
+        # Known tradable first, then unknown metadata.
+        if meta_state == "KNOWN_TRADABLE":
+            meta_rank = 2
+        elif meta_state == "UNKNOWN":
+            meta_rank = 1
+        else:
+            meta_rank = 0
+        return (meta_rank, *_latest_active_btc_15m_sort_key(resolved))
+
+    active_entries.sort(key=_select_sort_key, reverse=True)
+    bounded = active_entries[: max(1, int(max_candidates_considered))]
+    selected: Optional[Dict[str, Any]] = None
+    for entry in bounded:
+        meta_state = str(entry.get("meta_state") or "")
+        if meta_state.startswith("NON_TRADABLE_"):
+            continue
+        selected = entry
+        break
+    if selected is None:
         error_payload = {
             **payload_base,
             "status": "NONE_FOUND",
             "error_code": "NO_ACTIVE_BTC_15M",
             "closest_candidates": diagnostics.get("closest_candidates", []),
+            "candidates_considered": int(len(bounded)),
         }
         raise NoActiveMarketError(
             market_key="btc_15m",
             now_ms=now_ms,
             diagnostics=diagnostics,
             request_payload=error_payload,
-        ) from exc
-
-    selected_raw: Optional[Dict[str, Any]] = None
-    selected_identity = _resolved_market_identity(selected_resolved)
-    for candidate_resolved, candidate_raw in resolved_pairs:
-        if _resolved_market_identity(candidate_resolved) == selected_identity:
-            selected_raw = candidate_raw
-            break
-    if selected_raw is None:
-        raise ValueError("selected_market_not_found_in_candidates")
-
+        )
+    selected_resolved = selected["resolved"]
+    selected_raw = selected["raw"]
+    selected_meta_state = str(selected.get("meta_state") or "UNKNOWN")
     selection_key = deterministic_market_selection_key_str(selected_raw)
+    candidate_rank = int(active_entries.index(selected) + 1)
     success_payload = {
         **payload_base,
         "status": "SELECTED",
@@ -837,6 +888,13 @@ def _resolve_latest_active_btc_15m_selection(
         "selected_condition_id": selected_resolved.condition_id,
         "selected_clobTokenIds": list(selected_resolved.token_ids),
         "selection_key": selection_key,
+        "selected_candidate_rank": int(candidate_rank),
+        "selected_tradable_meta_state": selected_meta_state,
+        "selection_witness": {
+            "time_active": True,
+            "tradable_meta_state": selected_meta_state,
+            "ws_confirm_state": "PENDING",
+        },
     }
     return selected_raw, success_payload
 
@@ -871,6 +929,22 @@ def _latest_active_btc_15m_diagnostics(
         "n_active_now": int(len(active_now)),
         "closest_candidates": [_discovery_candidate_payload(candidate) for candidate in closest],
     }
+
+
+def _candidate_meta_tradability_state(candidate: Dict[str, Any]) -> str:
+    closed = _coerce_bool(candidate.get("closed"))
+    active = _coerce_bool(candidate.get("active"))
+    accepting = _coerce_bool(candidate.get("accepting_orders") or candidate.get("acceptingOrders"))
+    if closed is True:
+        return "NON_TRADABLE_CLOSED"
+    if active is False:
+        return "NON_TRADABLE_INACTIVE"
+    if accepting is False:
+        return "NON_TRADABLE_NOT_ACCEPTING"
+    seen_metadata = closed is not None or active is not None or accepting is not None
+    if seen_metadata:
+        return "KNOWN_TRADABLE"
+    return "UNKNOWN"
 
 
 def _closest_candidate_key(candidate: ResolvedMarket, now_ms: int) -> Tuple[int, Tuple[int, int, str, str, str]]:

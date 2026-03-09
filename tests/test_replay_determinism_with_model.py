@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -119,6 +121,57 @@ class TestReplayDeterminismWithModel(unittest.TestCase):
             out_first = run_replay(output_a)
             out_second = run_replay(output_b)
             self.assertEqual(out_first, out_second)
+
+    def test_replay_certify_cli_detects_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            left_dir = Path(tmp) / "left"
+            right_dir = Path(tmp) / "right"
+            left_dir.mkdir()
+            right_dir.mkdir()
+            left_file = left_dir / "decision_20240101.jsonl"
+            right_file = right_dir / "decision_20240101.jsonl"
+            left_file.write_text(
+                json.dumps(
+                    {
+                        "t_decision_wall_ms": 1000,
+                        "token_id": "token-a",
+                        "gates": {"allow": True, "reasons": []},
+                        "fsm_state": "QUOTING_BOTH",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            right_file.write_text(
+                json.dumps(
+                    {
+                        "t_decision_wall_ms": 1000,
+                        "token_id": "token-a",
+                        "gates": {"allow": False, "reasons": ["FORCED_BLOCK"]},
+                        "fsm_state": "FROZEN",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/replay_certify.py",
+                    "--left",
+                    str(left_dir),
+                    "--right",
+                    str(right_dir),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "FAIL")
+            self.assertGreater(payload["mismatch_count"], 0)
 
 
 if __name__ == "__main__":

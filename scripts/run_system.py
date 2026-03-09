@@ -5,15 +5,17 @@ import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_EVEN
 import hashlib
 import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
+import subprocess
 import traceback
 import sys
 import time
-import uuid
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +71,18 @@ def _utc_iso_from_ms(ts_ms: int) -> str:
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _quantize_float(value: Optional[float], digits: int) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        precision = max(0, int(digits))
+    except (TypeError, ValueError):
+        precision = 0
+    quantum = Decimal("1").scaleb(-precision)
+    quantized = Decimal(str(float(value))).quantize(quantum, rounding=ROUND_HALF_EVEN)
+    return float(quantized)
 
 
 def _round_down(price: float, tick: float) -> float:
@@ -184,6 +198,18 @@ class RolloverCommitDecision:
     action: str
     force_observe_only: bool
     reason: str
+
+
+ExecutionQualityWindowRow = Tuple[
+    int,
+    str,
+    str,
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]
 
 
 class RuntimeEngine:
@@ -319,12 +345,15 @@ class RuntimeEngine:
         self._max_cancels_per_min = int(trading_cfg.get("max_cancels_per_min", 60))
         self._max_daily_loss_usdc = float(trading_cfg.get("max_daily_loss_usdc", 100.0))
         self._max_daily_notional_usdc = float(trading_cfg.get("max_daily_notional_usdc", 2000.0))
+        self._max_position_per_side = float(trading_cfg.get("max_position_per_side", 0.0))
         self._clock_drift_max_ms = float(trading_cfg.get("clock_drift_max_ms", 250.0))
         self._ws_starvation_max_ms = float(trading_cfg.get("ws_starvation_max_ms", 5000.0))
         self._econ_min_net_edge_p50_bps = float(trading_cfg.get("econ_min_net_edge_p50_bps", 0.0))
         self._econ_max_adverse_markout_5s_p95_bps = float(
             trading_cfg.get("econ_max_adverse_markout_5s_p95_bps", 20.0)
         )
+        self._signal_quantize_decimals = int(trading_cfg.get("signal_quantize_decimals", 6))
+        self._cost_quantize_decimals = int(trading_cfg.get("cost_quantize_decimals", 6))
         self._next_reconcile_due_ms: int = 0
         self._consecutive_mismatch_cycles: int = 0
         self._consecutive_onchain_disagree_cycles: int = 0
@@ -398,6 +427,27 @@ class RuntimeEngine:
         self._reference_poll_secs: float = float(reference_poll_secs if reference_poll_secs is not None else 1.0)
         self._pstar_state_by_symbol: Dict[str, str] = {}
         self._pstar_transition_counts: Dict[str, int] = defaultdict(int)
+        self._event_seq_by_stream: Dict[str, int] = defaultdict(int)
+        self._eq_stats_window_rows: Deque[ExecutionQualityWindowRow] = deque()
+        self._eq_stats_window_ms: int = 3_600_000
+        self._eq_stats_bootstrapped: bool = False
+        self._eq_stats_last_seen: Optional[Tuple[int, str]] = None
+
+    def _next_event_seq(self, stream: str) -> int:
+        key = str(stream or "runtime")
+        self._event_seq_by_stream[key] += 1
+        return int(self._event_seq_by_stream[key])
+
+    def _deterministic_event_id(self, stream: str, *, ts_ms: int, fields: Dict[str, Any]) -> str:
+        seq = self._next_event_seq(stream)
+        stable_payload = {
+            "stream": str(stream),
+            "ts_ms": int(ts_ms),
+            "fields": fields,
+        }
+        encoded = json.dumps(stable_payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+        return f"{stream}:{seq:010d}:{digest}"
 
     def on_reference(self, source: str, symbol: str, value: float, ts_event_ms: Optional[int], ts_recv_ms: int) -> None:
         event_ts = int(ts_event_ms if ts_event_ms is not None else ts_recv_ms)
@@ -603,12 +653,12 @@ class RuntimeEngine:
 
             q = self._fair_probability(token_id=token_id, symbol=symbol, snap=snap, pstar=pstar, now_ms=now_ms)
             self._last_q_by_token[token_id] = float(q)
-            depth_buy = snap.depth_at_qty("buy", target_size)
-            depth_sell = snap.depth_at_qty("sell", target_size)
-            slip_buy = snap.expected_slippage_bps("buy", target_size)
-            slip_sell = snap.expected_slippage_bps("sell", target_size)
-            eff_buy = snap.effective_spread_bps("buy", target_size)
-            eff_sell = snap.effective_spread_bps("sell", target_size)
+            depth_buy = float(_quantize_float(snap.depth_at_qty("buy", target_size), self._cost_quantize_decimals) or 0.0)
+            depth_sell = float(_quantize_float(snap.depth_at_qty("sell", target_size), self._cost_quantize_decimals) or 0.0)
+            slip_buy = _quantize_float(snap.expected_slippage_bps("buy", target_size), self._cost_quantize_decimals)
+            slip_sell = _quantize_float(snap.expected_slippage_bps("sell", target_size), self._cost_quantize_decimals)
+            eff_buy = _quantize_float(snap.effective_spread_bps("buy", target_size), self._cost_quantize_decimals)
+            eff_sell = _quantize_float(snap.effective_spread_bps("sell", target_size), self._cost_quantize_decimals)
 
             fsm = self.fsms[token_id]
             if fsm.on_rebalance_tick(now_ms) or fsm.status().state == ExecutionState.UNWINDING:
@@ -794,7 +844,10 @@ class RuntimeEngine:
             if guard_reasons:
                 reasons = sorted(set(reasons + guard_reasons))
             cap_diag = self._inventory_cap_diagnostics(token_id=token_id, q=q)
-            if bool(cap_diag.get("hard_breach", False)):
+            cap_reason_codes = [str(code) for code in cap_diag.get("reason_codes", []) if code]
+            if cap_reason_codes:
+                reasons.extend(cap_reason_codes)
+            elif bool(cap_diag.get("hard_breach", False)):
                 reasons.append("RISK_CAP_BREACH")
             elif bool(cap_diag.get("soft_breach", False)):
                 reasons.append("RISK_CAP_SOFT")
@@ -956,6 +1009,9 @@ class RuntimeEngine:
                 now_ms=now_ms,
                 token_id=token_id,
                 decision_id=decision_id,
+                action="FREEZE"
+                if ("C_BOOK_DOWN" in reasons or buy_verdict.action == "FREEZE" or sell_verdict.action == "FREEZE")
+                else ("QUOTE" if (buy_verdict.allow or sell_verdict.allow) else "SKIP"),
                 decision_ts_ms=decision_ts_event_ms,
                 max_feature_ts_ms=feature_max_ts,
                 snap=snap,
@@ -1012,6 +1068,8 @@ class RuntimeEngine:
             "readiness_payload": dict(self._startup_readiness_payload),
         }
         a_pipeline_diag = self._a_pipeline_diag(now_ms=int(now_ms))
+        paper_trading_profile = self._paper_trading_profile_snapshot(now_ms=int(now_ms))
+        paper_trading_utilization = self._paper_trading_utilization_snapshot(now_ms=int(now_ms))
         self.db.upsert_system_state(
             as_of_ts=now_ms,
             is_frozen=is_frozen_any,
@@ -1024,6 +1082,8 @@ class RuntimeEngine:
                 "freeze_reasons": freeze_reason_codes,
                 "degraded_reasons": degraded_reason_codes,
                 "a_pipeline_diag": a_pipeline_diag,
+                "paper_trading_profile": paper_trading_profile,
+                "paper_trading_utilization": paper_trading_utilization,
                 **readiness_payload,
             },
         )
@@ -1039,6 +1099,18 @@ class RuntimeEngine:
         now_ms: int,
         decision_id: str,
     ) -> None:
+        guard_reasons = self.quote_guard_reasons(token_id, int(now_ms))
+        if guard_reasons:
+            if self.mode in {"PAPER", "TRADE"}:
+                self._emit_rate_limited_alert(
+                    int(now_ms),
+                    severity="critical",
+                    code="QUOTE_GUARD_BLOCK",
+                    message=f"{token_id}:{side}:{','.join(sorted(set(guard_reasons)))}",
+                    payload={"token_id": str(token_id), "side": str(side), "reason_codes": sorted(set(guard_reasons))},
+                    dedupe_key=f"quote_guard_block:{token_id}:{side}",
+                )
+            return
         current = self.open_quotes[token_id].get(side)
         if not verdict.allow:
             if current is not None and self.mode in {"PAPER", "TRADE"} and self.broker is not None:
@@ -1251,7 +1323,7 @@ class RuntimeEngine:
         maker_order_id = unwind_state.get("maker_order_id")
         if not maker_order_id:
             maker_price = self._maker_unwind_price(token_id, side, constraint)
-            maker_order_id = f"{token_id}:unwind:maker:{uuid.uuid4().hex[:10]}"
+            maker_order_id = f"{token_id}:unwind:maker:{self._next_event_seq('unwind_maker_order'):010d}"
             maker_intent = OrderIntent(
                 order_id=maker_order_id,
                 client_order_id=f"{maker_order_id}:client",
@@ -1311,7 +1383,7 @@ class RuntimeEngine:
             unwind_state["maker_order_id"] = None
 
         taker_price = constraint.min_price if side == "sell" else constraint.max_price
-        taker_order_id = f"{token_id}:unwind:taker:{uuid.uuid4().hex[:10]}"
+        taker_order_id = f"{token_id}:unwind:taker:{self._next_event_seq('unwind_taker_order'):010d}"
         taker_intent = OrderIntent(
             order_id=taker_order_id,
             client_order_id=f"{taker_order_id}:client",
@@ -1361,13 +1433,37 @@ class RuntimeEngine:
 
     def _handle_broker_event(self, token_id: str, side: str, event: BrokerEvent, decision_id: str) -> None:
         ts_ms = int(event.payload.get("t_event_wall_ms") or _now_ms())
-        event_id = uuid.uuid4().hex
         status = str(event.payload.get("status") or event.event_type)
+        token_meta = self.market_meta.get(token_id) or {}
+        market_slug = str(token_meta.get("slug") or token_meta.get("market_slug") or "")
+        condition_id = str(token_meta.get("condition_id") or "")
+        reason_code = str(event.payload.get("error_code") or event.payload.get("reason_code") or "")
+        event_id = str(
+            event.payload.get("event_id")
+            or event.payload.get("broker_event_id")
+            or self._deterministic_event_id(
+                "orders",
+                ts_ms=ts_ms,
+                fields={
+                    "order_id": str(event.order_id),
+                    "event_type": str(event.event_type),
+                    "token_id": str(token_id),
+                    "side": str(side),
+                    "status": str(status),
+                    "reason_code": str(reason_code),
+                    "decision_id": str(decision_id),
+                },
+            )
+        )
         self.db.insert(
             "orders",
             {
                 "ts_ms": ts_ms,
                 "event_id": event_id,
+                "run_id": self.run_id,
+                "mode": self.mode,
+                "market_slug": market_slug,
+                "condition_id": condition_id,
                 "order_id": event.order_id,
                 "client_order_id": str(event.payload.get("client_order_id") or ""),
                 "token_id": token_id,
@@ -1378,6 +1474,7 @@ class RuntimeEngine:
                 "tif": str(event.payload.get("time_in_force") or "GTC"),
                 "status": status,
                 "reason": str(event.payload.get("reason") or ""),
+                "reason_code": reason_code,
                 "quote_group_id": str(event.payload.get("quote_group_id") or ""),
                 "idempotency_key": str(event.payload.get("idempotency_key") or ""),
                 "fsm_state": self.fsms[token_id].status().state.value,
@@ -1405,7 +1502,17 @@ class RuntimeEngine:
                     "exec_latency",
                     {
                         "ts_ms": ts_ms,
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "exec_latency",
+                            ts_ms=ts_ms,
+                            fields={
+                                "decision_id": str(decision_id),
+                                "token_id": str(token_id),
+                                "order_id": str(event.order_id),
+                                "metric": "send_ack_ms",
+                                "value": float(max(0, ack_ts - send_ts)),
+                            },
+                        ),
                         "decision_id": decision_id,
                         "token_id": token_id,
                         "signal_age_ms": None,
@@ -1423,13 +1530,33 @@ class RuntimeEngine:
             fill_qty = float(event.payload.get("fill_size") or 0.0)
             fill_price = float(event.payload.get("fill_price") or 0.0)
             fee_bps = float(event.payload.get("fees_bps") or 0.0)
-            fill_key = str(event.payload.get("fill_event_id") or f"{event.order_id}:{fill_ts}:{fill_qty:.8f}:{side}")
+            broker_fill_event_id = str(event.payload.get("fill_event_id") or "")
+            fill_key = self._fill_event_key(
+                event_id=broker_fill_event_id,
+                order_id=str(event.order_id),
+                token_id=str(token_id),
+                side=str(side),
+                fill_qty=float(fill_qty),
+                fill_price=float(fill_price),
+                fill_ts=int(fill_ts),
+            )
             if fill_key in self._seen_reconcile_fill_ids:
                 self.db.insert(
                     "recovery_events",
                     {
                         "ts_ms": int(fill_ts),
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "recovery_events",
+                            ts_ms=int(fill_ts),
+                            fields={
+                                "action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                                "order_id": str(event.order_id),
+                                "token_id": str(token_id),
+                                "side": str(side),
+                                "fill_event_key": str(fill_key),
+                                "reason": "in_memory_seen",
+                            },
+                        ),
                         "run_id": self.run_id,
                         "mode": self.mode,
                         "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
@@ -1466,7 +1593,18 @@ class RuntimeEngine:
                     "recovery_events",
                     {
                         "ts_ms": int(fill_ts),
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "recovery_events",
+                            ts_ms=int(fill_ts),
+                            fields={
+                                "action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                                "order_id": str(event.order_id),
+                                "token_id": str(token_id),
+                                "side": str(side),
+                                "fill_event_key": str(fill_key),
+                                "reason": "persistent_seen",
+                            },
+                        ),
                         "run_id": self.run_id,
                         "mode": self.mode,
                         "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
@@ -1486,12 +1624,16 @@ class RuntimeEngine:
                 )
                 return
             self._seen_reconcile_fill_ids.add(fill_key)
-            fill_event_id = str(event.payload.get("fill_event_id") or uuid.uuid4().hex)
+            fill_event_id = str(broker_fill_event_id or fill_key)
             self.db.insert(
                 "fills",
                 {
                     "ts_ms": fill_ts,
                     "event_id": fill_event_id,
+                    "run_id": self.run_id,
+                    "mode": self.mode,
+                    "market_slug": market_slug,
+                    "condition_id": condition_id,
                     "order_id": event.order_id,
                     "token_id": token_id,
                     "side": side,
@@ -1499,6 +1641,7 @@ class RuntimeEngine:
                     "fill_qty": fill_qty,
                     "fee": fee_bps,
                     "liquidity": "maker" if str(event.payload.get("mode") or "").upper() == "MAKE" else "taker",
+                    "reason_code": reason_code,
                     "payload_json": json.dumps(event.payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
                 },
             )
@@ -1537,7 +1680,17 @@ class RuntimeEngine:
                     "exec_latency",
                     {
                         "ts_ms": fill_ts,
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "exec_latency",
+                            ts_ms=fill_ts,
+                            fields={
+                                "decision_id": str(decision_id),
+                                "token_id": str(token_id),
+                                "order_id": str(event.order_id),
+                                "metric": "ack_fill_ms",
+                                "value": float(ack_fill_ms),
+                            },
+                        ),
                         "decision_id": decision_id,
                         "token_id": token_id,
                         "signal_age_ms": None,
@@ -1797,6 +1950,7 @@ class RuntimeEngine:
         now_ms: int,
         token_id: str,
         decision_id: str,
+        action: str,
         decision_ts_ms: int,
         max_feature_ts_ms: int,
         snap: BookSnapshot,
@@ -1814,7 +1968,15 @@ class RuntimeEngine:
             "decision_ticks",
             {
                 "ts_ms": int(now_ms),
-                "event_id": uuid.uuid4().hex,
+                "event_id": self._deterministic_event_id(
+                    "decision_ticks",
+                    ts_ms=int(now_ms),
+                    fields={
+                        "decision_id": str(decision_id),
+                        "token_id": str(token_id),
+                        "decision_ts_ms": int(decision_ts_ms),
+                    },
+                ),
                 "decision_ts_ms": int(decision_ts_ms),
                 "token_id": str(token_id),
                 "decision_id": str(decision_id),
@@ -1837,6 +1999,26 @@ class RuntimeEngine:
                 "allow_action": 1 if allow_action else 0,
                 "block_reason_codes": ",".join(sorted(set(block_reason_codes))),
                 "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True),
+            },
+        )
+        token_meta = self.market_meta.get(token_id) or {}
+        market_slug = str(token_meta.get("slug") or token_meta.get("market_slug") or token_id)
+        self.db.append_decision_trace(
+            ts_ms=int(now_ms),
+            decision_id=str(decision_id),
+            token_id=str(token_id),
+            market_slug=market_slug,
+            action=str(action),
+            allow_action=bool(allow_action),
+            input_asof_ts_ms=int(max_feature_ts_ms),
+            gate_reason_codes=list(block_reason_codes),
+            payload={
+                "book_asof_ts_ms": _maybe_int(book_asof_ts_ms),
+                "pstar_asof_ts_ms": _maybe_int(pstar_asof_ts_ms),
+                "ws_lag_ms": _maybe_float(ws_lag_ms),
+                "pstar_age_ms": _maybe_float(pstar_age_ms),
+                "signal_age_ms": _maybe_float(signal_age_ms),
+                "book_health_state": str(snap.book_health_state or ""),
             },
         )
 
@@ -1910,7 +2092,17 @@ class RuntimeEngine:
             "recovery_events",
             {
                 "ts_ms": int(ts_ms),
-                "event_id": uuid.uuid4().hex,
+                "event_id": self._deterministic_event_id(
+                    "recovery_events",
+                    ts_ms=int(ts_ms),
+                    fields={
+                        "action": "FSM_TRANSITION",
+                        "token_id": str(token_id),
+                        "prev_state": str(prev_state),
+                        "new_state": str(new_state),
+                        "reason": str(reason),
+                    },
+                ),
                 "run_id": self.run_id,
                 "mode": self.mode,
                 "recovery_action": "FSM_TRANSITION",
@@ -1953,7 +2145,14 @@ class RuntimeEngine:
             "microstructure_stats",
             {
                 "ts_ms": int(now_ms),
-                "event_id": uuid.uuid4().hex,
+                "event_id": self._deterministic_event_id(
+                    "microstructure_stats",
+                    ts_ms=int(now_ms),
+                    fields={
+                        "token_id": str(token_id),
+                        "book_health": str(book_health),
+                    },
+                ),
                 "token_id": token_id,
                 "book_health": str(book_health),
                 "spread_bps": _maybe_float(spread_bps),
@@ -2017,7 +2216,18 @@ class RuntimeEngine:
         send_ts = _maybe_int(self.send_ts_by_order.get(order_id))
         ack_ts = _maybe_int(self.ack_ts_by_order.get(order_id))
         pending = ExecutionAttributionPending(
-            event_id=uuid.uuid4().hex,
+            event_id=self._deterministic_event_id(
+                "execution_quality",
+                ts_ms=int(fill_ts_ms),
+                fields={
+                    "token_id": str(token_id),
+                    "order_id": str(order_id),
+                    "side": str(side),
+                    "fill_ts_ms": int(fill_ts_ms),
+                    "fill_price": float(fill_price),
+                    "fill_qty": float(fill_qty),
+                },
+            ),
             token_id=str(token_id),
             order_id=str(order_id),
             side=str(side),
@@ -2108,16 +2318,85 @@ class RuntimeEngine:
             inserted += 1
         return inserted
 
-    def _record_execution_quality_stats(self, now_ms: int) -> None:
+    def _bootstrap_execution_quality_window(self, now_ms: int) -> None:
+        if self._eq_stats_bootstrapped:
+            return
+        cutoff_ms = int(now_ms - int(self._eq_stats_window_ms))
         rows = self.db.query(
             """
-            SELECT token_id, realized_spread_bps, markout_1s_bps, markout_5s_bps, markout_30s_bps, net_edge_bps
+            SELECT ts_ms, event_id, token_id, realized_spread_bps, markout_1s_bps, markout_5s_bps, markout_30s_bps, net_edge_bps
             FROM execution_quality
             WHERE ts_ms >= ?
-            ORDER BY ts_ms
+            ORDER BY ts_ms, event_id
             """,
-            [int(now_ms - 3_600_000)],
+            [cutoff_ms],
         )
+        for ts_ms, event_id, token_id, realized, m1, m5, m30, net in rows:
+            row: ExecutionQualityWindowRow = (
+                int(ts_ms),
+                str(event_id),
+                str(token_id or "__all__"),
+                _maybe_float(realized),
+                _maybe_float(m1),
+                _maybe_float(m5),
+                _maybe_float(m30),
+                _maybe_float(net),
+            )
+            self._eq_stats_window_rows.append(row)
+        if rows:
+            last_ts, last_event_id = int(rows[-1][0]), str(rows[-1][1])
+            self._eq_stats_last_seen = (last_ts, last_event_id)
+        elif self._eq_stats_last_seen is None:
+            self._eq_stats_last_seen = (int(now_ms), "")
+        self._eq_stats_bootstrapped = True
+
+    def _ingest_new_execution_quality_rows(self, now_ms: int) -> None:
+        cutoff_ms = int(now_ms - int(self._eq_stats_window_ms))
+        last_seen = self._eq_stats_last_seen
+        if last_seen is None:
+            rows = self.db.query(
+                """
+                SELECT ts_ms, event_id, token_id, realized_spread_bps, markout_1s_bps, markout_5s_bps, markout_30s_bps, net_edge_bps
+                FROM execution_quality
+                WHERE ts_ms >= ?
+                ORDER BY ts_ms, event_id
+                """,
+                [cutoff_ms],
+            )
+        else:
+            rows = self.db.query(
+                """
+                SELECT ts_ms, event_id, token_id, realized_spread_bps, markout_1s_bps, markout_5s_bps, markout_30s_bps, net_edge_bps
+                FROM execution_quality
+                WHERE ts_ms >= ?
+                  AND (ts_ms > ? OR (ts_ms = ? AND event_id > ?))
+                ORDER BY ts_ms, event_id
+                """,
+                [cutoff_ms, int(last_seen[0]), int(last_seen[0]), str(last_seen[1])],
+            )
+        for ts_ms, event_id, token_id, realized, m1, m5, m30, net in rows:
+            row: ExecutionQualityWindowRow = (
+                int(ts_ms),
+                str(event_id),
+                str(token_id or "__all__"),
+                _maybe_float(realized),
+                _maybe_float(m1),
+                _maybe_float(m5),
+                _maybe_float(m30),
+                _maybe_float(net),
+            )
+            self._eq_stats_window_rows.append(row)
+            self._eq_stats_last_seen = (int(ts_ms), str(event_id))
+
+    def _prune_execution_quality_window(self, now_ms: int) -> None:
+        cutoff_ms = int(now_ms - int(self._eq_stats_window_ms))
+        while self._eq_stats_window_rows and int(self._eq_stats_window_rows[0][0]) < cutoff_ms:
+            self._eq_stats_window_rows.popleft()
+
+    def _record_execution_quality_stats(self, now_ms: int) -> None:
+        self._bootstrap_execution_quality_window(now_ms)
+        self._ingest_new_execution_quality_rows(now_ms)
+        self._prune_execution_quality_window(now_ms)
         grouped: Dict[str, Dict[str, List[float]]] = defaultdict(
             lambda: {
                 "realized_spread_bps": [],
@@ -2127,8 +2406,7 @@ class RuntimeEngine:
                 "net_edge_bps": [],
             }
         )
-        for token_id, realized, m1, m5, m30, net in rows:
-            token_key = str(token_id or "__all__")
+        for _ts_ms, _event_id, token_key, realized, m1, m5, m30, net in self._eq_stats_window_rows:
             for key, value in (
                 ("realized_spread_bps", realized),
                 ("markout_1s_bps", m1),
@@ -2148,7 +2426,14 @@ class RuntimeEngine:
                 "execution_quality_stats",
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "execution_quality_stats",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "token_id": str(token_key),
+                            "sample_count": int(sample_count),
+                        },
+                    ),
                     "token_id": str(token_key),
                     "sample_count": int(sample_count),
                     "p50_realized_spread_bps": _maybe_float(_quantile(series["realized_spread_bps"], 0.50)),
@@ -2186,7 +2471,16 @@ class RuntimeEngine:
                 "queue_quality_stats",
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "queue_quality_stats",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "token_id": str(token_id),
+                            "submit_count": int(submit_count),
+                            "cancel_count": int(cancel_count),
+                            "fill_count": int(fill_count),
+                        },
+                    ),
                     "token_id": str(token_id),
                     "post_only_reject_rate": reject_rate,
                     "cancel_to_fill_ratio": _maybe_float(cancel_to_fill_ratio),
@@ -2232,6 +2526,106 @@ class RuntimeEngine:
             reasons.append("RISK_DAILY_LOSS_KILLSWITCH")
         return sorted(set(reasons))
 
+    def _paper_trading_profile_snapshot(self, now_ms: int) -> Dict[str, Any]:
+        execution_cfg = self.constitution.get("execution", {}) if isinstance(self.constitution, dict) else {}
+        sim_latency_ms: Optional[int] = None
+        sim_fee_mode: Optional[str] = None
+        if isinstance(self.broker, SimBroker):
+            broker_cfg = getattr(self.broker, "_config", None)
+            if broker_cfg is not None:
+                sim_latency_ms = _maybe_int(getattr(broker_cfg, "latency_ms", None))
+                fee_mode = getattr(broker_cfg, "fee_mode", None)
+                sim_fee_mode = str(fee_mode).upper() if fee_mode is not None else None
+        return {
+            "single_level_quoting": bool(self._single_level_quoting),
+            "maker_quote_size": float(execution_cfg.get("maker_quote_size", 1.0)),
+            "maker_half_spread_bps": float(execution_cfg.get("maker_half_spread_bps", 40.0)),
+            "inventory_skew_per_unit": float(execution_cfg.get("inventory_skew_per_unit", 0.0025)),
+            "risk_padding_bps": float(execution_cfg.get("risk_padding_bps", 5.0)),
+            "max_orders_per_min": int(self._max_orders_per_min),
+            "max_cancels_per_min": int(self._max_cancels_per_min),
+            "max_daily_loss_usdc": float(self._max_daily_loss_usdc),
+            "max_daily_notional_usdc": float(self._max_daily_notional_usdc),
+            "caps": {
+                "per_market": {
+                    "gross": float(self._cap_state.get("per_market", {}).get("gross", 0.0)),
+                    "soft": float(self._cap_state.get("per_market", {}).get("soft", 0.0)),
+                    "net": float(self._cap_state.get("per_market", {}).get("net", 0.0)),
+                },
+                "portfolio": {
+                    "gross": float(self._cap_state.get("portfolio", {}).get("gross", 0.0)),
+                    "net": float(self._cap_state.get("portfolio", {}).get("net", 0.0)),
+                },
+            },
+            "rollover_guard": self.rollover_guard_status(int(now_ms)),
+            "sim_latency_ms": _maybe_int(sim_latency_ms),
+            "sim_fee_mode": sim_fee_mode,
+            "fill_model": "book_vwap",
+        }
+
+    def _paper_trading_utilization_snapshot(self, now_ms: int) -> Dict[str, Any]:
+        def _ratio(value: float, limit: float) -> float:
+            if float(limit) <= 0.0:
+                return 0.0
+            return float(value) / float(limit)
+
+        orders_per_min = int(self._count_recent(self._submit_event_ts, now_ms))
+        cancels_per_min = int(self._count_recent(self._cancel_event_ts, now_ms))
+        active_risk_reasons = self._risk_budget_reasons(int(now_ms))
+        open_quote_count = int(sum(len(sides) for sides in self.open_quotes.values()))
+
+        token_ids: Set[str] = {
+            str(token_id)
+            for token_id in self.books.keys()
+        }
+        token_ids.update(str(token_id) for token_id, sides in self.open_quotes.items() if sides)
+        token_ids.update(str(token_id) for token_id, qty in self.inventory_yes.items() if abs(float(qty)) > 1e-9)
+        token_ids.update(str(token_id) for token_id, qty in self.inventory_no.items() if abs(float(qty)) > 1e-9)
+        if not token_ids:
+            token_ids = {str(token_id) for token_id in self.books.keys()}
+
+        cap_state_by_token: Dict[str, Dict[str, Any]] = {}
+        portfolio_gross = 0.0
+        portfolio_net = 0.0
+        for token_id in sorted(token_ids):
+            q = max(0.01, min(0.99, float(self._last_q_by_token.get(token_id, 0.5))))
+            diag = self._inventory_cap_diagnostics(token_id=token_id, q=q)
+            portfolio_gross = float(diag.get("portfolio_gross", portfolio_gross))
+            portfolio_net = float(diag.get("portfolio_net", portfolio_net))
+            cap_state_by_token[token_id] = {
+                "yes_qty": float(diag.get("yes_qty", 0.0)),
+                "no_qty": float(diag.get("no_qty", 0.0)),
+                "token_notional": float(diag.get("token_notional", 0.0)),
+                "token_net_notional": float(diag.get("token_net_notional", 0.0)),
+                "hard_breach": bool(diag.get("hard_breach", False)),
+                "soft_breach": bool(diag.get("soft_breach", False)),
+                "reason_codes": [str(code) for code in diag.get("reason_codes", []) if code],
+            }
+
+        portfolio_caps = self._cap_state.get("portfolio", {})
+        portfolio_gross_limit = float(portfolio_caps.get("gross", 0.0))
+        portfolio_net_limit = float(portfolio_caps.get("net", 0.0))
+
+        return {
+            "orders_per_min": orders_per_min,
+            "cancels_per_min": cancels_per_min,
+            "daily_notional_usdc": float(self._daily_notional_usdc),
+            "daily_loss_usdc": float(self._daily_loss_usdc),
+            "open_quote_count": open_quote_count,
+            "active_risk_reasons": list(active_risk_reasons),
+            "orders_per_min_ratio": _ratio(float(orders_per_min), float(max(1, int(self._max_orders_per_min)))),
+            "cancels_per_min_ratio": _ratio(float(cancels_per_min), float(max(1, int(self._max_cancels_per_min)))),
+            "daily_notional_ratio": _ratio(float(self._daily_notional_usdc), float(max(1.0, self._max_daily_notional_usdc))),
+            "daily_loss_ratio": _ratio(float(self._daily_loss_usdc), float(max(0.0, self._max_daily_loss_usdc))),
+            "cap_state_by_token": cap_state_by_token,
+            "portfolio_cap_state": {
+                "gross": float(portfolio_gross),
+                "net": float(portfolio_net),
+                "gross_limit": float(portfolio_gross_limit),
+                "net_limit": float(portfolio_net_limit),
+            },
+        }
+
     def _emit_rate_limited_alert(
         self,
         now_ms: int,
@@ -2266,6 +2660,7 @@ class RuntimeEngine:
             "RECONCILIATION_MISMATCH_CRITICAL",
             "RISK_THROTTLE_CRITICAL",
             "RISK_DAILY_LOSS_KILLSWITCH",
+            "RISK_POSITION_SIDE_LIMIT",
             "E_LIVENESS_CRITICAL",
             "RECON_UNKNOWN_ORDER_QUARANTINE",
             "RISK_CAP_BREACH",
@@ -2403,13 +2798,29 @@ class RuntimeEngine:
 
         per_market_caps = self._cap_state["per_market"]
         portfolio_caps = self._cap_state["portfolio"]
+        side_limit = float(self._max_position_per_side)
+        side_limit_breach = bool(side_limit > 0.0 and max(abs(yes_qty), abs(no_qty)) >= side_limit)
+        reason_codes: List[str] = []
+        if side_limit_breach:
+            reason_codes.append("RISK_POSITION_SIDE_LIMIT")
+        if token_notional >= per_market_caps["gross"]:
+            reason_codes.append("RISK_CAP_BREACH")
+        if token_net_notional >= per_market_caps["net"]:
+            reason_codes.append("RISK_CAP_BREACH")
+        if portfolio_gross >= portfolio_caps["gross"]:
+            reason_codes.append("RISK_CAP_BREACH")
+        if portfolio_net >= portfolio_caps["net"]:
+            reason_codes.append("RISK_CAP_BREACH")
         hard_breach = bool(
             token_notional >= per_market_caps["gross"]
             or token_net_notional >= per_market_caps["net"]
             or portfolio_gross >= portfolio_caps["gross"]
             or portfolio_net >= portfolio_caps["net"]
+            or side_limit_breach
         )
         soft_breach = bool(token_notional >= per_market_caps["soft"] and not hard_breach)
+        if soft_breach:
+            reason_codes.append("RISK_CAP_SOFT")
         return {
             "within_limits": not hard_breach,
             "hard_breach": hard_breach,
@@ -2418,6 +2829,10 @@ class RuntimeEngine:
             "token_net_notional": token_net_notional,
             "portfolio_gross": portfolio_gross,
             "portfolio_net": portfolio_net,
+            "max_position_per_side": side_limit,
+            "yes_qty": yes_qty,
+            "no_qty": no_qty,
+            "reason_codes": sorted(set(reason_codes)),
             "caps": self._cap_state,
         }
 
@@ -2548,7 +2963,16 @@ class RuntimeEngine:
             rows.append(
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "open_orders_snapshot",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "order_id": str(payload.get("order_id") or order_id),
+                            "token_id": str(token_id),
+                            "side": str(side),
+                            "status": str(payload.get("status") or ""),
+                        },
+                    ),
                     "run_id": self.run_id,
                     "mode": self.mode,
                     "token_id": token_id,
@@ -2589,7 +3013,17 @@ class RuntimeEngine:
                 "recovery_events",
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "recovery_events",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "action": "ADOPT_OPEN_ORDER",
+                            "token_id": str(token_id),
+                            "side": str(side),
+                            "order_id": str(row["order_id"]),
+                            "adopted_order_count": int(adopted),
+                        },
+                    ),
                     "run_id": self.run_id,
                     "mode": self.mode,
                     "recovery_action": "ADOPT_OPEN_ORDER",
@@ -2622,7 +3056,15 @@ class RuntimeEngine:
                 "recovery_events",
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "recovery_events",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "action": "STARTUP_QUOTING_INVARIANT_CHECK",
+                            "status": "VIOLATION",
+                            "reason": str(exc),
+                        },
+                    ),
                     "run_id": self.run_id,
                     "mode": self.mode,
                     "recovery_action": "STARTUP_QUOTING_INVARIANT_CHECK",
@@ -2644,7 +3086,15 @@ class RuntimeEngine:
             "recovery_events",
             {
                 "ts_ms": int(now_ms),
-                "event_id": uuid.uuid4().hex,
+                "event_id": self._deterministic_event_id(
+                    "recovery_events",
+                    ts_ms=int(now_ms),
+                    fields={
+                        "action": "STARTUP_QUOTING_INVARIANT_CHECK",
+                        "status": "PASS",
+                        "slot_count": int(len(keepers)),
+                    },
+                ),
                 "run_id": self.run_id,
                 "mode": self.mode,
                 "recovery_action": "STARTUP_QUOTING_INVARIANT_CHECK",
@@ -2685,7 +3135,15 @@ class RuntimeEngine:
                 "recovery_events",
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "recovery_events",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "action": "UNKNOWN_OPEN_ORDER_QUARANTINE",
+                            "unknown_order_count": int(len(unknown_rows)),
+                            "adopted_order_count": int(adopted),
+                        },
+                    ),
                     "run_id": self.run_id,
                     "mode": self.mode,
                     "recovery_action": "UNKNOWN_OPEN_ORDER_QUARANTINE",
@@ -2722,7 +3180,17 @@ class RuntimeEngine:
                     "recovery_events",
                     {
                         "ts_ms": int(now_ms),
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "recovery_events",
+                            ts_ms=int(now_ms),
+                            fields={
+                                "action": "CANCEL_DUPLICATE_OPEN_ORDER",
+                                "token_id": str(token_id),
+                                "side": str(side),
+                                "order_id": str(order_id),
+                                "events": [event.event_type for event in events],
+                            },
+                        ),
                         "run_id": self.run_id,
                         "mode": self.mode,
                         "recovery_action": "CANCEL_DUPLICATE_OPEN_ORDER",
@@ -2768,7 +3236,8 @@ class RuntimeEngine:
                 ret = (float(pstar.value) - prev) / prev
                 drift = _clamp(ret / dt_s * 2.0, -0.03, 0.03)
                 q = _clamp(mid + drift, 0.01, 0.99)
-        return _clamp(q, 0.01, 0.99)
+        quantized_q = _quantize_float(_clamp(q, 0.01, 0.99), self._signal_quantize_decimals)
+        return float(_clamp(float(quantized_q or 0.5), 0.01, 0.99))
 
     def _compute_quotes(
         self,
@@ -2779,11 +3248,14 @@ class RuntimeEngine:
         inventory_skew: float,
         risk_padding_bps: float,
     ) -> Tuple[float, float]:
-        base = float(mid if mid is not None else q)
+        q_quant = float(_quantize_float(q, self._signal_quantize_decimals) or q)
+        base_raw = float(mid if mid is not None else q_quant)
+        base = float(_quantize_float(base_raw, self._signal_quantize_decimals) or base_raw)
         half = max(constraint.min_tick, base * (half_spread_bps / 10000.0))
         risk_pad = base * (risk_padding_bps / 10000.0)
-        bid = q - half - inventory_skew - risk_pad
-        ask = q + half - inventory_skew + risk_pad
+        inv_skew = float(_quantize_float(inventory_skew, self._signal_quantize_decimals) or inventory_skew)
+        bid = q_quant - half - inv_skew - risk_pad
+        ask = q_quant + half - inv_skew + risk_pad
         bid = _clamp(bid, constraint.min_price, constraint.max_price - constraint.min_tick)
         ask = _clamp(ask, constraint.min_price + constraint.min_tick, constraint.max_price)
         if ask <= bid:
@@ -2831,7 +3303,15 @@ class RuntimeEngine:
                 "book_health_stats",
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "book_health_stats",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "token_id": str(token_id),
+                            "book_seq": int(snap.book_seq if snap else 0),
+                            "book_health_state": str(snap.book_health_state if snap else BookHealthState.DOWN.value),
+                        },
+                    ),
                     "token_id": str(token_id),
                     "book_asof_ts_ms": _maybe_int(snap.book_asof_ts_ms if snap else None),
                     "book_recv_ts_ms": _maybe_int(snap.book_recv_ts_ms if snap else None),
@@ -2928,7 +3408,15 @@ class RuntimeEngine:
             "liveness_stats",
             {
                 "ts_ms": int(now_ms),
-                "event_id": uuid.uuid4().hex,
+                "event_id": self._deterministic_event_id(
+                    "liveness_stats",
+                    ts_ms=int(now_ms),
+                    fields={
+                        "mode": str(self.mode),
+                        "freeze_state": 1 if self._liveness_freeze_active else 0,
+                        "reason_codes": ",".join(self._liveness_reason_codes),
+                    },
+                ),
                 "mode": self.mode,
                 "clock_drift_ms": _maybe_float(clock_drift_ms),
                 "sequence_gap_rate_per_min": _maybe_float(sequence_gap_rate_per_min),
@@ -3128,7 +3616,15 @@ class RuntimeEngine:
                 "recovery_events",
                 {
                     "ts_ms": int(now_ms),
-                    "event_id": uuid.uuid4().hex,
+                    "event_id": self._deterministic_event_id(
+                        "recovery_events",
+                        ts_ms=int(now_ms),
+                        fields={
+                            "action": "MARKET_STATE_RESET",
+                            "token_id": str(token_id),
+                            "reason": str(reason),
+                        },
+                    ),
                     "run_id": self.run_id,
                     "mode": self.mode,
                     "recovery_action": "MARKET_STATE_RESET",
@@ -3253,7 +3749,17 @@ class RuntimeEngine:
                     "recovery_events",
                     {
                         "ts_ms": int(now_ms),
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "recovery_events",
+                            ts_ms=int(now_ms),
+                            fields={
+                                "action": "CANCEL_OPEN_QUOTE_ON_FREEZE",
+                                "token_id": str(token_id),
+                                "side": str(side),
+                                "order_id": str(quote.order_id),
+                                "reason": str(reason),
+                            },
+                        ),
                         "run_id": self.run_id,
                         "mode": self.mode,
                         "recovery_action": "CANCEL_OPEN_QUOTE_ON_FREEZE",
@@ -3318,7 +3824,17 @@ class RuntimeEngine:
             "recovery_events",
             {
                 "ts_ms": int(now_ms),
-                "event_id": uuid.uuid4().hex,
+                "event_id": self._deterministic_event_id(
+                    "recovery_events",
+                    ts_ms=int(now_ms),
+                    fields={
+                        "action": "MISSED_FILL_CORRECTION",
+                        "token_id": str(token_id),
+                        "side": str(side),
+                        "order_id": str(order_id),
+                        "fill_event_id": str(fill_event_id),
+                    },
+                ),
                 "run_id": self.run_id,
                 "mode": self.mode,
                 "recovery_action": "MISSED_FILL_CORRECTION",
@@ -3391,7 +3907,18 @@ class RuntimeEngine:
                     "recovery_events",
                     {
                         "ts_ms": int(now_ms),
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "recovery_events",
+                            ts_ms=int(now_ms),
+                            fields={
+                                "action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                                "token_id": str(row["token_id"]),
+                                "side": str(row["side"]),
+                                "order_id": str(row["order_id"]),
+                                "fill_event_key": str(fill_event_key),
+                                "reason": "in_memory_seen",
+                            },
+                        ),
                         "run_id": self.run_id,
                         "mode": self.mode,
                         "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
@@ -3431,7 +3958,18 @@ class RuntimeEngine:
                     "recovery_events",
                     {
                         "ts_ms": int(now_ms),
-                        "event_id": uuid.uuid4().hex,
+                        "event_id": self._deterministic_event_id(
+                            "recovery_events",
+                            ts_ms=int(now_ms),
+                            fields={
+                                "action": "MISSED_FILL_DUPLICATE_SKIPPED",
+                                "token_id": str(row["token_id"]),
+                                "side": str(row["side"]),
+                                "order_id": str(row["order_id"]),
+                                "fill_event_key": str(fill_event_key),
+                                "reason": "persistent_seen",
+                            },
+                        ),
                         "run_id": self.run_id,
                         "mode": self.mode,
                         "recovery_action": "MISSED_FILL_DUPLICATE_SKIPPED",
@@ -3482,7 +4020,7 @@ class RuntimeEngine:
                 order_id=str(row["order_id"]),
                 fill_qty=fill_qty,
                 fill_price=float(row["fill_price"]),
-                fill_event_id=str(row["event_id"] or uuid.uuid4().hex),
+                fill_event_id=str(row["event_id"] or fill_event_key),
                 payload=row["payload"],
             )
             self._seen_reconcile_fill_ids.add(fill_event_key)
@@ -3748,7 +4286,16 @@ class RuntimeEngine:
             "reconciliation_stats",
             {
                 "ts_ms": int(now_ms),
-                "event_id": uuid.uuid4().hex,
+                "event_id": self._deterministic_event_id(
+                    "reconciliation_stats",
+                    ts_ms=int(now_ms),
+                    fields={
+                        "mode": str(self.mode),
+                        "freeze_state": 1 if self._reconciliation_frozen else 0,
+                        "mismatch_count": int(mismatch_count),
+                        "outside_tolerance": bool(outside_tolerance),
+                    },
+                ),
                 "run_id": self.run_id,
                 "mode": self.mode,
                 "broker_open_orders": int(broker_open_orders),
@@ -3811,6 +4358,345 @@ def _load_constitution(path: Path) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("constitution_invalid_format")
     return data
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=True, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _update_run_status(
+    *,
+    meta_dir: Optional[Path],
+    status: str,
+    promotion_eligible: bool,
+    reason: Optional[str],
+    details: Optional[Dict[str, Any]] = None,
+    now_ms: Optional[int] = None,
+) -> None:
+    if meta_dir is None:
+        return
+    run_status_path = meta_dir / "run_status.json"
+    payload = _read_json(run_status_path) or {}
+    payload["status"] = str(status)
+    payload["promotion_eligible"] = bool(promotion_eligible)
+    if reason:
+        payload["reason"] = str(reason)
+    if details is not None:
+        payload["details"] = dict(details)
+    ts_ms = _maybe_int(now_ms)
+    if ts_ms is not None:
+        payload["updated_ts_ms"] = int(ts_ms)
+        if str(status).upper() in {"INVALIDATED", "DIAGNOSTIC_ONLY"}:
+            payload["invalidated_ts_ms"] = int(ts_ms)
+    _write_json(run_status_path, payload)
+
+
+def _startup_table_exists(db_path: Path, table: str) -> bool:
+    if not db_path.exists():
+        return False
+    try:
+        with sqlite3.connect(db_path.as_posix()) as cx:
+            row = cx.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+                (str(table),),
+            ).fetchone()
+            return bool(row)
+    except Exception:
+        return False
+
+
+def _startup_table_count(db_path: Path, table: str) -> Optional[int]:
+    if not db_path.exists():
+        return None
+    if not _startup_table_exists(db_path, table):
+        return None
+    try:
+        with sqlite3.connect(db_path.as_posix()) as cx:
+            row = cx.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
+        return None
+
+
+def _startup_missing_tables(db_path: Path, table_names: List[str]) -> List[str]:
+    missing: List[str] = []
+    for table in table_names:
+        if not _startup_table_exists(db_path, table):
+            missing.append(str(table))
+    return missing
+
+
+def _startup_discovery_selected_once(db_path: Path) -> bool:
+    if not db_path.exists() or not _startup_table_exists(db_path, "discovery_requests"):
+        return False
+    try:
+        with sqlite3.connect(db_path.as_posix()) as cx:
+            row = cx.execute(
+                "SELECT 1 FROM discovery_requests WHERE status = ? LIMIT 1",
+                ("SELECTED",),
+            ).fetchone()
+            return bool(row)
+    except Exception:
+        return False
+
+
+async def _run_startup_acceptance_check(
+    *,
+    db_path: Path,
+    observe_dir: Optional[Path],
+    critical_tables: List[str],
+    growth_wait_secs: int,
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    reasons: List[str] = []
+    details: Dict[str, Any] = {
+        "db_path": db_path.resolve().as_posix(),
+        "critical_tables": list(critical_tables),
+        "growth_wait_secs": int(max(1, growth_wait_secs)),
+    }
+    discovery_selected_once = _startup_discovery_selected_once(db_path)
+    details["discovery_selected_once"] = bool(discovery_selected_once)
+    before_count = _startup_table_count(db_path, "market_data_book")
+    details["market_data_book_before"] = _maybe_int(before_count)
+    await asyncio.sleep(max(1, int(growth_wait_secs)))
+    after_count = _startup_table_count(db_path, "market_data_book")
+    details["market_data_book_after"] = _maybe_int(after_count)
+    if bool(discovery_selected_once) and (
+        before_count is None or after_count is None or int(after_count) <= int(before_count)
+    ):
+        reasons.append("STARTUP_BOOK_NOT_GROWING")
+
+    decision_ticks_count = _startup_table_count(db_path, "decision_ticks")
+    details["decision_ticks_count"] = _maybe_int(decision_ticks_count)
+    if decision_ticks_count is None or int(decision_ticks_count) <= 0:
+        reasons.append("STARTUP_DECISION_TICKS_MISSING")
+
+    missing_tables = _startup_missing_tables(db_path, critical_tables)
+    details["missing_tables"] = list(missing_tables)
+    if missing_tables:
+        reasons.append("STARTUP_CRITICAL_TABLES_MISSING")
+
+    if observe_dir is not None:
+        promotion_report_path = observe_dir / "promotion_report_hourly.json"
+        details["promotion_report_hourly_path"] = promotion_report_path.as_posix()
+        promotion_report_ok = False
+        if promotion_report_path.exists():
+            report_payload = _read_json(promotion_report_path)
+            promotion_report_ok = isinstance(report_payload, dict)
+        details["promotion_report_hourly_valid"] = bool(promotion_report_ok)
+        if not promotion_report_ok:
+            reasons.append("STARTUP_PROMOTION_JSON_INVALID")
+
+    return (len(reasons) == 0), reasons, details
+
+
+def _resolve_promotion_run_root(db_path: Path, log_dir: Path) -> Optional[Path]:
+    observe_dir = db_path.resolve().parent
+    if observe_dir.name != "observe":
+        return None
+    try:
+        if not log_dir.resolve().is_relative_to(observe_dir):
+            return None
+    except Exception:
+        return None
+    return observe_dir.parent
+
+
+def _current_git_sha() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_ROOT.as_posix(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        sha = (result.stdout or "").strip()
+        if result.returncode == 0 and sha:
+            return sha
+    except Exception:
+        pass
+    return "UNKNOWN"
+
+
+def _write_provenance_manifest(
+    *,
+    meta_dir: Optional[Path],
+    run_id: str,
+    mode: str,
+    run_start_ts_ms: int,
+    db_path: Path,
+    log_dir: Path,
+    constitution_path: Path,
+    markets_path: Path,
+) -> None:
+    if meta_dir is None:
+        return
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    constitution_hash = _sha256_file(constitution_path) if constitution_path.exists() else "MISSING"
+    markets_hash = _sha256_file(markets_path) if markets_path.exists() else "MISSING"
+    runtime_hash = _sha256_file(Path(__file__).resolve())
+
+    (meta_dir / "constitution.sha256").write_text(f"{constitution_hash}\n", encoding="utf-8")
+    (meta_dir / "markets.sha256").write_text(f"{markets_hash}\n", encoding="utf-8")
+    (meta_dir / "runtime_fingerprint.sha256").write_text(f"{runtime_hash}\n", encoding="utf-8")
+
+    pip_freeze_path = meta_dir / "pip_freeze.txt"
+    pip_freeze_status = "ok"
+    pip_freeze_error: Optional[str] = None
+    try:
+        freeze_proc = subprocess.run(
+            [sys.executable, "-m", "pip", "freeze"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        freeze_stdout = freeze_proc.stdout or ""
+        if freeze_proc.returncode != 0:
+            pip_freeze_status = "error"
+            pip_freeze_error = (freeze_proc.stderr or "pip_freeze_failed").strip() or "pip_freeze_failed"
+            freeze_stdout = f"# ERROR: {pip_freeze_error}\n{freeze_stdout}"
+        pip_freeze_path.write_text(freeze_stdout, encoding="utf-8")
+    except Exception as exc:
+        pip_freeze_status = "error"
+        pip_freeze_error = str(exc)
+        pip_freeze_path.write_text(f"# ERROR: {pip_freeze_error}\n", encoding="utf-8")
+    pip_freeze_hash = _sha256_file(pip_freeze_path)
+
+    manifest = {
+        "schema_version": "run_manifest_v1",
+        "run_id": str(run_id),
+        "mode": str(mode),
+        "run_start_ts_ms": int(run_start_ts_ms),
+        "run_start_wall_iso": _utc_iso_from_ms(int(run_start_ts_ms)),
+        "git_sha": _current_git_sha(),
+        "paths": {
+            "db_path": db_path.resolve().as_posix(),
+            "log_dir": log_dir.resolve().as_posix(),
+            "constitution_path": constitution_path.resolve().as_posix(),
+            "markets_path": markets_path.resolve().as_posix(),
+            "pip_freeze_path": pip_freeze_path.resolve().as_posix(),
+        },
+        "hashes": {
+            "runtime_fingerprint_sha256": runtime_hash,
+            "constitution_sha256": constitution_hash,
+            "markets_sha256": markets_hash,
+            "pip_freeze_sha256": pip_freeze_hash,
+        },
+        "pip_freeze": {
+            "status": pip_freeze_status,
+            "error": pip_freeze_error,
+        },
+    }
+    _write_json(meta_dir / "run_manifest.json", manifest)
+
+
+def _serialize_resolved_markets_payload(*, run_id: str, resolved_markets: List[Any], ts_ms: int) -> Dict[str, Any]:
+    markets_payload: List[Dict[str, Any]] = []
+    for market in resolved_markets:
+        token_ids = [str(token) for token in getattr(market, "token_ids", []) if token]
+        outcomes = [str(outcome) for outcome in (getattr(market, "outcomes", []) or [])]
+        outcome_by_token_raw = getattr(market, "outcome_by_token", {}) or {}
+        outcome_by_token = outcome_by_token_raw if isinstance(outcome_by_token_raw, dict) else {}
+        tokens_payload: List[Dict[str, str]] = []
+        for idx, token_id in enumerate(token_ids):
+            outcome = outcome_by_token.get(token_id)
+            if outcome is None and idx < len(outcomes):
+                outcome = outcomes[idx]
+            tokens_payload.append(
+                {
+                    "token_id": str(token_id),
+                    "outcome": str(outcome) if outcome is not None else "",
+                }
+            )
+        condition_id = str(getattr(market, "condition_id", "") or "")
+        slug = _coerce_optional_str(getattr(market, "slug", None))
+        selection_key = deterministic_market_selection_key_str(
+            {
+                "slug": slug,
+                "conditionId": condition_id,
+                "clobTokenIds": token_ids,
+            }
+        )
+        markets_payload.append(
+            {
+                "name": str(getattr(market, "name", "") or ""),
+                "reference_symbol": str(getattr(market, "reference_symbol", "") or ""),
+                "market_slug": slug,
+                "condition_id": condition_id,
+                "outcomes": outcomes,
+                "tokens": tokens_payload,
+                "constraints": {
+                    "min_tick": float(getattr(market, "min_tick", 0.01)),
+                    "min_size": float(getattr(market, "min_size", 1.0)),
+                    "min_price": float(getattr(market, "min_price", 0.01)),
+                    "max_price": float(getattr(market, "max_price", 0.99)),
+                },
+                "question": _coerce_optional_str(getattr(market, "question", None)),
+                "end_ts_ms": _maybe_int(getattr(market, "end_ts_ms", None)),
+                "end_ts_source": _coerce_optional_str(getattr(market, "end_ts_source", None)),
+                "selection_key": selection_key,
+            }
+        )
+    return {
+        "schema_version": "resolved_markets_v1",
+        "run_id": str(run_id),
+        "t_created_wall_iso": _utc_iso_from_ms(int(ts_ms)),
+        "markets": markets_payload,
+    }
+
+
+def _write_resolved_markets_artifact(*, log_dir: Path, run_id: str, resolved_markets: List[Any], ts_ms: int) -> None:
+    payload = _serialize_resolved_markets_payload(
+        run_id=run_id,
+        resolved_markets=resolved_markets,
+        ts_ms=int(ts_ms),
+    )
+    _write_json(log_dir / "resolved_markets.json", payload)
+
+
+def _write_discovery_requests_artifact(
+    *,
+    meta_dir: Optional[Path],
+    run_id: str,
+    discovery_summary: Dict[str, Any],
+    ts_ms: int,
+) -> None:
+    if meta_dir is None:
+        return
+    requests = _dedupe_discovery_requests(_discovery_requests_from_summary(discovery_summary))
+    payload = {
+        "schema_version": "discovery_requests_v1",
+        "run_id": str(run_id),
+        "t_created_wall_iso": _utc_iso_from_ms(int(ts_ms)),
+        "requests": requests,
+    }
+    _write_json(meta_dir / "discovery_requests.json", payload)
 
 
 def _build_constraints(
@@ -4004,6 +4890,24 @@ def _discovery_none_found_deadline_exceeded(
     return int(max(0, int(now_ms) - int(start_ts_ms))) >= int(max(0, deadline_ms))
 
 
+def _discovery_diagnostic_fields(
+    discovery_summary: Optional[Dict[str, Any]],
+    *,
+    default_symbol: str,
+    default_horizon: str,
+) -> Dict[str, Any]:
+    requests = _discovery_requests_from_summary(discovery_summary)
+    latest = requests[-1] if requests else {}
+    return {
+        "requested_symbol": str(latest.get("requested_symbol") or default_symbol),
+        "requested_horizon": str(latest.get("requested_horizon") or default_horizon),
+        "n_total": _maybe_int(latest.get("n_total")),
+        "n_btc_15m": _maybe_int(latest.get("n_btc_15m")),
+        "n_active_now": _maybe_int(latest.get("n_active_now")),
+        "n_tradable_now": _maybe_int(latest.get("n_tradable_now")),
+    }
+
+
 def _coerce_optional_str(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -4106,6 +5010,45 @@ def _candidate_liveness(
     return True, "CANDIDATE_LIVE", details
 
 
+def _candidate_rejection_reason(candidate_liveness_state: str) -> str:
+    state = str(candidate_liveness_state or "")
+    mapping = {
+        "CANDIDATE_CLOSED": "META_NON_TRADABLE_CLOSED",
+        "CANDIDATE_INACTIVE": "META_NON_TRADABLE_INACTIVE",
+        "CANDIDATE_NOT_ACCEPTING_ORDERS": "META_NON_TRADABLE_NOT_ACCEPTING",
+        "CANDIDATE_ENDED": "CANDIDATE_ENDED",
+    }
+    return str(mapping.get(state, "CANDIDATE_NOT_LIVE"))
+
+
+def _switch_abort_rejection_reason(switch_abort_reason: str) -> str:
+    return "WS_NOT_LIVE_CONFIRM_TIMEOUT" if str(switch_abort_reason) == "CONFIRM_TIMEOUT" else "WS_NOT_LIVE_SWITCH_ABORT"
+
+
+def _extract_selection_witness(discovery_summary: Dict[str, Any]) -> Dict[str, Any]:
+    requests = _discovery_requests_from_summary(discovery_summary)
+    selected = None
+    for payload in reversed(requests):
+        if str(payload.get("status") or "").upper() == "SELECTED":
+            selected = payload
+            break
+    if not isinstance(selected, dict):
+        return {
+            "time_active": True,
+            "tradable_meta_state": "UNKNOWN",
+            "ws_confirm_state": "PENDING",
+            "candidate_rank": None,
+            "max_candidates_considered": None,
+        }
+    return {
+        "time_active": True,
+        "tradable_meta_state": str(selected.get("selected_tradable_meta_state") or "UNKNOWN"),
+        "ws_confirm_state": "PENDING",
+        "candidate_rank": _maybe_int(selected.get("selected_candidate_rank")),
+        "max_candidates_considered": _maybe_int(selected.get("max_candidates_considered")),
+    }
+
+
 def _pending_books_liveness(token_ids: List[str], books: Dict[str, OrderBook]) -> Tuple[bool, Dict[str, Any]]:
     by_token: Dict[str, bool] = {}
     any_book_update = False
@@ -4121,6 +5064,19 @@ def _pending_books_liveness(token_ids: List[str], books: Dict[str, OrderBook]) -
         "any_book_update": bool(any_book_update),
         "by_token": by_token,
     }
+
+
+def _books_last_event_ts_ms(token_ids: List[str], books: Dict[str, OrderBook]) -> Optional[int]:
+    max_ts: Optional[int] = None
+    for token_id in [str(token) for token in token_ids if token]:
+        book = books.get(token_id)
+        if book is None:
+            continue
+        ts_value = _maybe_int(book.last_event_ts_ms)
+        if ts_value is None:
+            continue
+        max_ts = int(ts_value) if max_ts is None else max(int(max_ts), int(ts_value))
+    return max_ts
 
 
 def _rollover_commit_decision(
@@ -4155,7 +5111,27 @@ def _rollover_commit_decision(
     )
 
 
-async def _run() -> None:
+def _write_runtime_pid_file(
+    *,
+    pid_file: Optional[Path],
+    run_id: str,
+    mode: str,
+) -> None:
+    if pid_file is None:
+        return
+    _write_json(
+        pid_file,
+        {
+            "schema_version": "runtime_pid_v1",
+            "pid": int(os.getpid()),
+            "run_id": str(run_id),
+            "mode": str(mode),
+            "ts_ms": int(_now_ms()),
+        },
+    )
+
+
+async def _run() -> int:
     args = _parse_args()
     settings = load_settings()
     constitution_path = Path(args.constitution or "config/constitution.yaml")
@@ -4178,8 +5154,30 @@ async def _run() -> None:
     log_dir = Path(args.log_dir or settings.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     db_path = Path(args.db_path or settings.runtime_db_path)
+    promotion_run_root = _resolve_promotion_run_root(db_path=db_path, log_dir=log_dir)
+    meta_dir = promotion_run_root / "meta" if promotion_run_root is not None else None
     db = SQLiteStore(db_path)
-    run_id = uuid.uuid4().hex
+    run_start_ts_ms = int(_now_ms())
+    run_id = f"run-{run_start_ts_ms}"
+    _write_provenance_manifest(
+        meta_dir=meta_dir,
+        run_id=run_id,
+        mode=mode,
+        run_start_ts_ms=run_start_ts_ms,
+        db_path=db_path,
+        log_dir=log_dir,
+        constitution_path=constitution_path,
+        markets_path=Path(markets_path),
+    )
+    pid_file = Path(args.pid_file).resolve() if args.pid_file else None
+    _write_runtime_pid_file(pid_file=pid_file, run_id=run_id, mode=mode)
+    _update_run_status(
+        meta_dir=meta_dir,
+        status=f"RUNNING_{mode}",
+        promotion_eligible=True,
+        reason=None,
+        now_ms=run_start_ts_ms,
+    )
     event_tape = EventTape(log_dir=str(log_dir), run_id=run_id)
     decision_tape = DecisionTape(log_dir=str(log_dir), run_id=run_id)
     trade_tape = TradeTape(log_dir=str(log_dir), run_id=run_id)
@@ -4195,6 +5193,7 @@ async def _run() -> None:
             gamma_base_url=GAMMA_BASE_URL,
             now_ts=int(startup_discovery_now_ms / 1000),
             discovery_summary=startup_discovery_summary,
+            max_candidates_considered=int(trading_cfg.get("rollover_max_candidates_considered", 10)),
         )
     except NoActiveMarketError as exc:
         discovery_requests = _discovery_requests_from_summary(startup_discovery_summary)
@@ -4242,6 +5241,18 @@ async def _run() -> None:
         db=db,
         ts_ms=startup_discovery_now_ms,
         discovery_requests=_discovery_requests_from_summary(startup_discovery_summary),
+    )
+    _write_discovery_requests_artifact(
+        meta_dir=meta_dir,
+        run_id=run_id,
+        discovery_summary=startup_discovery_summary,
+        ts_ms=startup_discovery_now_ms,
+    )
+    _write_resolved_markets_artifact(
+        log_dir=log_dir,
+        run_id=run_id,
+        resolved_markets=resolved_markets,
+        ts_ms=startup_discovery_now_ms,
     )
     asset_ids = sorted({token for market in resolved_markets for token in market.token_ids if token})
     if not asset_ids:
@@ -4379,6 +5390,29 @@ async def _run() -> None:
         reconnect_base_ms=settings.ws_reconnect_base_ms,
         reconnect_max_ms=settings.ws_reconnect_max_ms,
     )
+
+    def _handle_ws_invariant_violation(payload: Dict[str, Any]) -> None:
+        now_ms = int(time_mapper.wall_ms(time.monotonic_ns()))
+        violation_payload = {
+            "mode": str(mode),
+            "state": ALERT_STATE_FROZEN if mode in {"PAPER", "TRADE"} else ALERT_STATE_DEGRADED,
+            "payload": dict(payload or {}),
+        }
+        db.append_alert(
+            now_ms,
+            "critical" if mode in {"PAPER", "TRADE"} else "warning",
+            "WS_INVARIANT_VIOLATION",
+            "market_ws_invariant_violation",
+            payload=violation_payload,
+        )
+        db.append_log(now_ms, "ERROR", "ws_invariant_violation", violation_payload)
+        if mode in {"PAPER", "TRADE"}:
+            runtime.activate_rollover_guard(
+                token_ids=sorted(runtime.books.keys()),
+                quiet_until_ms=int(now_ms + 6 * 60 * 60 * 1000),
+                require_readiness=True,
+            )
+
     market_client = MarketWSClient(
         asset_ids=asset_ids,
         books=books,
@@ -4386,7 +5420,56 @@ async def _run() -> None:
         metrics=metrics,
         config=ws_config,
         decision_engine=None,
+        on_invariant_violation=_handle_ws_invariant_violation,
     )
+
+    def _flush_ws_subscribe_attempts(now_ms: int) -> None:
+        attempts = market_client.drain_completed_subscribe_attempts()
+        if not attempts:
+            return
+        for attempt in attempts:
+            attempt_diag = attempt.get("attempt_diag") if isinstance(attempt.get("attempt_diag"), dict) else {}
+            confirm_counts_json = str(attempt.get("confirm_counts_by_asset_json") or "{}")
+            confirm_preclass_json = str(attempt.get("confirm_preclass_hits_by_asset_json") or "{}")
+            db.append_ws_subscribe_attempt(
+                run_id=str(runtime.run_id),
+                ts_ms=int(_maybe_int(attempt.get("ts_ms")) or now_ms),
+                attempt_id=int(_maybe_int(attempt.get("attempt_id")) or 0),
+                action=str(attempt.get("action") or ""),
+                active_sub_id_before=_maybe_int(attempt.get("active_sub_id_before")),
+                pending_sub_id=_maybe_int(attempt.get("pending_sub_id")),
+                asset_ids_json=str(attempt.get("asset_ids_json") or "[]"),
+                payload_json=str(attempt.get("payload_json") or "{}"),
+                ack_status=_coerce_optional_str(attempt.get("ack_status")),
+                ack_ts_ms=_maybe_int(attempt.get("ack_ts_ms")),
+                ack_error=_coerce_optional_str(attempt.get("ack_error")),
+                preclass_pending_hits=_maybe_int(attempt.get("preclass_pending_hits")),
+                preclass_active_hits=_maybe_int(attempt.get("preclass_active_hits")),
+                preclass_unknown_schema=_maybe_int(attempt.get("preclass_unknown_schema")),
+                preclass_missing_asset=_maybe_int(attempt.get("preclass_missing_asset")),
+                preclass_missing_sub=_maybe_int(attempt.get("preclass_missing_sub")),
+                confirm_required_updates=_maybe_int(attempt.get("confirm_required_updates")),
+                confirm_counts_by_asset_json=confirm_counts_json,
+                confirm_preclass_hits_by_asset_json=confirm_preclass_json,
+                first_pending_recv_ts_ms=_maybe_int(attempt.get("first_pending_recv_ts_ms")),
+                last_pending_recv_ts_ms=_maybe_int(attempt.get("last_pending_recv_ts_ms")),
+                confirm_wait_ms=_maybe_float(attempt.get("confirm_wait_ms")),
+                result=_coerce_optional_str(attempt.get("result")),
+            )
+            db.append_rollover_metric(
+                ts_ms=int(_maybe_int(attempt.get("ts_ms")) or now_ms),
+                metric_name="ws_subscribe_attempt",
+                metric_value=float(_maybe_int(attempt.get("attempt_id")) or 0),
+                market_slug=None,
+                selection_key=None,
+                payload={
+                    "attempt_id": int(_maybe_int(attempt.get("attempt_id")) or 0),
+                    "action": str(attempt.get("action") or ""),
+                    "ack_status": _coerce_optional_str(attempt.get("ack_status")),
+                    "result": _coerce_optional_str(attempt.get("result")),
+                    "attempt_diag": attempt_diag,
+                },
+            )
     rollover_manager: Optional[MarketRolloverManager] = None
     auto_discover_enabled = bool(args.auto_discover or settings.auto_discover)
     if auto_discover_enabled and len(markets) == 1 and len(resolved_markets) == 1:
@@ -4422,6 +5505,17 @@ async def _run() -> None:
     quote_interval_ms = int(args.quote_interval_ms or trading_cfg.get("quote_interval_ms", settings.quote_interval_ms))
     stats_interval_ms = int(args.stats_interval_ms or trading_cfg.get("stats_interval_ms", settings.stats_interval_ms))
     rollover_quiet_window_ms = int(trading_cfg.get("rollover_quiet_window_ms", 500))
+    startup_acceptance_delay_secs = int(trading_cfg.get("startup_acceptance_delay_secs", 600))
+    startup_acceptance_growth_wait_secs = int(trading_cfg.get("startup_acceptance_growth_wait_secs", 60))
+    startup_acceptance_critical_tables_raw = trading_cfg.get(
+        "startup_acceptance_critical_tables",
+        ["market_data_book", "decision_ticks", "logs"],
+    )
+    if isinstance(startup_acceptance_critical_tables_raw, list):
+        startup_acceptance_critical_tables = [str(item) for item in startup_acceptance_critical_tables_raw if str(item).strip()]
+    else:
+        startup_acceptance_critical_tables = ["market_data_book", "decision_ticks", "logs"]
+    observe_dir = db_path.resolve().parent if db_path.resolve().parent.name == "observe" else None
     unknown_alert_policy_cfg = trading_cfg.get("unknown_alert_policy", {}) if isinstance(trading_cfg, dict) else {}
     unknown_alert_threshold_per_min = int(
         unknown_alert_policy_cfg.get(
@@ -4521,13 +5615,62 @@ async def _run() -> None:
         decision_tape.close()
         trade_tape.close()
         db.close()
-        raise RuntimeError("feed_not_wired_for_live_mode")
+        return 2
     db.append_log(
         _now_ms(),
         "INFO",
         "startup_a_pipeline_diag",
         runtime._a_pipeline_diag(now_ms=_now_ms()),
     )
+    startup_acceptance_failure_reason: Optional[str] = None
+    startup_acceptance_details: Optional[Dict[str, Any]] = None
+
+    async def _startup_acceptance_loop() -> None:
+        nonlocal startup_acceptance_failure_reason, startup_acceptance_details
+        if stop_event.is_set():
+            return
+        await asyncio.sleep(max(1, int(startup_acceptance_delay_secs)))
+        if stop_event.is_set():
+            return
+        accepted, reason_codes, details = await _run_startup_acceptance_check(
+            db_path=db_path,
+            observe_dir=observe_dir if promotion_run_root is not None else None,
+            critical_tables=list(startup_acceptance_critical_tables),
+            growth_wait_secs=int(startup_acceptance_growth_wait_secs),
+        )
+        payload = {
+            "accepted": bool(accepted),
+            "reason_codes": [str(code) for code in reason_codes],
+            "details": details,
+        }
+        startup_acceptance_details = payload
+        if accepted:
+            db.append_log(_now_ms(), "INFO", "startup_acceptance_passed", payload)
+            return
+
+        primary_reason = str(reason_codes[0]) if reason_codes else "STARTUP_ACCEPTANCE_FAILED"
+        startup_acceptance_failure_reason = primary_reason
+        db.append_log(_now_ms(), "ERROR", "startup_acceptance_failed", payload)
+        db.append_alert(
+            _now_ms(),
+            "critical" if mode in {"PAPER", "TRADE"} else "warning",
+            "STARTUP_ACCEPTANCE_FAILED",
+            f"startup_acceptance_failed reason={primary_reason}",
+            payload={
+                "state": ALERT_STATE_FROZEN if mode in {"PAPER", "TRADE"} else ALERT_STATE_DEGRADED,
+                **payload,
+            },
+        )
+        _update_run_status(
+            meta_dir=meta_dir,
+            status="INVALIDATED",
+            promotion_eligible=False,
+            reason=primary_reason,
+            details=payload,
+            now_ms=_now_ms(),
+        )
+        stop_event.set()
+
     runtime_lock = asyncio.Lock()
 
     async def _quote_loop() -> None:
@@ -4698,6 +5841,7 @@ async def _run() -> None:
                         "a_pipeline_diag",
                         runtime._a_pipeline_diag(now_ms=int(now_ms)),
                     )
+                _flush_ws_subscribe_attempts(now_ms)
             except Exception as exc:
                 db.append_alert(
                     now_ms,
@@ -4742,6 +5886,33 @@ async def _run() -> None:
         none_found_deadline_alerted = False
         none_found_quotes_canceled = False
         none_found_deadline_ms = int(trading_cfg.get("rollover_none_found_deadline_ms", 180_000))
+        discovery_error_retry_index = 0
+        discovery_error_next_retry_ts_ms: Optional[int] = None
+        rollover_max_attempts = max(1, int(trading_cfg.get("rollover_max_attempts", 3)))
+        rollover_attempt_spacing_ms = max(0, int(trading_cfg.get("rollover_attempt_spacing_ms", 3_000)))
+        rollover_attempt_index = 0
+        rollover_next_retry_ts_ms: Optional[int] = None
+
+        def _rollover_trace_payload(
+            *,
+            now_ms: int,
+            candidate_market_slug: Optional[str],
+            candidate_token_ids: Optional[List[str]],
+            precondition_reason_codes: Optional[List[str]],
+            attempt_index: int,
+            books: Dict[str, OrderBook],
+        ) -> Dict[str, Any]:
+            active_subscription_token_ids = list(rollover_manager.current.token_ids)
+            trace_payload = {
+                "candidate_market_slug": str(candidate_market_slug or ""),
+                "candidate_token_ids": [str(token) for token in (candidate_token_ids or []) if str(token)],
+                "precondition_reason_codes": [str(code) for code in (precondition_reason_codes or []) if str(code)],
+                "active_subscription_token_ids": [str(token) for token in active_subscription_token_ids if str(token)],
+                "book_last_ts_ms": _books_last_event_ts_ms(active_subscription_token_ids, books),
+                "attempt_index": int(max(1, attempt_index)),
+                "as_of_ts_ms": int(now_ms),
+            }
+            return trace_payload
 
         def _emit_rollover_abort(
             *,
@@ -4753,13 +5924,42 @@ async def _run() -> None:
             log_level: str = "WARNING",
             log_code: str = "rollover_abort",
             count_toward_health: bool = True,
+            count_toward_attempt_limit: bool = False,
         ) -> None:
+            nonlocal rollover_attempt_index, rollover_next_retry_ts_ms
             abort_payload = {
                 **intent_payload,
                 "abort_reason": str(abort_reason),
             }
             if extra_payload:
                 abort_payload.update(extra_payload)
+            if count_toward_attempt_limit:
+                rollover_attempt_index = int(rollover_attempt_index) + 1
+                abort_payload["attempt_index"] = int(rollover_attempt_index)
+                abort_payload["max_attempts"] = int(rollover_max_attempts)
+                if int(rollover_attempt_index) >= int(rollover_max_attempts):
+                    abort_payload["hard_fail_reason"] = "ROLLOVER_SWITCH_ABORT_LOOP"
+                    db.append_alert(
+                        now_ms,
+                        "critical",
+                        "ROLLOVER_SWITCH_ABORT_LOOP",
+                        "Rollover aborted repeatedly without commit; invalidating run",
+                        payload=abort_payload,
+                    )
+                    db.append_log(now_ms, "ERROR", "rollover_abort_loop_fail", abort_payload)
+                    _update_run_status(
+                        meta_dir=meta_dir,
+                        status="INVALIDATED",
+                        promotion_eligible=False,
+                        reason="ROLLOVER_SWITCH_ABORT_LOOP",
+                        details=abort_payload,
+                        now_ms=now_ms,
+                    )
+                    stop_event.set()
+                else:
+                    retry_ts_ms = int(now_ms + rollover_attempt_spacing_ms)
+                    rollover_next_retry_ts_ms = int(retry_ts_ms)
+                    abort_payload["next_retry_ts_ms"] = int(retry_ts_ms)
             _write_rollover_event(
                 event_tape=event_tape,
                 event_type="ROLLOVER_ABORT",
@@ -4841,10 +6041,16 @@ async def _run() -> None:
         while not stop_event.is_set():
             now_mono_ns = time.monotonic_ns()
             now_ms = int(time_mapper.wall_ms(now_mono_ns))
+            if rollover_next_retry_ts_ms is not None and int(now_ms) < int(rollover_next_retry_ts_ms):
+                await asyncio.sleep(check_period_secs)
+                continue
             if health_gate.is_frozen(now_ms):
                 await asyncio.sleep(check_period_secs)
                 continue
             if none_found_next_retry_ts_ms is not None and int(now_ms) < int(none_found_next_retry_ts_ms):
+                await asyncio.sleep(check_period_secs)
+                continue
+            if discovery_error_next_retry_ts_ms is not None and int(now_ms) < int(discovery_error_next_retry_ts_ms):
                 await asyncio.sleep(check_period_secs)
                 continue
             last_book_recv_mono_ns = market_client.active_last_book_recv_mono_ns()
@@ -4923,6 +6129,7 @@ async def _run() -> None:
                     gamma_base_url=GAMMA_BASE_URL,
                     now_ts=int(now_ms / 1000),
                     discovery_summary=discovery_summary,
+                    max_candidates_considered=int(trading_cfg.get("rollover_max_candidates_considered", 10)),
                 )
                 _append_discovery_request_rows(
                     db=db,
@@ -5038,19 +6245,67 @@ async def _run() -> None:
                 await asyncio.sleep(check_period_secs)
                 continue
             except Exception as exc:
+                retry_index = int(discovery_error_retry_index)
+                discovery_error_retry_index += 1
+                next_retry_ts_ms = _discovery_effective_next_retry_ts_ms(
+                    now_ms=int(now_ms),
+                    retry_index=int(retry_index),
+                    discovery_period_ms=int(rollover_manager.config.discovery_period_ms),
+                )
+                discovery_error_next_retry_ts_ms = int(next_retry_ts_ms)
+                retry_delay_ms = int(max(0, int(next_retry_ts_ms) - int(now_ms)))
+                discovery_fields = _discovery_diagnostic_fields(
+                    discovery_summary,
+                    default_symbol="BTC",
+                    default_horizon="15m",
+                )
+                discovery_requests = _discovery_requests_from_summary(discovery_summary)
+                discovery_requests.append(
+                    {
+                        "status": "ERROR",
+                        "error_code": f"DISCOVERY_{type(exc).__name__.upper()}",
+                        "error": str(exc),
+                        "retry_index": int(retry_index),
+                        "retry_delay_ms": int(retry_delay_ms),
+                        "next_retry_ts_ms": int(next_retry_ts_ms),
+                        "requested_symbol": str(discovery_fields.get("requested_symbol") or "BTC"),
+                        "requested_horizon": str(discovery_fields.get("requested_horizon") or "15m"),
+                        "requested_mode": str(mode),
+                        "n_total": _maybe_int(discovery_fields.get("n_total")),
+                        "n_btc_15m": _maybe_int(discovery_fields.get("n_btc_15m")),
+                        "n_active_now": _maybe_int(discovery_fields.get("n_active_now")),
+                        "n_tradable_now": _maybe_int(discovery_fields.get("n_tradable_now")),
+                        "now_wall_ms": int(now_ms),
+                    }
+                )
+                discovery_requests = _dedupe_discovery_requests(discovery_requests)
                 _append_discovery_request_rows(
                     db=db,
                     ts_ms=now_ms,
-                    discovery_requests=_discovery_requests_from_summary(discovery_summary),
+                    discovery_requests=discovery_requests,
                 )
                 _emit_rollover_abort(
                     now_ms=now_ms,
                     current_state=current_state,
                     intent_payload=intent_payload,
                     abort_reason="DISCOVERY_ERROR",
-                    extra_payload={"error": str(exc)},
+                    extra_payload={
+                        "error": str(exc),
+                        "error_code": f"DISCOVERY_{type(exc).__name__.upper()}",
+                        "retry_index": int(retry_index),
+                        "retry_delay_ms": int(retry_delay_ms),
+                        "next_retry_ts_ms": int(next_retry_ts_ms),
+                        "requested_symbol": str(discovery_fields.get("requested_symbol") or "BTC"),
+                        "requested_horizon": str(discovery_fields.get("requested_horizon") or "15m"),
+                        "n_total": _maybe_int(discovery_fields.get("n_total")),
+                        "n_btc_15m": _maybe_int(discovery_fields.get("n_btc_15m")),
+                        "n_active_now": _maybe_int(discovery_fields.get("n_active_now")),
+                        "n_tradable_now": _maybe_int(discovery_fields.get("n_tradable_now")),
+                        "discovery_requests": discovery_requests,
+                    },
                     log_level="WARNING",
                     log_code="rollover_abort_discovery_error",
+                    count_toward_health=False,
                 )
                 await asyncio.sleep(check_period_secs)
                 continue
@@ -5060,6 +6315,8 @@ async def _run() -> None:
             none_found_start_ts_ms = None
             none_found_deadline_alerted = False
             none_found_quotes_canceled = False
+            discovery_error_retry_index = 0
+            discovery_error_next_retry_ts_ms = None
 
             candidate_state = _resolve_primary_market_state(discovered_markets, discovered_asset_meta)
             if candidate_state is None:
@@ -5083,6 +6340,28 @@ async def _run() -> None:
                 "market_end_source_new": candidate_state.market_end_source,
                 "selection_key_new": candidate_state.selection_key,
             }
+            selection_witness = _extract_selection_witness(discovery_summary)
+            candidate_payload["selection_witness"] = dict(selection_witness)
+            candidate_payload["max_candidates_considered"] = int(
+                trading_cfg.get("rollover_max_candidates_considered", 10)
+            )
+            candidate_trace = _rollover_trace_payload(
+                now_ms=now_ms,
+                candidate_market_slug=candidate_state.market_slug,
+                candidate_token_ids=list(candidate_state.token_ids),
+                precondition_reason_codes=[],
+                attempt_index=int(rollover_attempt_index) + 1,
+                books=runtime.books,
+            )
+            db.append_log(
+                now_ms,
+                "INFO",
+                "rollover_candidate_selected",
+                {
+                    **candidate_payload,
+                    **candidate_trace,
+                },
+            )
 
             if not rollover_manager.has_market_changed(candidate_state):
                 await asyncio.sleep(check_period_secs)
@@ -5109,6 +6388,7 @@ async def _run() -> None:
                 market_end_ts_ms=candidate_state.market_end_ts_ms,
             )
             if not candidate_live:
+                rejection_reason = _candidate_rejection_reason(candidate_liveness_state)
                 _emit_rollover_abort(
                     now_ms=now_ms,
                     current_state=current_state,
@@ -5118,10 +6398,26 @@ async def _run() -> None:
                         **candidate_payload,
                         "candidate_liveness_state": candidate_liveness_state,
                         "candidate_liveness_details": candidate_liveness_details,
+                        "rejection_reason": rejection_reason,
+                        "selection_witness": {
+                            **selection_witness,
+                            "ws_confirm_state": "NOT_ATTEMPTED",
+                        },
                         "discovery_summary": discovery_summary,
                     },
                     log_level="WARNING",
                     log_code="rollover_abort_candidate_not_live",
+                    count_toward_attempt_limit=True,
+                )
+                db.append_log(
+                    now_ms,
+                    "WARNING",
+                    "rollover_switch_preconditions_failed",
+                    {
+                        **candidate_trace,
+                        "precondition_reason_codes": [str(candidate_liveness_state)],
+                        "candidate_liveness_state": str(candidate_liveness_state),
+                    },
                 )
                 await asyncio.sleep(check_period_secs)
                 continue
@@ -5149,6 +6445,17 @@ async def _run() -> None:
                         },
                         log_level="ERROR",
                         log_code="rollover_abort_prepare_error",
+                        count_toward_attempt_limit=True,
+                    )
+                    db.append_log(
+                        now_ms,
+                        "ERROR",
+                        "rollover_switch_preconditions_failed",
+                        {
+                            **candidate_trace,
+                            "precondition_reason_codes": ["PREPARE_ERROR"],
+                            "error": str(exc),
+                        },
                     )
                     await asyncio.sleep(check_period_secs)
                     continue
@@ -5162,11 +6469,14 @@ async def _run() -> None:
                     new_asset_ids=list(candidate_state.token_ids),
                     first_book_timeout_secs=confirm_timeout_secs,
                 )
+                _flush_ws_subscribe_attempts(now_ms)
                 confirm_diag_summary = _confirm_diag_summary(
                     switch_result.confirm_diag,
                     _maybe_float(switch_result.confirm_wait_ms),
                 )
                 if switch_result.status != "committed":
+                    switch_abort_reason = str(switch_result.abort_reason or "SWITCH_ABORT")
+                    rejection_reason = _switch_abort_rejection_reason(switch_abort_reason)
                     market_client.set_books(runtime.books)
                     db.append_rollover_metric(
                         ts_ms=now_ms,
@@ -5209,12 +6519,17 @@ async def _run() -> None:
                         now_ms=now_ms,
                         current_state=current_state,
                         intent_payload=intent_payload,
-                        abort_reason=switch_result.abort_reason or "SWITCH_ABORT",
+                        abort_reason=switch_abort_reason,
                         extra_payload={
                             **candidate_payload,
                             "confirm_diag": switch_result.confirm_diag,
                             "confirm_diag_summary": confirm_diag_summary,
                             "switch_status": switch_result.status,
+                            "rejection_reason": rejection_reason,
+                            "selection_witness": {
+                                **selection_witness,
+                                "ws_confirm_state": "FAILED_CONFIRM",
+                            },
                             "active_subscription_id_after": int(switch_result.active_subscription_id),
                             "prepare_diag": prepare_diag,
                             "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
@@ -5222,6 +6537,17 @@ async def _run() -> None:
                         },
                         log_level="WARNING",
                         log_code="rollover_abort_switch",
+                        count_toward_attempt_limit=True,
+                    )
+                    db.append_log(
+                        now_ms,
+                        "WARNING",
+                        "rollover_switch_preconditions_failed",
+                        {
+                            **candidate_trace,
+                            "precondition_reason_codes": [str(switch_abort_reason)],
+                            "switch_status": str(switch_result.status),
+                        },
                     )
                     await asyncio.sleep(check_period_secs)
                     continue
@@ -5237,6 +6563,7 @@ async def _run() -> None:
                     active_subscription_id=market_client.active_subscription_id(),
                     confirm_diag={},
                 )
+                _flush_ws_subscribe_attempts(now_ms)
                 confirm_diag_summary = _confirm_diag_summary(
                     switch_result.confirm_diag,
                     _maybe_float(switch_result.confirm_wait_ms),
@@ -5328,6 +6655,18 @@ async def _run() -> None:
             )
             if commit_decision.action != "COMMIT":
                 market_client.set_books(runtime.books)
+                db.append_log(
+                    now_ms,
+                    "INFO",
+                    "rollover_commit_blocked_by_feed",
+                    {
+                        **candidate_trace,
+                        "precondition_reason_codes": list(readiness_result.reason_codes),
+                        "commit_decision": str(commit_decision.action),
+                        "commit_decision_reason": str(commit_decision.reason),
+                        "liveness_ok": bool(liveness_ok),
+                    },
+                )
                 _emit_rollover_abort(
                     now_ms=now_ms,
                     current_state=current_state,
@@ -5345,6 +6684,7 @@ async def _run() -> None:
                     log_level="INFO",
                     log_code="rollover_abort_readiness_or_liveness",
                     count_toward_health=not rollover_manager.escape_hatch_open(now_ms),
+                    count_toward_attempt_limit=True,
                 )
                 await asyncio.sleep(check_period_secs)
                 continue
@@ -5368,6 +6708,12 @@ async def _run() -> None:
                 resolved_markets[:] = discovered_markets
                 asset_meta.clear()
                 asset_meta.update(discovered_asset_meta)
+                _write_resolved_markets_artifact(
+                    log_dir=log_dir,
+                    run_id=run_id,
+                    resolved_markets=resolved_markets,
+                    ts_ms=now_ms,
+                )
             except Exception as exc:
                 market_client.set_books(runtime.books)
                 abort_payload = {
@@ -5392,6 +6738,7 @@ async def _run() -> None:
                     extra_payload=abort_payload,
                     log_level="ERROR",
                     log_code="rollover_abort_runtime_error",
+                    count_toward_attempt_limit=True,
                 )
                 await asyncio.sleep(check_period_secs)
                 continue
@@ -5490,6 +6837,18 @@ async def _run() -> None:
                 ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
                 payload=commit_payload,
             )
+            db.append_log(
+                now_ms,
+                "INFO",
+                "rollover_commit",
+                {
+                    **commit_payload,
+                    **candidate_trace,
+                    "precondition_reason_codes": list(readiness_result.reason_codes),
+                },
+            )
+            rollover_attempt_index = 0
+            rollover_next_retry_ts_ms = None
             quiet_until_ms = int(now_ms + max(0, rollover_quiet_window_ms))
             async with runtime_lock:
                 runtime.activate_rollover_guard(
@@ -5523,12 +6882,12 @@ async def _run() -> None:
                 now_ms=now_ms,
                 payload=commit_payload,
             )
-            db.append_log(now_ms, "INFO", "rollover_commit", commit_payload)
             await asyncio.sleep(check_period_secs)
 
     tasks.append(asyncio.create_task(_quote_loop()))
     tasks.append(asyncio.create_task(_stats_loop()))
     tasks.append(asyncio.create_task(_rollover_loop()))
+    tasks.append(asyncio.create_task(_startup_acceptance_loop()))
 
     def _shutdown(*_args) -> None:
         stop_event.set()
@@ -5542,20 +6901,21 @@ async def _run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown)
 
+    startup_payload_now_ms = int(_now_ms())
     db.append_log(
-        _now_ms(),
+        startup_payload_now_ms,
         "INFO",
         f"run_system_started mode={mode}",
-        {
-            "run_id": run_id,
-            "mode_requested": mode_raw,
-            "mode_effective": mode,
-            "observe_live_alias": bool(observe_live_alias),
-            "order_actions_enabled": bool(mode in {"PAPER", "TRADE"}),
-            "reference_poll_secs": float(settings.reference_poll_secs),
-            "pstar_max_age_ms": int(pstar_builder.max_age_ms),
-            "a_pipeline_diag": runtime._a_pipeline_diag(now_ms=_now_ms()),
-        },
+        _build_startup_log_payload(
+            runtime=runtime,
+            run_id=run_id,
+            mode_raw=mode_raw,
+            mode=mode,
+            observe_live_alias=observe_live_alias,
+            settings=settings,
+            pstar_builder=pstar_builder,
+            now_ms=startup_payload_now_ms,
+        ),
     )
     await stop_event.wait()
     for task in tasks:
@@ -5566,6 +6926,9 @@ async def _run() -> None:
     decision_tape.close()
     trade_tape.close()
     db.close()
+    if startup_acceptance_failure_reason is not None:
+        return 2
+    return 0
 
 
 def _parse_args() -> argparse.Namespace:
@@ -5580,11 +6943,45 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quote-interval-ms", type=int, default=None, help="Quote loop interval in ms")
     parser.add_argument("--stats-interval-ms", type=int, default=None, help="Stats loop interval in ms")
     parser.add_argument("--dry-run", action="store_true", help="Dry-run live broker methods")
+    parser.add_argument("--pid-file", default=None, help="Optional path to write runtime PID metadata")
     return parser.parse_args()
 
 
 def _effective_auto_discover(cli_auto_discover: bool, settings_auto_discover: bool) -> bool:
     return bool(cli_auto_discover or settings_auto_discover)
+
+
+def _build_startup_log_payload(
+    *,
+    runtime: RuntimeEngine,
+    run_id: str,
+    mode_raw: str,
+    mode: str,
+    observe_live_alias: bool,
+    settings: Any,
+    pstar_builder: PStarBuilder,
+    now_ms: int,
+) -> Dict[str, Any]:
+    ts_ms = int(now_ms)
+    return {
+        "run_id": str(run_id),
+        "mode_requested": str(mode_raw),
+        "mode_effective": str(mode),
+        "observe_live_alias": bool(observe_live_alias),
+        "order_actions_enabled": bool(mode in {"PAPER", "TRADE"}),
+        "reference_poll_secs": float(settings.reference_poll_secs),
+        "pstar_max_age_ms": int(pstar_builder.max_age_ms),
+        "paper_trading_profile": {
+            "single_level_quoting": bool(runtime._single_level_quoting),
+            "max_orders_per_min": int(runtime._max_orders_per_min),
+            "max_cancels_per_min": int(runtime._max_cancels_per_min),
+            "max_daily_loss_usdc": float(runtime._max_daily_loss_usdc),
+            "max_daily_notional_usdc": float(runtime._max_daily_notional_usdc),
+            "per_market_caps": runtime._cap_state,
+            "rollover_guard": runtime.rollover_guard_status(ts_ms),
+        },
+        "a_pipeline_diag": runtime._a_pipeline_diag(now_ms=ts_ms),
+    }
 
 
 def _resolve_runtime_mode(mode_raw: str) -> Tuple[str, bool]:
@@ -5650,7 +7047,7 @@ def _should_emit_unknown_ws_alert(
 
 
 def main() -> None:
-    asyncio.run(_run())
+    raise SystemExit(asyncio.run(_run()))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 import threading
 
 
@@ -54,10 +54,16 @@ class TradeEvent:
 
 
 class TradeTape:
-    def __init__(self, log_dir: str, run_id: str) -> None:
+    def __init__(
+        self,
+        log_dir: str,
+        run_id: str,
+        date_key_provider: Optional[Callable[[], str]] = None,
+    ) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
+        self._date_key_provider = date_key_provider or _default_date_key_provider
         self._handles: Dict[str, Any] = {}
         self._lock = threading.Lock()
         self._last_event_id = 0
@@ -123,7 +129,7 @@ class TradeTape:
             raise ValueError(f"trade_tape_missing_fields_for_type:{event_type}:{sorted(type_missing)}")
 
     def _get_handle(self):
-        date_key = datetime.now(timezone.utc).strftime("%Y%m%d")
+        date_key = str(self._date_key_provider())
         filename = f"trade_{date_key}.jsonl"
         path = self.log_dir / filename
         handle = self._handles.get(path.as_posix())
@@ -131,3 +137,7 @@ class TradeTape:
             handle = path.open("a", encoding="utf-8")
             self._handles[path.as_posix()] = handle
         return handle
+
+
+def _default_date_key_provider() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")

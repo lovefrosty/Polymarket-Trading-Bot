@@ -215,12 +215,40 @@ def adapt_fills(df: pd.DataFrame) -> pd.DataFrame:
     hedge_flags: List[bool] = []
     slippage: List[Optional[float]] = []
     time_to_fill: List[Optional[float]] = []
+    simulated_flags: List[bool] = []
+    brokers: List[Optional[str]] = []
+    asset_ids: List[Optional[str]] = []
+    modes: List[Optional[str]] = []
+    client_order_ids: List[Optional[str]] = []
+    vwap_prices: List[Optional[float]] = []
+    depths_at_qty: List[Optional[float]] = []
+    spreads_bps: List[Optional[float]] = []
+    book_ages_ms: List[Optional[float]] = []
+    fee_bps_vals: List[Optional[float]] = []
+    fee_modes: List[Optional[str]] = []
+    fill_models: List[Optional[str]] = []
+    latency_ms_vals: List[Optional[float]] = []
     for _, row in out.iterrows():
         payload = safe_json(row.get("payload_json"))
         payload_text = json.dumps(payload).lower()
         is_hedge = bool(payload.get("is_hedge")) or "hedge" in payload_text
         hedge_flags.append(is_hedge)
         slippage.append(payload.get("slippage_bps"))
+        simulated_flags.append(bool(payload.get("simulated")))
+        brokers.append(str(payload.get("broker")) if payload.get("broker") is not None else None)
+        asset_ids.append(str(payload.get("asset_id")) if payload.get("asset_id") is not None else None)
+        modes.append(str(payload.get("mode")) if payload.get("mode") is not None else None)
+        client_order_ids.append(
+            str(payload.get("client_order_id")) if payload.get("client_order_id") is not None else None
+        )
+        vwap_prices.append(_float_or_none(payload.get("vwap_price")))
+        depths_at_qty.append(_float_or_none(payload.get("depth_at_qty")))
+        spreads_bps.append(_float_or_none(payload.get("spread_bps")))
+        book_ages_ms.append(_float_or_none(payload.get("book_age_ms")))
+        fee_bps_vals.append(_float_or_none(payload.get("fee_bps") if payload.get("fee_bps") is not None else payload.get("fees_bps")))
+        fee_modes.append(str(payload.get("fee_mode")) if payload.get("fee_mode") is not None else None)
+        fill_models.append(str(payload.get("fill_model")) if payload.get("fill_model") is not None else None)
+        latency_ms_vals.append(_float_or_none(payload.get("latency_ms")))
         primary_ts = payload.get("primary_fill_ts_ms")
         hedge_ts = payload.get("hedge_fill_ts_ms")
         if primary_ts is not None and hedge_ts is not None:
@@ -233,9 +261,382 @@ def adapt_fills(df: pd.DataFrame) -> pd.DataFrame:
     out["is_hedge"] = hedge_flags
     out["slippage_bps"] = slippage
     out["time_to_fill_s"] = time_to_fill
+    out["simulated"] = simulated_flags
+    out["broker"] = brokers
+    out["asset_id"] = asset_ids
+    out["mode"] = modes
+    out["client_order_id"] = client_order_ids
+    out["vwap_price"] = vwap_prices
+    out["depth_at_qty"] = depths_at_qty
+    out["spread_bps"] = spreads_bps
+    out["book_age_ms"] = book_ages_ms
+    out["fee_bps"] = fee_bps_vals
+    out["fee_mode"] = fee_modes
+    out["fill_model"] = fill_models
+    out["latency_ms"] = latency_ms_vals
     if "ts_ms" in out.columns:
         out["ts"] = pd.to_datetime(out["ts_ms"], unit="ms", utc=True)
     return out
+
+
+def _default_paper_trading_profile() -> Dict[str, Any]:
+    return {
+        "single_level_quoting": False,
+        "maker_quote_size": 0.0,
+        "maker_half_spread_bps": 0.0,
+        "inventory_skew_per_unit": 0.0,
+        "risk_padding_bps": 0.0,
+        "max_orders_per_min": 0,
+        "max_cancels_per_min": 0,
+        "max_daily_loss_usdc": 0.0,
+        "max_daily_notional_usdc": 0.0,
+        "caps": {},
+        "rollover_guard": {},
+        "sim_latency_ms": None,
+        "sim_fee_mode": None,
+        "fill_model": "book_vwap",
+    }
+
+
+def _default_paper_trading_utilization() -> Dict[str, Any]:
+    return {
+        "orders_per_min": 0,
+        "cancels_per_min": 0,
+        "daily_notional_usdc": 0.0,
+        "daily_loss_usdc": 0.0,
+        "open_quote_count": 0,
+        "active_risk_reasons": [],
+        "orders_per_min_ratio": 0.0,
+        "cancels_per_min_ratio": 0.0,
+        "daily_notional_ratio": 0.0,
+        "daily_loss_ratio": 0.0,
+        "cap_state_by_token": {},
+        "portfolio_cap_state": {
+            "gross": 0.0,
+            "net": 0.0,
+            "gross_limit": 0.0,
+            "net_limit": 0.0,
+        },
+    }
+
+
+def get_latest_runtime_risk_snapshot(
+    *,
+    db_path: Optional[Path] = None,
+    stale_after_ms: int = 120_000,
+) -> Dict[str, Any]:
+    default_profile = _default_paper_trading_profile()
+    default_utilization = _default_paper_trading_utilization()
+    snapshot: Dict[str, Any] = {
+        "available": False,
+        "stale": False,
+        "age_ms": None,
+        "as_of_ts_ms": None,
+        "mode": None,
+        "is_frozen": False,
+        "reasons": [],
+        "alert_state": "UNKNOWN",
+        "profile": default_profile,
+        "utilization": default_utilization,
+    }
+    if not table_exists("system_state", db_path=db_path):
+        return snapshot
+
+    rows = query_df(
+        """
+        SELECT as_of_ts, is_frozen, reasons, mode, payload_json
+        FROM system_state
+        ORDER BY as_of_ts DESC
+        LIMIT 1
+        """,
+        db_path=db_path,
+    )
+    if rows.empty:
+        return snapshot
+
+    row = rows.iloc[0]
+    payload = safe_json(row.get("payload_json"))
+    raw_profile = payload.get("paper_trading_profile")
+    raw_utilization = payload.get("paper_trading_utilization")
+    has_contract = isinstance(raw_profile, dict) and isinstance(raw_utilization, dict)
+    as_of_ts_ms = _int_or_none(row.get("as_of_ts"))
+    age_ms = None if as_of_ts_ms is None else max(0, _now_ms() - int(as_of_ts_ms))
+
+    snapshot.update(
+        {
+            "available": has_contract,
+            "stale": bool(age_ms is not None and age_ms > int(stale_after_ms)),
+            "age_ms": age_ms,
+            "as_of_ts_ms": as_of_ts_ms,
+            "mode": str(row.get("mode")) if row.get("mode") is not None else None,
+            "is_frozen": bool(int(row.get("is_frozen") or 0)),
+            "reasons": parse_reasons(row.get("reasons")),
+            "alert_state": str(payload.get("alert_state") or ("FROZEN" if bool(int(row.get("is_frozen") or 0)) else "OK")).upper(),
+            "profile": {**default_profile, **(raw_profile if isinstance(raw_profile, dict) else {})},
+            "utilization": {**default_utilization, **(raw_utilization if isinstance(raw_utilization, dict) else {})},
+        }
+    )
+    utilization = dict(snapshot["utilization"])
+    utilization["active_risk_reasons"] = [str(code) for code in utilization.get("active_risk_reasons", []) if str(code).strip()]
+    cap_state_raw = utilization.get("cap_state_by_token")
+    if isinstance(cap_state_raw, dict):
+        normalized_caps: Dict[str, Dict[str, Any]] = {}
+        for token_id, raw in cap_state_raw.items():
+            if not isinstance(raw, dict):
+                continue
+            normalized_caps[str(token_id)] = {
+                "yes_qty": _float_or_none(raw.get("yes_qty")) or 0.0,
+                "no_qty": _float_or_none(raw.get("no_qty")) or 0.0,
+                "token_notional": _float_or_none(raw.get("token_notional")) or 0.0,
+                "token_net_notional": _float_or_none(raw.get("token_net_notional")) or 0.0,
+                "hard_breach": bool(raw.get("hard_breach")),
+                "soft_breach": bool(raw.get("soft_breach")),
+                "reason_codes": [str(code) for code in raw.get("reason_codes", []) if str(code).strip()],
+            }
+        utilization["cap_state_by_token"] = normalized_caps
+    else:
+        utilization["cap_state_by_token"] = {}
+    portfolio_raw = utilization.get("portfolio_cap_state")
+    utilization["portfolio_cap_state"] = {
+        "gross": _float_or_none(portfolio_raw.get("gross") if isinstance(portfolio_raw, dict) else None) or 0.0,
+        "net": _float_or_none(portfolio_raw.get("net") if isinstance(portfolio_raw, dict) else None) or 0.0,
+        "gross_limit": _float_or_none(portfolio_raw.get("gross_limit") if isinstance(portfolio_raw, dict) else None) or 0.0,
+        "net_limit": _float_or_none(portfolio_raw.get("net_limit") if isinstance(portfolio_raw, dict) else None) or 0.0,
+    }
+    snapshot["utilization"] = utilization
+    return snapshot
+
+
+def get_paper_fill_telemetry(
+    *,
+    start_ts_ms: int,
+    end_ts_ms: int,
+    limit: int,
+    market_slug: str = "ALL",
+    token_id: str = "ALL",
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    columns = [
+        "ts_ms",
+        "event_id",
+        "order_id",
+        "token_id",
+        "market_slug",
+        "side",
+        "fill_price",
+        "fill_qty",
+        "liquidity",
+        "simulated",
+        "broker",
+        "asset_id",
+        "mode",
+        "client_order_id",
+        "vwap_price",
+        "depth_at_qty",
+        "slippage_bps",
+        "spread_bps",
+        "book_age_ms",
+        "fee_bps",
+        "fee_mode",
+        "fill_model",
+        "latency_ms",
+    ]
+    if not table_exists("fills", db_path=db_path):
+        return pd.DataFrame(columns=columns)
+
+    capped_limit = max(1, int(limit))
+    rows = query_df(
+        """
+        SELECT
+          ts_ms,
+          event_id,
+          order_id,
+          token_id,
+          market_slug,
+          side,
+          fill_price,
+          fill_qty,
+          liquidity,
+          payload_json
+        FROM fills
+        WHERE ts_ms BETWEEN ? AND ?
+        ORDER BY ts_ms DESC, event_id DESC
+        LIMIT ?
+        """,
+        (int(start_ts_ms), int(end_ts_ms), int(capped_limit)),
+        db_path=db_path,
+    )
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    out = adapt_fills(rows)
+    token_market = _latest_token_market(as_of_ts_ms=int(end_ts_ms), db_path=db_path)
+    if not token_market.empty:
+        token_market = token_market.rename(columns={"market_slug": "market_slug_from_decision"})
+        out = out.merge(token_market[["token_id", "market_slug_from_decision"]], on="token_id", how="left")
+        out["market_slug"] = out.apply(
+            lambda row: _normalize_market_slug(row.get("market_slug")) or _normalize_market_slug(row.get("market_slug_from_decision")),
+            axis=1,
+        )
+        out = out.drop(columns=["market_slug_from_decision"], errors="ignore")
+    else:
+        out["market_slug"] = out["market_slug"].apply(_normalize_market_slug)
+
+    if market_slug != "ALL":
+        out = out[out["market_slug"] == str(market_slug)]
+    if token_id != "ALL":
+        out = out[out["token_id"] == str(token_id)]
+    out = out.sort_values(["ts_ms", "event_id"], ascending=[False, False]).head(capped_limit)
+    return out[columns]
+
+
+def _normalize_market_slug(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def get_live_order_newswire(
+    start_ts_ms: int,
+    end_ts_ms: int,
+    limit: int,
+    market_slug: str = "ALL",
+    last_seen_ts_ms: Optional[int] = None,
+    last_seen_event_id: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    if not table_exists("orders", db_path=db_path) and not table_exists("fills", db_path=db_path):
+        return pd.DataFrame(
+            columns=[
+                "ts_ms",
+                "event_id",
+                "event_type",
+                "order_id",
+                "market_slug",
+                "condition_id",
+                "token_id",
+                "side",
+                "price",
+                "size",
+                "status",
+                "mode",
+                "reason_code",
+            ]
+        )
+    cap = max(1, int(limit))
+    params: List[Any] = [int(start_ts_ms), int(end_ts_ms)]
+    watermark_where = ""
+    if last_seen_ts_ms is not None:
+        params.extend([int(last_seen_ts_ms), int(last_seen_ts_ms), str(last_seen_event_id or "")])
+        watermark_where = " AND (ts_ms > ? OR (ts_ms = ? AND event_id > ?))"
+
+    events = query_df(
+        f"""
+        SELECT *
+        FROM (
+          SELECT
+            o.ts_ms AS ts_ms,
+            o.event_id AS event_id,
+            'order' AS event_type,
+            o.order_id AS order_id,
+            o.market_slug AS market_slug,
+            o.condition_id AS condition_id,
+            o.token_id AS token_id,
+            o.side AS side,
+            o.price AS price,
+            o.qty AS size,
+            o.status AS status,
+            o.mode AS mode,
+            COALESCE(o.reason_code, o.reason, '') AS reason_code
+          FROM orders o
+          WHERE o.ts_ms BETWEEN ? AND ?
+
+          UNION ALL
+
+          SELECT
+            f.ts_ms AS ts_ms,
+            f.event_id AS event_id,
+            'fill' AS event_type,
+            f.order_id AS order_id,
+            f.market_slug AS market_slug,
+            f.condition_id AS condition_id,
+            f.token_id AS token_id,
+            f.side AS side,
+            f.fill_price AS price,
+            f.fill_qty AS size,
+            COALESCE(f.liquidity, 'fill') AS status,
+            f.mode AS mode,
+            COALESCE(f.reason_code, '') AS reason_code
+          FROM fills f
+          WHERE f.ts_ms BETWEEN ? AND ?
+        ) news
+        WHERE 1=1
+        {watermark_where}
+        ORDER BY ts_ms DESC, event_id DESC
+        LIMIT ?
+        """,
+        (
+            int(start_ts_ms),
+            int(end_ts_ms),
+            int(start_ts_ms),
+            int(end_ts_ms),
+            *params[2:],
+            cap,
+        ),
+        db_path=db_path,
+    )
+    if events.empty:
+        return events
+
+    out = events.copy()
+    token_market = _latest_token_market(as_of_ts_ms=int(end_ts_ms), db_path=db_path)
+    if not token_market.empty:
+        token_market = token_market.rename(columns={"market_slug": "market_slug_from_decision"})
+        out = out.merge(token_market[["token_id", "market_slug_from_decision"]], on="token_id", how="left")
+        out["market_slug"] = out.apply(
+            lambda row: _normalize_market_slug(row.get("market_slug")) or _normalize_market_slug(row.get("market_slug_from_decision")),
+            axis=1,
+        )
+    else:
+        out["market_slug"] = out["market_slug"].apply(_normalize_market_slug)
+    out = out.drop(columns=["market_slug_from_decision"], errors="ignore")
+
+    if market_slug != "ALL":
+        out = out[out["market_slug"] == str(market_slug)]
+
+    out = out.sort_values(["ts_ms", "event_id"], ascending=[False, False]).head(cap)
+    return out[
+        [
+            "ts_ms",
+            "event_id",
+            "event_type",
+            "order_id",
+            "market_slug",
+            "condition_id",
+            "token_id",
+            "side",
+            "price",
+            "size",
+            "status",
+            "mode",
+            "reason_code",
+        ]
+    ]
+
+
+def get_live_order_newswire_markets(end_ts_ms: int, db_path: Optional[Path] = None) -> List[str]:
+    rows = get_live_order_newswire(
+        start_ts_ms=max(0, int(end_ts_ms) - 60 * 60 * 1000),
+        end_ts_ms=int(end_ts_ms),
+        limit=500,
+        market_slug="ALL",
+        db_path=db_path,
+    )
+    if rows.empty or "market_slug" not in rows.columns:
+        return []
+    markets = sorted({str(v) for v in rows["market_slug"].dropna().astype(str).tolist() if str(v).strip()})
+    return markets
 
 
 def _symbol_from_market_slug(slug: Any) -> Optional[str]:

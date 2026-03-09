@@ -54,6 +54,21 @@ class TestSimBroker(unittest.TestCase):
         first = broker.submit(intent)
         second = broker.submit(intent)
         self.assertEqual(first, second)
+        fill_payload = first[-1].payload
+        self.assertEqual(first[-1].event_type, "order_fill")
+        self.assertTrue(bool(fill_payload.get("simulated")))
+        self.assertEqual(str(fill_payload.get("broker")), "sim")
+        self.assertEqual(str(fill_payload.get("asset_id")), "asset")
+        self.assertEqual(str(fill_payload.get("side")), "buy")
+        self.assertEqual(str(fill_payload.get("mode")), "TAKE")
+        self.assertEqual(str(fill_payload.get("client_order_id")), "c1")
+        self.assertAlmostEqual(float(fill_payload.get("vwap_price")), 0.51)
+        self.assertAlmostEqual(float(fill_payload.get("depth_at_qty")), 1.0)
+        self.assertAlmostEqual(float(fill_payload.get("spread_bps")), 400.0)
+        self.assertEqual(str(fill_payload.get("fee_mode")), "TAKE")
+        self.assertEqual(str(fill_payload.get("fill_model")), "book_vwap")
+        self.assertEqual(int(fill_payload.get("latency_ms")), 0)
+        self.assertIn("fee_bps", fill_payload)
 
     def test_leakage_guard(self) -> None:
         broker = self._make_broker(last_recv_mono_ns=2_000_000_000)
@@ -71,3 +86,28 @@ class TestSimBroker(unittest.TestCase):
         events = broker.submit(intent)
         self.assertEqual(events[0].event_type, "order_reject")
         self.assertEqual(events[0].payload.get("error_code"), "LEAKAGE_GUARD")
+        self.assertTrue(bool(events[0].payload.get("simulated")))
+        self.assertEqual(str(events[0].payload.get("asset_id")), "asset")
+        self.assertEqual(str(events[0].payload.get("client_order_id")), "c1")
+        self.assertAlmostEqual(float(events[0].payload.get("depth_at_qty")), 1.0)
+        self.assertAlmostEqual(float(events[0].payload.get("spread_bps")), 400.0)
+
+    def test_insufficient_depth_reject_includes_book_diagnostics(self) -> None:
+        broker = self._make_broker(last_recv_mono_ns=1_000_000_000)
+        intent = OrderIntent(
+            order_id="o2",
+            client_order_id="c2",
+            asset_id="asset",
+            side="buy",
+            size=20.0,
+            price=0.51,
+            mode="TAKE",
+            t_decision_wall_ms=1000,
+            as_of_ts_ms=1000,
+        )
+        events = broker.submit(intent)
+        self.assertEqual(events[0].event_type, "order_reject")
+        self.assertEqual(events[0].payload.get("error_code"), "INSUFFICIENT_DEPTH")
+        self.assertTrue(bool(events[0].payload.get("simulated")))
+        self.assertAlmostEqual(float(events[0].payload.get("depth_at_qty")), 10.0)
+        self.assertAlmostEqual(float(events[0].payload.get("spread_bps")), 400.0)

@@ -162,6 +162,81 @@ python3 -m scripts.analyze_audit ./logs
 
 This reads DecisionTape JSONL files and writes `audit_report.json` and `audit_report.md` to `LOG_DIR`.
 
+## Repo Audit (Read-only)
+
+```bash
+python3 -m scripts.repo_audit --trigger "run audit"
+```
+
+The repo audit command runs read-only checks (git state, invariant scans, rollover/tradability checks,
+mode-safety checks, replay parity evidence, and quality gate) and emits a structured A-I report with
+ranked risks and minimal acceptance-criteria-driven recommendations.
+
+## Replay Certification (Tier-1)
+
+Compare two replay decision streams and fail on any Tier-1 mismatch.
+
+```bash
+python3 scripts/replay_certify.py --left ./logs/run_a --right ./logs/run_b
+```
+
+Tier-1 compares normalized decision contract fields:
+- `decision_id`
+- `as_of_ts_ms`
+- `action`
+- ordered `reasons`
+- `outputs`
+- `fsm_state` (when present in source record)
+
+## Promotion Report (OBSERVE -> PAPER -> TRADE)
+
+Generate a unified promotion verdict by combining integration health, promotion gates, replay certification,
+and soak clocks.
+
+```bash
+python3 scripts/promotion_report.py \
+  --db-path runtime.db \
+  --current-mode PAPER \
+  --replay-report ./tmp/replay_certify.json
+```
+
+`promotion_report` blocks promotion when any of the following fail:
+- integration health
+- promotion gates
+- replay certification
+- soak windows (`OBSERVE >= 48h`, `PAPER >= 48h`)
+
+Soak windows are tracked in `.promotion_mode_history.json` and are reset when runtime fingerprint changes.
+
+## Micro-Cap Live Profile
+
+Pinned defaults for phase-1 constrained live operation are captured in:
+- `config/constitution.yaml`
+- `config/profiles/micro_cap_live.yaml`
+
+Key values:
+- `quote_interval_ms=2000`
+- `max_orders_per_min=30`
+- `max_daily_loss_usdc=50`
+- `cap_gross_usd=200`
+- `cap_total_gross_usd=400`
+- `max_position_per_side=500`
+- `book_stale_after_ms=30000`
+
+## Secret Hygiene (Required)
+
+- Load API credentials and private keys from environment variables only.
+- Never log secrets to JSONL tapes, SQLite rows, or decision evidence payloads.
+- Never commit secrets into repo files, fixtures, or promotion artifacts.
+
+## Operator Runbook (Phase-1)
+
+1. Run OBSERVE and accumulate at least 48h soak data.
+2. Run PAPER and accumulate at least 48h soak data.
+3. Run replay certification on comparable tapes (`scripts/replay_certify.py`).
+4. Run promotion report (`scripts/promotion_report.py`) and require `status=PROMOTE`.
+5. Enable TRADE only after all checks above are green.
+
 ## Build Training Datasets (Offline)
 
 ```bash

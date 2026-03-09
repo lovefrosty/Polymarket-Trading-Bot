@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import threading
 
 
@@ -46,10 +46,16 @@ class DecisionRecord:
 
 
 class DecisionTape:
-    def __init__(self, log_dir: str, run_id: str) -> None:
+    def __init__(
+        self,
+        log_dir: str,
+        run_id: str,
+        date_key_provider: Optional[Callable[[], str]] = None,
+    ) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
+        self._date_key_provider = date_key_provider or _default_date_key_provider
         self._handles: Dict[str, Any] = {}
         self._lock = threading.Lock()
 
@@ -72,7 +78,7 @@ class DecisionTape:
             self._handles.clear()
 
     def _get_handle(self):
-        date_key = datetime.now(timezone.utc).strftime("%Y%m%d")
+        date_key = str(self._date_key_provider())
         filename = f"decision_{date_key}.jsonl"
         path = self.log_dir / filename
         handle = self._handles.get(path.as_posix())
@@ -80,6 +86,10 @@ class DecisionTape:
             handle = path.open("a", encoding="utf-8")
             self._handles[path.as_posix()] = handle
         return handle
+
+
+def _default_date_key_provider() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
 
 
 class TimeMapper:

@@ -9,8 +9,8 @@ from core.trade_tape import TradeTape
 
 
 class TestTradeTapeDeterminism(unittest.TestCase):
-    def _write_events(self, log_dir: Path) -> str:
-        tape = TradeTape(log_dir=str(log_dir), run_id="run")
+    def _write_events(self, log_dir: Path, date_key_provider=None) -> str:
+        tape = TradeTape(log_dir=str(log_dir), run_id="run", date_key_provider=date_key_provider)
         tape.write(
             {
                 "schema_version": "trade_v1",
@@ -56,3 +56,11 @@ class TestTradeTapeDeterminism(unittest.TestCase):
             first = self._write_events(Path(tmpdir) / "first")
             second = self._write_events(Path(tmpdir) / "second")
             self.assertEqual(first, second)
+
+    def test_trade_tape_uses_injected_date_key_provider_for_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir) / "only"
+            _ = self._write_events(log_dir, date_key_provider=lambda: "20991231")
+            files = sorted(glob.glob(str(log_dir / "trade_*.jsonl")))
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].endswith("trade_20991231.jsonl"))

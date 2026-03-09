@@ -42,6 +42,10 @@ EMPTY_LOG_MESSAGES = {
     "logs": "No warning/error logs for this window.",
 }
 
+SCOREBOARD_LOOKBACK_ROWS = 500
+FREEZE_TREND_HOURS = 24
+MS_PER_HOUR = 3_600_000
+
 
 def _sanitize_df_for_view(
     df: pd.DataFrame,
@@ -494,11 +498,30 @@ def render_logs_panel(
     st.subheader("Recent WARN/ERROR alerts")
     if reason_humanizer is not None and "code" in alerts.columns:
         alerts["reason"] = alerts.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
-    alerts = _sanitize_df_for_view(alerts, view_mode, reason_humanizer=reason_humanizer)
-    if alerts.empty:
-        st.info(EMPTY_LOG_MESSAGES["alerts"])
+    is_dev = str(view_mode).lower() == "developer"
+    if is_dev:
+        alerts_view = _sanitize_df_for_view(alerts, view_mode, reason_humanizer=reason_humanizer)
+        if alerts_view.empty:
+            st.info(EMPTY_LOG_MESSAGES["alerts"])
+        else:
+            st.dataframe(alerts_view, width="stretch", height=220)
     else:
-        st.dataframe(alerts, width="stretch", height=220)
+        trader_alerts = pd.DataFrame()
+        if not alerts.empty:
+            trader_alerts = pd.DataFrame(
+                {
+                    "Time": alerts["ts"].astype(str),
+                    "Severity": alerts.get("severity", pd.Series(dtype=str)).astype(str).str.upper(),
+                    "Message": alerts.get("reason", alerts.get("message", pd.Series(dtype=str))).astype(str),
+                }
+            )
+        if trader_alerts.empty:
+            st.info(EMPTY_LOG_MESSAGES["alerts"])
+        else:
+            st.dataframe(trader_alerts.head(min(filters.lookback_rows, 50)), width="stretch", height=220)
+            with st.expander("Technical details", expanded=False):
+                raw_cols = [col for col in ["ts", "severity", "code", "message"] if col in alerts.columns]
+                st.dataframe(alerts[raw_cols].head(50), width="stretch", height=220)
 
     breaches = query_df(
         """
@@ -516,11 +539,24 @@ def render_logs_panel(
     st.subheader("Gate breaches timeline")
     if reason_humanizer is not None and "code" in breaches.columns:
         breaches["reason"] = breaches.apply(lambda row: reason_humanizer(row.get("code"), row.get("message")), axis=1)
-    breaches = _sanitize_df_for_view(breaches, view_mode, reason_humanizer=reason_humanizer)
-    if breaches.empty:
-        st.info(EMPTY_LOG_MESSAGES["breaches"])
+    if is_dev:
+        breaches_view = _sanitize_df_for_view(breaches, view_mode, reason_humanizer=reason_humanizer)
+        if breaches_view.empty:
+            st.info(EMPTY_LOG_MESSAGES["breaches"])
+        else:
+            st.dataframe(breaches_view, width="stretch", height=180)
     else:
-        st.dataframe(breaches, width="stretch", height=180)
+        if breaches.empty:
+            st.info(EMPTY_LOG_MESSAGES["breaches"])
+        else:
+            trader_breaches = pd.DataFrame(
+                {
+                    "Time": breaches["ts"].astype(str),
+                    "Severity": "GATE",
+                    "Message": breaches.get("reason", breaches.get("message", pd.Series(dtype=str))).astype(str),
+                }
+            )
+            st.dataframe(trader_breaches.head(min(filters.lookback_rows, 50)), width="stretch", height=180)
 
     logs = query_df(
         """
@@ -535,10 +571,25 @@ def render_logs_panel(
     if not logs.empty:
         logs["ts"] = pd.to_datetime(logs["ts_ms"], unit="ms", utc=True)
     st.subheader("Logs")
-    if logs.empty:
-        st.info(EMPTY_LOG_MESSAGES["logs"])
+    if is_dev:
+        if logs.empty:
+            st.info(EMPTY_LOG_MESSAGES["logs"])
+        else:
+            st.dataframe(logs, width="stretch", height=220)
     else:
-        st.dataframe(logs, width="stretch", height=220)
+        if logs.empty:
+            st.info(EMPTY_LOG_MESSAGES["logs"])
+        else:
+            trader_logs = pd.DataFrame(
+                {
+                    "Time": logs["ts"].astype(str),
+                    "Severity": logs.get("level", pd.Series(dtype=str)).astype(str).str.upper(),
+                    "Message": logs.get("msg", pd.Series(dtype=str)).astype(str),
+                }
+            )
+            st.dataframe(trader_logs.head(min(filters.lookback_rows, 50)), width="stretch", height=220)
+            with st.expander("Log details", expanded=False):
+                st.dataframe(logs.head(50), width="stretch", height=220)
 
     manifest = logs[logs["msg"].str.contains("manifest", case=False, na=False)] if not logs.empty else pd.DataFrame()
     last_manifest_hash = "N/A"
@@ -557,60 +608,98 @@ def compute_reliability_scoreboard(latency_df: Optional[pd.DataFrame] = None) ->
         SELECT ts_ms, p95_ws_lag_ms, p95_send_ack_ms, p95_signal_age_ms
         FROM latency_stats
         ORDER BY ts_ms DESC
-        LIMIT 500
+        LIMIT ?
         """
+        ,
+        (SCOREBOARD_LOOKBACK_ROWS,),
     )
+    # Aggregate over bounded recent windows instead of materializing full frames.
     pstar = query_df(
         """
-        SELECT ts_ms, disagreement_bps, valid
-        FROM pstar_stats
-        ORDER BY ts_ms DESC
-        LIMIT 500
+        SELECT
+          AVG(CASE WHEN valid = 0 THEN 1.0 ELSE 0.0 END) AS invalid_ratio,
+          AVG(CASE WHEN disagreement_bps > 50.0 THEN 1.0 ELSE 0.0 END) AS disagree_ratio
+        FROM (
+          SELECT valid, disagreement_bps
+          FROM pstar_stats
+          ORDER BY ts_ms DESC
+          LIMIT ?
+        )
         """
+        ,
+        (SCOREBOARD_LOOKBACK_ROWS,),
     )
     rec = query_df(
         """
-        SELECT ts_ms, outside_tolerance, unresolved_mismatch_count
-        FROM reconciliation_stats
-        ORDER BY ts_ms DESC
-        LIMIT 500
+        SELECT
+          AVG(CASE WHEN outside_tolerance = 1 THEN 1.0 ELSE 0.0 END) AS outside_tolerance_ratio,
+          AVG(CASE WHEN unresolved_mismatch_count > 0 THEN 1.0 ELSE 0.0 END) AS unresolved_ratio
+        FROM (
+          SELECT outside_tolerance, unresolved_mismatch_count
+          FROM reconciliation_stats
+          ORDER BY ts_ms DESC
+          LIMIT ?
+        )
         """
+        ,
+        (SCOREBOARD_LOOKBACK_ROWS,),
     )
-    alerts = query_df(
+    lookback_start_ms = _lookback_start_ms(FREEZE_TREND_HOURS)
+    state_ratio = query_df(
         """
-        SELECT ts_ms, severity, code
-        FROM alerts
-        WHERE ts_ms >= (CAST(strftime('%s','now') AS INTEGER) - 86400) * 1000
-        ORDER BY ts_ms DESC
-        """
-    )
-    state = query_df(
-        """
-        SELECT as_of_ts, is_frozen, reasons
+        SELECT AVG(CASE WHEN is_frozen = 1 THEN 1.0 ELSE 0.0 END) AS freeze_ratio
         FROM system_state
-        WHERE as_of_ts >= (CAST(strftime('%s','now') AS INTEGER) - 86400) * 1000
-        ORDER BY as_of_ts DESC
+        WHERE as_of_ts >= ?
         """
+        ,
+        (lookback_start_ms,),
+    )
+    # Hourly aggregate trend queries lower dashboard refresh cost while preserving visible semantics.
+    alerts_hourly = query_df(
+        """
+        SELECT
+          ((ts_ms / ?) * ?) AS hour_ms,
+          COUNT(*) AS alerts_total,
+          SUM(
+            CASE
+              WHEN UPPER(COALESCE(code, '')) LIKE '%FREEZE%' THEN 1
+              WHEN SUBSTR(UPPER(COALESCE(code, '')), 1, 2) IN ('A_', 'B_', 'C_', 'D_', 'E_') THEN 1
+              ELSE 0
+            END
+          ) AS freeze_related_alerts
+        FROM alerts
+        WHERE ts_ms >= ?
+        GROUP BY hour_ms
+        ORDER BY hour_ms DESC
+        LIMIT ?
+        """
+        ,
+        (MS_PER_HOUR, MS_PER_HOUR, lookback_start_ms, FREEZE_TREND_HOURS),
+    )
+    state_hourly = query_df(
+        """
+        SELECT
+          ((as_of_ts / ?) * ?) AS hour_ms,
+          SUM(CASE WHEN is_frozen = 1 THEN 1 ELSE 0 END) AS frozen_samples
+        FROM system_state
+        WHERE as_of_ts >= ?
+        GROUP BY hour_ms
+        ORDER BY hour_ms DESC
+        LIMIT ?
+        """
+        ,
+        (MS_PER_HOUR, MS_PER_HOUR, lookback_start_ms, FREEZE_TREND_HOURS),
     )
 
     ws_lag = _safe_float(lat["p95_ws_lag_ms"].median()) if not lat.empty and "p95_ws_lag_ms" in lat.columns else 0.0
     ack = _safe_float(lat["p95_send_ack_ms"].median()) if not lat.empty and "p95_send_ack_ms" in lat.columns else 0.0
     signal = _safe_float(lat["p95_signal_age_ms"].median()) if not lat.empty and "p95_signal_age_ms" in lat.columns else 0.0
-    invalid_ratio = 0.0
-    disagree_ratio = 0.0
-    if not pstar.empty:
-        invalid_ratio = float((pstar["valid"] == 0).mean()) if "valid" in pstar.columns else 0.0
-        if "disagreement_bps" in pstar.columns:
-            disagree_ratio = float((pstar["disagreement_bps"] > 50.0).mean())
-    mismatch_ratio = 0.0
-    if not rec.empty:
-        if "outside_tolerance" in rec.columns:
-            mismatch_ratio = float((rec["outside_tolerance"] == 1).mean())
-        elif "unresolved_mismatch_count" in rec.columns:
-            mismatch_ratio = float((rec["unresolved_mismatch_count"] > 0).mean())
-    freeze_ratio = 0.0
-    if not state.empty and "is_frozen" in state.columns:
-        freeze_ratio = float((state["is_frozen"] == 1).mean())
+    invalid_ratio = _safe_float(pstar.iloc[0].get("invalid_ratio")) if not pstar.empty else 0.0
+    disagree_ratio = _safe_float(pstar.iloc[0].get("disagree_ratio")) if not pstar.empty else 0.0
+    outside_ratio = rec.iloc[0].get("outside_tolerance_ratio") if not rec.empty else None
+    unresolved_ratio = rec.iloc[0].get("unresolved_ratio") if not rec.empty else None
+    mismatch_ratio = _safe_float(outside_ratio if outside_ratio is not None and not pd.isna(outside_ratio) else unresolved_ratio)
+    freeze_ratio = _safe_float(state_ratio.iloc[0].get("freeze_ratio")) if not state_ratio.empty else 0.0
 
     rows = classify_reliability_rows(
         {
@@ -637,7 +726,7 @@ def compute_reliability_scoreboard(latency_df: Optional[pd.DataFrame] = None) ->
         }
     )
 
-    freeze_trend = _freeze_trend(alerts, state)
+    freeze_trend = _merge_hourly_trend(alerts_hourly, state_hourly)
     return {
         "rows": [
             {
@@ -652,34 +741,56 @@ def compute_reliability_scoreboard(latency_df: Optional[pd.DataFrame] = None) ->
     }
 
 
-def _freeze_trend(alerts: pd.DataFrame, state: pd.DataFrame) -> List[Dict[str, Any]]:
+def _lookback_start_ms(hours: int) -> int:
+    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    return max(0, now_ms - int(hours) * MS_PER_HOUR)
+
+
+def _merge_hourly_trend(alerts_hourly: pd.DataFrame, state_hourly: pd.DataFrame) -> List[Dict[str, Any]]:
     buckets: Dict[str, Dict[str, Any]] = {}
 
-    if not alerts.empty and "ts_ms" in alerts.columns:
-        for _, row in alerts.iterrows():
-            ts = _bucket_hour(_safe_int(row.get("ts_ms")))
+    if not alerts_hourly.empty:
+        for _, row in alerts_hourly.iterrows():
+            hour_ms = _safe_int(row.get("hour_ms"))
+            if hour_ms is None:
+                continue
+            ts = _bucket_hour(hour_ms)
             if ts is None:
                 continue
-            bucket = buckets.setdefault(ts, {"hour_utc": ts, "alerts_total": 0, "freeze_related_alerts": 0, "frozen_samples": 0})
-            bucket["alerts_total"] += 1
-            code = str(row.get("code") or "").upper()
-            if "FREEZE" in code or code.startswith(("A_", "B_", "C_", "D_", "E_")):
-                bucket["freeze_related_alerts"] += 1
+            bucket = buckets.setdefault(
+                ts,
+                {"hour_ms": hour_ms, "hour_utc": ts, "alerts_total": 0, "freeze_related_alerts": 0, "frozen_samples": 0},
+            )
+            bucket["alerts_total"] = int(row.get("alerts_total") or 0)
+            bucket["freeze_related_alerts"] = int(row.get("freeze_related_alerts") or 0)
 
-    if not state.empty:
-        ts_col = "as_of_ts" if "as_of_ts" in state.columns else None
-        if ts_col is not None and "is_frozen" in state.columns:
-            for _, row in state.iterrows():
-                ts = _bucket_hour(_safe_int(row.get(ts_col)))
-                if ts is None:
-                    continue
-                bucket = buckets.setdefault(ts, {"hour_utc": ts, "alerts_total": 0, "freeze_related_alerts": 0, "frozen_samples": 0})
-                if int(row.get("is_frozen") or 0) == 1:
-                    bucket["frozen_samples"] += 1
+    if not state_hourly.empty:
+        for _, row in state_hourly.iterrows():
+            hour_ms = _safe_int(row.get("hour_ms"))
+            if hour_ms is None:
+                continue
+            ts = _bucket_hour(hour_ms)
+            if ts is None:
+                continue
+            bucket = buckets.setdefault(
+                ts,
+                {"hour_ms": hour_ms, "hour_utc": ts, "alerts_total": 0, "freeze_related_alerts": 0, "frozen_samples": 0},
+            )
+            bucket["frozen_samples"] = int(row.get("frozen_samples") or 0)
 
     rows = list(buckets.values())
-    rows.sort(key=lambda item: item["hour_utc"], reverse=True)
-    return rows[:24]
+    rows.sort(key=lambda item: int(item.get("hour_ms") or 0), reverse=True)
+    out: List[Dict[str, Any]] = []
+    for item in rows[:FREEZE_TREND_HOURS]:
+        out.append(
+            {
+                "hour_utc": item["hour_utc"],
+                "alerts_total": item["alerts_total"],
+                "freeze_related_alerts": item["freeze_related_alerts"],
+                "frozen_samples": item["frozen_samples"],
+            }
+        )
+    return out
 
 
 def _bucket_hour(ts_ms: Optional[int]) -> Optional[str]:
