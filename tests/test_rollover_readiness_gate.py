@@ -136,6 +136,28 @@ class TestRolloverReadinessGate(unittest.TestCase):
         self.assertIn("ROLLOVER_QUIET_WINDOW", reasons)
         self.assertIn("ROLLOVER_READINESS_BLOCK", reasons)
 
+    def test_adopted_market_guard_clears_after_quiet_window_without_full_readiness(self) -> None:
+        runtime = _runtime(["yes", "no"])
+        now_ms = 10_000
+
+        for token in ["yes", "no"]:
+            book = runtime.books[token]
+            book.apply_snapshot(
+                bids=[(0.10, 5.0)],
+                asks=[(0.11, 5.0)],
+                event_ts_ms=now_ms - 50,
+                recv_mono_ns=1_000_000_000,
+                last_hash=None,
+            )
+
+        runtime.on_reference("spot", "BTC", 50000.0, ts_event_ms=now_ms - 20, ts_recv_ms=now_ms - 20)
+        runtime.on_reference("perp", "BTC", 50000.0, ts_event_ms=now_ms - 20, ts_recv_ms=now_ms - 20)
+
+        runtime.activate_rollover_guard(["yes", "no"], quiet_until_ms=now_ms + 100, require_readiness=False)
+        reasons = runtime.quote_guard_reasons("yes", now_ms + 200)
+        self.assertEqual(reasons, [])
+        self.assertFalse(runtime.rollover_guard_status(now_ms + 200)["active"])
+
 
 if __name__ == "__main__":
     unittest.main()

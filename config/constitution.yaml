@@ -45,7 +45,7 @@
     "book_stale_after_ms": 30000,
     "book_down_after_ms": 120000,
     "max_book_age_ms": 2000,
-    "max_spread_bps": 150.0,
+    "max_spread_bps": 500.0,
     "max_slippage_bps": 120.0,
     "min_depth_at_qty": 1.0,
     "signal_age_max_ms": 1200,

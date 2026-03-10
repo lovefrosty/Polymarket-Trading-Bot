@@ -149,7 +149,7 @@ def load_settings() -> Settings:
         max_book_staleness_ms=int(os.getenv("MAX_BOOK_STALENESS_MS", "2000")),
         ws_reconnect_base_ms=int(os.getenv("WS_RECONNECT_BASE_MS", "250")),
         ws_reconnect_max_ms=int(os.getenv("WS_RECONNECT_MAX_MS", "10000")),
-        max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "150.0")),
+        max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "500.0")),
         max_slippage_bps=float(os.getenv("MAX_SLIPPAGE_BPS", "200.0")),
         dry_run_interval_secs=float(os.getenv("DRY_RUN_INTERVAL_SECS", "5")),
         dry_run_size=float(os.getenv("DRY_RUN_SIZE", "1")),

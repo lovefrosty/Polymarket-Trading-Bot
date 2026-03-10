@@ -546,7 +546,7 @@ class RuntimeEngine:
         if self._rollover_guard_require_readiness and not readiness_result.ready:
             reasons.append("ROLLOVER_READINESS_BLOCK")
             reasons.extend(readiness_result.reason_codes)
-        if not reasons and readiness_result.ready:
+        if not reasons and (readiness_result.ready or not self._rollover_guard_require_readiness):
             self._rollover_guard_token_ids = set()
             self._rollover_guard_quiet_until_ms = 0
             self._rollover_guard_require_readiness = False
@@ -4055,6 +4055,57 @@ def _confirm_diag_summary(
         "reject_reasons_top": reject_reasons_top,
         "missing_assets": missing_assets,
         "confirm_wait_ms": _maybe_float(confirm_wait_ms),
+        "failure_class": str(diag.get("failure_class") or "") or None,
+        "reconnect_attempted": bool(diag.get("reconnect_attempted")),
+        "unsubscribe_before_subscribe": bool(diag.get("unsubscribe_before_subscribe")),
+    }
+
+
+def _old_market_non_viable(*, now_ms: int, market_end_ts_ms: Optional[int]) -> bool:
+    end_ts_ms = _maybe_int(market_end_ts_ms)
+    return end_ts_ms is not None and int(now_ms) >= int(end_ts_ms)
+
+
+def _should_adopt_switched_market_without_readiness(
+    *,
+    token_ids_changed: bool,
+    switch_status: str,
+    commit_action: str,
+    old_market_non_viable: bool,
+) -> bool:
+    return (
+        bool(token_ids_changed)
+        and str(switch_status) == "committed"
+        and str(commit_action) != "COMMIT"
+        and bool(old_market_non_viable)
+    )
+
+
+async def _rollback_post_switch_abort(
+    *,
+    market_client: Any,
+    runtime: Any,
+    previous_token_ids: List[str],
+    confirm_timeout_secs: float,
+) -> Dict[str, Any]:
+    market_client.set_books(runtime.books)
+    rollback_result = await market_client.resubscribe(
+        new_asset_ids=list(previous_token_ids),
+        first_book_timeout_secs=confirm_timeout_secs,
+    )
+    market_client.set_books(runtime.books)
+    return {
+        "post_switch_abort": True,
+        "rollback_attempted": True,
+        "rollback_status": str(rollback_result.status),
+        "rollback_confirm_diag": dict(rollback_result.confirm_diag or {}),
+        "rollback_confirm_diag_summary": _confirm_diag_summary(
+            rollback_result.confirm_diag,
+            _maybe_float(rollback_result.confirm_wait_ms),
+        ),
+        "rollback_confirm_wait_ms": _maybe_float(rollback_result.confirm_wait_ms),
+        "rollback_unsubscribe_ms": _maybe_float(rollback_result.unsubscribe_ms),
+        "rollback_active_subscription_after": int(rollback_result.active_subscription_id),
     }
 
 
@@ -4492,6 +4543,15 @@ async def _run() -> None:
             ws_client = ReferenceWSClient(
                 tape=event_tape,
                 config=ReferenceWSConfig(venue="kraken", symbols=symbols),
+                on_quote=_on_reference_quote,
+                reference_store=None,
+            )
+            ref_ws_clients.append(ws_client)
+            tasks.append(asyncio.create_task(ws_client.run()))
+        elif source == "ws_kraken_futures_perp":
+            ws_client = ReferenceWSClient(
+                tape=event_tape,
+                config=ReferenceWSConfig(venue="kraken_futures", symbols=symbols),
                 on_quote=_on_reference_quote,
                 reference_store=None,
             )
@@ -5298,6 +5358,10 @@ async def _run() -> None:
                 escape_hatch_open=rollover_manager.escape_hatch_open(now_ms),
                 liveness_ok=bool(liveness_ok),
             )
+            old_market_non_viable = _old_market_non_viable(
+                now_ms=now_ms,
+                market_end_ts_ms=current_state.market_end_ts_ms,
+            )
             readiness_payload = {
                 **candidate_payload,
                 "readiness_ok": bool(readiness_result.ready),
@@ -5310,6 +5374,7 @@ async def _run() -> None:
                 "commit_decision_reason": commit_decision.reason,
                 "liveness_ok": bool(liveness_ok),
                 "liveness_details": liveness_details,
+                "old_market_non_viable": bool(old_market_non_viable),
             }
             db.append_rollover_status(
                 ts_ms=now_ms,
@@ -5326,75 +5391,160 @@ async def _run() -> None:
                 ignored_old_rate_per_min=metrics.market_ignored_old_rate_per_min(now_ms),
                 payload=readiness_payload,
             )
+            adopted_without_readiness = False
+            rollback_skipped_reason: Optional[str] = None
+            candidate_constraints = _build_constraints(discovered_markets, policy_cfg, settings)
+            runtime_diag: Dict[str, Any]
+            commit_block_ms: Optional[float] = None
+            previous_state = current_state
+            commit_already_performed = False
             if commit_decision.action != "COMMIT":
-                market_client.set_books(runtime.books)
-                _emit_rollover_abort(
-                    now_ms=now_ms,
-                    current_state=current_state,
-                    intent_payload=intent_payload,
-                    abort_reason=commit_decision.reason,
-                    extra_payload={
-                        **readiness_payload,
+                if _should_adopt_switched_market_without_readiness(
+                    token_ids_changed=bool(token_ids_changed),
+                    switch_status=str(switch_result.status),
+                    commit_action=str(commit_decision.action),
+                    old_market_non_viable=bool(old_market_non_viable),
+                ):
+                    rollback_skipped_reason = "OLD_MARKET_NON_VIABLE"
+                    adopted_without_readiness = True
+                    commit_decision = RolloverCommitDecision(
+                        action="COMMIT",
+                        force_observe_only=True,
+                        reason="READINESS_BLOCK_ADOPT_NEW_MARKET",
+                    )
+                    try:
+                        commit_block_start_ns = time.monotonic_ns()
+                        async with runtime_lock:
+                            runtime_diag = runtime.commit_rollover_swap(
+                                books=committed_books,
+                                constraints=candidate_constraints,
+                                market_meta=discovered_asset_meta,
+                                now_ms=now_ms,
+                            )
+                        commit_block_ms = float(max(0.0, (time.monotonic_ns() - commit_block_start_ns) / 1_000_000.0))
+                        market_client.set_books(runtime.books)
+                        previous_state = rollover_manager.commit(candidate_state)
+                        resolved_markets[:] = discovered_markets
+                        asset_meta.clear()
+                        asset_meta.update(discovered_asset_meta)
+                        commit_already_performed = True
+                    except Exception as exc:
+                        market_client.set_books(runtime.books)
+                        abort_payload = {
+                            **intent_payload,
+                            "abort_reason": "RUNTIME_ROLLOVER_ERROR",
+                            "error": str(exc),
+                            **candidate_payload,
+                            "prepare_diag": prepare_diag,
+                            "confirm_diag": switch_result.confirm_diag,
+                            "confirm_diag_summary": confirm_diag_summary,
+                            "switch_status": switch_result.status,
+                            "active_subscription_id_after": int(switch_result.active_subscription_id),
+                            "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
+                            "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
+                            "readiness_reason_codes": list(readiness_result.reason_codes),
+                            "old_market_non_viable": True,
+                            "rollback_attempted": False,
+                            "rollback_skipped_reason": rollback_skipped_reason,
+                            "adopted_without_readiness": False,
+                        }
+                        _emit_rollover_abort(
+                            now_ms=now_ms,
+                            current_state=current_state,
+                            intent_payload=intent_payload,
+                            abort_reason="RUNTIME_ROLLOVER_ERROR",
+                            extra_payload=abort_payload,
+                            log_level="ERROR",
+                            log_code="rollover_abort_runtime_error",
+                        )
+                        await asyncio.sleep(check_period_secs)
+                        continue
+                else:
+                    rollback_payload: Dict[str, Any] = {}
+                    if token_ids_changed and switch_result.status == "committed":
+                        rollback_payload = await _rollback_post_switch_abort(
+                            market_client=market_client,
+                            runtime=runtime,
+                            previous_token_ids=list(current_state.token_ids),
+                            confirm_timeout_secs=confirm_timeout_secs,
+                        )
+                    else:
+                        market_client.set_books(runtime.books)
+                    _emit_rollover_abort(
+                        now_ms=now_ms,
+                        current_state=current_state,
+                        intent_payload=intent_payload,
+                        abort_reason=commit_decision.reason,
+                        extra_payload={
+                            **readiness_payload,
+                            "prepare_diag": prepare_diag,
+                            "confirm_diag": switch_result.confirm_diag,
+                            "confirm_diag_summary": confirm_diag_summary,
+                            "switch_status": switch_result.status,
+                            "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
+                            "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
+                            **rollback_payload,
+                        },
+                        log_level="INFO",
+                        log_code="rollover_abort_readiness_or_liveness",
+                        count_toward_health=not rollover_manager.escape_hatch_open(now_ms),
+                    )
+                    await asyncio.sleep(check_period_secs)
+                    continue
+
+            if not commit_already_performed:
+                try:
+                    commit_block_start_ns = time.monotonic_ns()
+                    async with runtime_lock:
+                        runtime_diag = runtime.commit_rollover_swap(
+                            books=committed_books,
+                            constraints=candidate_constraints,
+                            market_meta=discovered_asset_meta,
+                            now_ms=now_ms,
+                        )
+                    commit_block_ms = float(max(0.0, (time.monotonic_ns() - commit_block_start_ns) / 1_000_000.0))
+                    market_client.set_books(runtime.books)
+                    previous_state = rollover_manager.commit(candidate_state)
+                    resolved_markets[:] = discovered_markets
+                    asset_meta.clear()
+                    asset_meta.update(discovered_asset_meta)
+                except Exception as exc:
+                    rollback_payload = {}
+                    if token_ids_changed and switch_result.status == "committed":
+                        rollback_payload = await _rollback_post_switch_abort(
+                            market_client=market_client,
+                            runtime=runtime,
+                            previous_token_ids=list(current_state.token_ids),
+                            confirm_timeout_secs=confirm_timeout_secs,
+                        )
+                    else:
+                        market_client.set_books(runtime.books)
+                    abort_payload = {
+                        **intent_payload,
+                        "abort_reason": "RUNTIME_ROLLOVER_ERROR",
+                        "error": str(exc),
+                        **candidate_payload,
                         "prepare_diag": prepare_diag,
                         "confirm_diag": switch_result.confirm_diag,
                         "confirm_diag_summary": confirm_diag_summary,
                         "switch_status": switch_result.status,
+                        "active_subscription_id_after": int(switch_result.active_subscription_id),
                         "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
                         "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
-                    },
-                    log_level="INFO",
-                    log_code="rollover_abort_readiness_or_liveness",
-                    count_toward_health=not rollover_manager.escape_hatch_open(now_ms),
-                )
-                await asyncio.sleep(check_period_secs)
-                continue
-
-            candidate_constraints = _build_constraints(discovered_markets, policy_cfg, settings)
-            runtime_diag: Dict[str, Any]
-            commit_block_ms: Optional[float] = None
-
-            try:
-                commit_block_start_ns = time.monotonic_ns()
-                async with runtime_lock:
-                    runtime_diag = runtime.commit_rollover_swap(
-                        books=committed_books,
-                        constraints=candidate_constraints,
-                        market_meta=discovered_asset_meta,
+                        "readiness_reason_codes": list(readiness_result.reason_codes),
+                        **rollback_payload,
+                    }
+                    _emit_rollover_abort(
                         now_ms=now_ms,
+                        current_state=current_state,
+                        intent_payload=intent_payload,
+                        abort_reason="RUNTIME_ROLLOVER_ERROR",
+                        extra_payload=abort_payload,
+                        log_level="ERROR",
+                        log_code="rollover_abort_runtime_error",
                     )
-                commit_block_ms = float(max(0.0, (time.monotonic_ns() - commit_block_start_ns) / 1_000_000.0))
-                market_client.set_books(runtime.books)
-                previous_state = rollover_manager.commit(candidate_state)
-                resolved_markets[:] = discovered_markets
-                asset_meta.clear()
-                asset_meta.update(discovered_asset_meta)
-            except Exception as exc:
-                market_client.set_books(runtime.books)
-                abort_payload = {
-                    **intent_payload,
-                    "abort_reason": "RUNTIME_ROLLOVER_ERROR",
-                    "error": str(exc),
-                    **candidate_payload,
-                    "prepare_diag": prepare_diag,
-                    "confirm_diag": switch_result.confirm_diag,
-                    "confirm_diag_summary": confirm_diag_summary,
-                    "switch_status": switch_result.status,
-                    "active_subscription_id_after": int(switch_result.active_subscription_id),
-                    "confirm_wait_ms": _maybe_float(switch_result.confirm_wait_ms),
-                    "unsubscribe_ms": _maybe_float(switch_result.unsubscribe_ms),
-                    "readiness_reason_codes": list(readiness_result.reason_codes),
-                }
-                _emit_rollover_abort(
-                    now_ms=now_ms,
-                    current_state=current_state,
-                    intent_payload=intent_payload,
-                    abort_reason="RUNTIME_ROLLOVER_ERROR",
-                    extra_payload=abort_payload,
-                    log_level="ERROR",
-                    log_code="rollover_abort_runtime_error",
-                )
-                await asyncio.sleep(check_period_secs)
-                continue
+                    await asyncio.sleep(check_period_secs)
+                    continue
 
             commit_payload = {
                 "market_slug_prev": previous_state.market_slug,
@@ -5423,6 +5573,9 @@ async def _run() -> None:
                 "readiness_reason_codes": list(readiness_result.reason_codes),
                 "readiness_details": readiness_result.details,
                 "commit_decision_reason": commit_decision.reason,
+                "adopted_without_readiness": bool(adopted_without_readiness),
+                "old_market_non_viable": bool(old_market_non_viable),
+                "rollback_skipped_reason": rollback_skipped_reason,
                 "liveness_ok": bool(liveness_ok),
                 "liveness_details": liveness_details,
                 "runtime_diag": runtime_diag,
@@ -5495,7 +5648,7 @@ async def _run() -> None:
                 runtime.activate_rollover_guard(
                     token_ids=list(candidate_state.token_ids),
                     quiet_until_ms=quiet_until_ms,
-                    require_readiness=True,
+                    require_readiness=not adopted_without_readiness,
                 )
             if commit_decision.force_observe_only:
                 db.append_log(
@@ -5576,7 +5729,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--db-path", default=None, help="SQLite path")
     parser.add_argument("--constitution", default=None, help="Path to constitution config")
     parser.add_argument("--auto_discover", action="store_true", help="Resolve markets via discovery")
-    parser.add_argument("--reference_source", default=None, help="CSV sources: poll_coinbase,poll_binance_perp,ws_kraken")
+    parser.add_argument("--reference_source", default=None, help="CSV sources: poll_coinbase,poll_binance_perp,ws_kraken,ws_kraken_futures_perp")
     parser.add_argument("--quote-interval-ms", type=int, default=None, help="Quote loop interval in ms")
     parser.add_argument("--stats-interval-ms", type=int, default=None, help="Stats loop interval in ms")
     parser.add_argument("--dry-run", action="store_true", help="Dry-run live broker methods")
