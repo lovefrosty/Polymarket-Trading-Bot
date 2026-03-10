@@ -35,6 +35,18 @@ class TestConfigValidation(unittest.TestCase):
             else:
                 os.environ["REFERENCE_POLL_SECS"] = prior
 
+    def test_reference_source_default_enables_spot_and_perp(self) -> None:
+        prior = os.environ.get("REFERENCE_SOURCE")
+        try:
+            os.environ.pop("REFERENCE_SOURCE", None)
+            settings = load_settings()
+            self.assertEqual(settings.reference_source, "poll_coinbase,poll_binance_perp")
+        finally:
+            if prior is None:
+                os.environ.pop("REFERENCE_SOURCE", None)
+            else:
+                os.environ["REFERENCE_SOURCE"] = prior
+
     def test_missing_ids_without_discovery_raises(self) -> None:
         markets = [
             MarketConfig(

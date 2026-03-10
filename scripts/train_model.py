@@ -41,7 +41,9 @@ def train_from_rows(
     tol: float,
     seed: int,
 ) -> Dict[str, Any]:
-    rows = sorted(rows, key=lambda row: row.get("as_of_ts_ms", 0))
+    rows = sorted(_filter_trainable_rows(rows), key=lambda row: row.get("as_of_ts_ms", 0))
+    if not rows:
+        raise ValueError("no_training_rows")
     train_rows, val_rows = _time_split(rows)
     X_train, y_train = _build_matrix(train_rows)
     X_val, y_val = _build_matrix(val_rows)
@@ -115,6 +117,28 @@ def _build_matrix(rows: List[Dict[str, Any]]) -> Tuple:
     if not X_list:
         raise ValueError("no_training_rows")
     return np.asarray(X_list, dtype=float), np.asarray(y_list, dtype=float)
+
+
+def _filter_trainable_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    usable: List[Dict[str, Any]] = []
+    for row in rows:
+        as_of_ts = row.get("as_of_ts_ms")
+        window_end = row.get("window_end_ts_ms")
+        if as_of_ts is not None and window_end is not None:
+            try:
+                if int(as_of_ts) >= int(window_end):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        features = row.get("features") if isinstance(row.get("features"), dict) else row
+        if not isinstance(features, dict):
+            continue
+        if any(features.get(key) is None for key in FEATURE_ORDER):
+            continue
+        if row.get("label_up") is None:
+            continue
+        usable.append(row)
+    return usable
 
 
 def _time_split(rows: List[Dict[str, Any]], train_frac: float = 0.7) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:

@@ -162,7 +162,7 @@ def load_settings() -> Settings:
         depth_within_ticks_n=int(os.getenv("DEPTH_WITHIN_TICKS_N", "5")),
         depth_at_notional_target=float(os.getenv("DEPTH_AT_NOTIONAL_TARGET", "10")),
         reference_enabled=_parse_bool(os.getenv("REFERENCE_ENABLED"), False),
-        reference_source=os.getenv("REFERENCE_SOURCE", "none"),
+        reference_source=os.getenv("REFERENCE_SOURCE", "poll_coinbase,poll_binance_perp"),
         reference_poll_secs=float(os.getenv("REFERENCE_POLL_SECS", "1")),
         reference_staleness_ms=int(os.getenv("REFERENCE_STALENESS_MS", "5000")),
         reference_lag_guard_ms=int(os.getenv("REFERENCE_LAG_GUARD_MS", "0")),

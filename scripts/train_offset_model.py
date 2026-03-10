@@ -27,7 +27,9 @@ def train_from_rows(
     tol: float,
     seed: int,
 ) -> Dict[str, Any]:
-    rows = sorted(rows, key=lambda row: row["as_of_ts_ms"])
+    rows = sorted(_filter_trainable_rows(rows), key=lambda row: row["as_of_ts_ms"])
+    if not rows:
+        raise ValueError("no_training_rows")
     train_rows, val_rows = _time_split(rows)
     X_train, y_train, offset_train = _build_matrix(train_rows)
     X_val, y_val, offset_val = _build_matrix(val_rows)
@@ -115,6 +117,34 @@ def _build_matrix(rows: List[Dict[str, Any]]) -> Tuple:
         np.asarray(y_list, dtype=float),
         np.asarray(offset_list, dtype=float),
     )
+
+
+def _filter_trainable_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    usable: List[Dict[str, Any]] = []
+    for row in rows:
+        as_of_ts = row.get("as_of_ts_ms")
+        window_end = row.get("window_end_ts_ms")
+        if as_of_ts is None or window_end is None:
+            continue
+        try:
+            if int(as_of_ts) >= int(window_end):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if any(row.get(key) is None for key in FEATURE_ORDER):
+            continue
+        label = row.get("label_up")
+        p_market = row.get("p_market_exec_buy")
+        if label is None or p_market is None:
+            continue
+        try:
+            p_market = float(p_market)
+        except (TypeError, ValueError):
+            continue
+        if not (0.0 < p_market < 1.0):
+            continue
+        usable.append(row)
+    return usable
 
 
 def _time_split(rows: List[Dict[str, Any]], train_frac: float = 0.7) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
