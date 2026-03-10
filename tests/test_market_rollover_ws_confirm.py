@@ -77,6 +77,32 @@ class TestMarketRolloverWSConfirm(unittest.IsolatedAsyncioTestCase):
             recv_wall_iso="2026-02-11T00:00:00.000Z",
         )
 
+    async def _emit_wrapped_snapshot(
+        self,
+        client: MarketWSClient,
+        *,
+        asset_id: str,
+        seq: int,
+        recv_wall_ms: int,
+        t_event_ms: int,
+    ) -> None:
+        msg = {
+            "type": "market",
+            "data": {
+                "asset_id": asset_id,
+                "bids": [{"price": 0.49, "size": 10.0}],
+                "asks": [{"price": 0.51, "size": 10.0}],
+                "timestamp": t_event_ms,
+                "sequence": seq,
+            },
+        }
+        await client._handle_dict_message(  # type: ignore[attr-defined]
+            msg=msg,
+            recv_mono_ns=recv_wall_ms * 1_000_000,
+            recv_wall_ms=recv_wall_ms,
+            recv_wall_iso="2026-02-11T00:00:00.000Z",
+        )
+
     async def test_requires_two_valid_updates_per_token(self) -> None:
         client = self._build_client()
         task = asyncio.create_task(client.resubscribe(["new_yes", "new_no"], first_book_timeout_secs=1.0))
@@ -170,6 +196,21 @@ class TestMarketRolloverWSConfirm(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["missing_assets"], ["new_no", "new_yes"])
         self.assertEqual(summary["rejects_by_asset"], {"new_no": 0, "new_yes": 0})
         self.assertEqual(summary["reject_reasons_top"], [])
+
+    async def test_wrapped_pending_snapshots_commit_successfully(self) -> None:
+        client = self._build_client()
+        task = asyncio.create_task(client.resubscribe(["new_yes", "new_no"], first_book_timeout_secs=1.0))
+        await asyncio.sleep(0.01)
+
+        await self._emit_wrapped_snapshot(client, asset_id="new_yes", seq=1, recv_wall_ms=50_000, t_event_ms=49_950)
+        await self._emit_wrapped_snapshot(client, asset_id="new_no", seq=2, recv_wall_ms=50_050, t_event_ms=50_000)
+        await self._emit_wrapped_snapshot(client, asset_id="new_yes", seq=3, recv_wall_ms=50_100, t_event_ms=50_050)
+        await self._emit_wrapped_snapshot(client, asset_id="new_no", seq=4, recv_wall_ms=50_150, t_event_ms=50_100)
+
+        result = await task
+        self.assertEqual(result.status, "committed")
+        self.assertGreaterEqual(int(result.confirm_diag["counts_by_asset"]["new_yes"]), 2)
+        self.assertGreaterEqual(int(result.confirm_diag["counts_by_asset"]["new_no"]), 2)
 
 
 if __name__ == "__main__":

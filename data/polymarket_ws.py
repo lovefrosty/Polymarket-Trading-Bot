@@ -331,22 +331,23 @@ class MarketWSClient:
     async def _handle_dict_message(
         self, msg: Dict[str, Any], recv_mono_ns: int, recv_wall_ms: int, recv_wall_iso: str
     ) -> None:
+        view = _payload_view(msg)
         parse_warnings: List[str] = []
-        t_event_ms = _extract_event_ts_ms(msg, parse_warnings)
-        event_type = _extract_event_type(msg)
-        market = _extract_market(msg)
-        asset_id = _extract_asset_id(msg)
-        non_book_event = _is_last_trade_price(msg)
-        seq_warning_preview = self._check_sequence(msg, update_state=False)
+        t_event_ms = _extract_event_ts_ms(view, parse_warnings)
+        event_type = _extract_event_type(view)
+        market = _extract_market(view)
+        asset_id = _extract_asset_id(view)
+        non_book_event = _is_last_trade_price(view)
+        seq_warning_preview = self._check_sequence(view, update_state=False)
         out_of_order = False
         phases_seen: Set[str] = set()
         sub_ids_seen: Set[int] = set()
         active_assets_seen: Set[str] = set()
         pending_assets_seen: Set[str] = set()
-        closed_flag = _extract_closed_flag(msg)
+        closed_flag = _extract_closed_flag(view)
 
-        if _is_snapshot(msg):
-            asset_id = asset_id or _extract_snapshot_asset_id(msg)
+        if _is_snapshot(view):
+            asset_id = asset_id or _extract_snapshot_asset_id(view)
             sub_id, phase = self._classify_asset(asset_id)
             phases_seen.add(phase)
             if sub_id is not None:
@@ -362,13 +363,13 @@ class MarketWSClient:
                 parse_warnings.append("unknown_subscription_asset")
 
             if should_apply and asset_id and asset_id in self.books:
-                bids, asks = _parse_snapshot_levels(msg)
+                bids, asks = _parse_snapshot_levels(view)
                 update_result = self.books[asset_id].apply_snapshot(
                     bids,
                     asks,
                     t_event_ms,
                     recv_mono_ns,
-                    last_hash=msg.get("hash"),
+                    last_hash=view.get("hash"),
                 )
                 out_of_order = update_result.recv_out_of_order
                 if update_result.event_time_regressed:
@@ -390,8 +391,8 @@ class MarketWSClient:
             else:
                 if should_apply:
                     parse_warnings.append("missing_asset_id_for_snapshot")
-        elif _is_price_change(msg):
-            changes = msg.get("price_changes", [])
+        elif _is_price_change(view):
+            changes = view.get("price_changes", [])
             if not isinstance(changes, list):
                 parse_warnings.append("price_changes_not_list")
             else:
@@ -472,7 +473,7 @@ class MarketWSClient:
                 self._active_market_closed = True
         should_track_sequence = bool(active_assets_seen or pending_assets_seen)
         if should_track_sequence:
-            seq_warning = self._check_sequence(msg, update_state=True)
+            seq_warning = self._check_sequence(view, update_state=True)
             if seq_warning:
                 self.metrics.record_sequence_warning(seq_warning, recv_wall_ms)
                 parse_warnings.append(seq_warning)
@@ -588,11 +589,12 @@ class MarketWSClient:
         return True
 
     def _check_sequence(self, msg: Dict[str, Any], update_state: bool = True) -> Optional[str]:
+        view = _payload_view(msg)
         seq_fields = ["sequence", "sequence_number", "seq"]
         seq_val = None
         for field in seq_fields:
-            if field in msg:
-                seq_val = msg.get(field)
+            if field in view:
+                seq_val = view.get(field)
                 break
         if seq_val is None:
             return None
@@ -741,11 +743,12 @@ class UserWSClient:
         self.metrics.record_message("user", t_event_ms, recv_wall_ms, asset_id=asset_id, sub_state="active")
 
     def _check_sequence(self, msg: Dict[str, Any]) -> Optional[str]:
+        view = _payload_view(msg)
         seq_fields = ["sequence", "sequence_number", "seq"]
         seq_val = None
         for field in seq_fields:
-            if field in msg:
-                seq_val = msg.get(field)
+            if field in view:
+                seq_val = view.get(field)
                 break
         if seq_val is None:
             return None
@@ -771,9 +774,10 @@ class UserWSClient:
 
 
 def _extract_event_ts_ms(msg: Dict[str, Any], warnings: List[str]) -> Optional[int]:
+    view = _payload_view(msg)
     for key in ("timestamp", "ts", "time", "event_time"):
-        if key in msg:
-            raw = msg.get(key)
+        if key in view:
+            raw = view.get(key)
             try:
                 value = int(float(raw))
             except (TypeError, ValueError):
@@ -786,23 +790,28 @@ def _extract_event_ts_ms(msg: Dict[str, Any], warnings: List[str]) -> Optional[i
 
 
 def _extract_event_type(msg: Dict[str, Any]) -> str:
-    return str(msg.get("event_type") or msg.get("type") or "unknown")
+    view = _payload_view(msg)
+    return str(view.get("event_type") or view.get("type") or "unknown")
 
 
 def _extract_market(msg: Dict[str, Any]) -> Optional[str]:
-    return msg.get("condition_id") or msg.get("conditionId") or msg.get("market")
+    view = _payload_view(msg)
+    return view.get("condition_id") or view.get("conditionId") or view.get("market")
 
 
 def _extract_asset_id(msg: Dict[str, Any]) -> Optional[str]:
-    return msg.get("asset_id") or msg.get("assetId") or msg.get("token_id") or msg.get("tokenId")
+    view = _payload_view(msg)
+    return view.get("asset_id") or view.get("assetId") or view.get("token_id") or view.get("tokenId")
 
 
 def _is_snapshot(msg: Dict[str, Any]) -> bool:
-    return any(key in msg for key in ("buys", "sells", "bids", "asks"))
+    view = _payload_view(msg)
+    return any(key in view for key in ("buys", "sells", "bids", "asks"))
 
 
 def _is_price_change(msg: Dict[str, Any]) -> bool:
-    return msg.get("event_type") == "price_change" or "price_changes" in msg
+    view = _payload_view(msg)
+    return view.get("event_type") == "price_change" or "price_changes" in view
 
 
 def _is_last_trade_price(msg: Dict[str, Any]) -> bool:
@@ -811,8 +820,9 @@ def _is_last_trade_price(msg: Dict[str, Any]) -> bool:
 
 
 def _parse_snapshot_levels(msg: Dict[str, Any]) -> tuple[List[tuple[float, float]], List[tuple[float, float]]]:
-    buys = msg.get("buys") or msg.get("bids") or []
-    sells = msg.get("sells") or msg.get("asks") or []
+    view = _payload_view(msg)
+    buys = view.get("buys") or view.get("bids") or []
+    sells = view.get("sells") or view.get("asks") or []
     return _parse_levels(buys), _parse_levels(sells)
 
 
@@ -841,14 +851,16 @@ def _normalize_side(side: Optional[str]) -> Optional[str]:
 
 
 def _extract_snapshot_asset_id(msg: Dict[str, Any]) -> Optional[str]:
-    return msg.get("asset_id") or msg.get("assetId")
+    view = _payload_view(msg)
+    return view.get("asset_id") or view.get("assetId")
 
 
 def _extract_closed_flag(msg: Dict[str, Any]) -> bool:
+    view = _payload_view(msg)
     for key in ("closed", "is_closed", "market_closed", "inactive"):
-        if key not in msg:
+        if key not in view:
             continue
-        value = msg.get(key)
+        value = view.get(key)
         if isinstance(value, bool):
             return value
         if isinstance(value, (int, float)):
@@ -856,6 +868,11 @@ def _extract_closed_flag(msg: Dict[str, Any]) -> bool:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "closed"}
     return False
+
+
+def _payload_view(msg: Dict[str, Any]) -> Dict[str, Any]:
+    data = msg.get("data") if isinstance(msg, dict) else None
+    return data if isinstance(data, dict) else msg
 
 
 def _market_sub_state(phases: Set[str]) -> str:
