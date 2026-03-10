@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from core.event_tape import EventTape
@@ -44,6 +45,7 @@ class ReferenceFeed:
         self._adapter = _build_adapter(config)
         self._on_quote = on_quote
         self._reference_store = reference_store
+        self._poll_failures_by_symbol: Dict[str, int] = {str(symbol): 0 for symbol in config.symbols}
 
     def stop(self) -> None:
         if self._adapter is not None:
@@ -52,7 +54,40 @@ class ReferenceFeed:
     async def run(self) -> None:
         if self._adapter is None:
             return
+        if self.config.source.startswith("poll_") and hasattr(self._adapter, "_poll_symbol") and hasattr(self._adapter, "_stop_event"):
+            await self._run_polling_adapter()
+            return
         await self._adapter.run(self._handle_event)
+
+    async def _run_polling_adapter(self) -> None:
+        adapter = self._adapter
+        if adapter is None:
+            return
+        while not adapter._stop_event.is_set():  # type: ignore[attr-defined]
+            for symbol in self.config.symbols:
+                try:
+                    record = await asyncio.to_thread(adapter._poll_symbol, symbol)  # type: ignore[attr-defined]
+                except Exception as exc:
+                    failures = int(self._poll_failures_by_symbol.get(symbol, 0)) + 1
+                    self._poll_failures_by_symbol[str(symbol)] = failures
+                    self._emit_feed_status(
+                        status="error",
+                        symbol=str(symbol),
+                        consecutive_failures=failures,
+                        exc=exc,
+                    )
+                    continue
+                failures = int(self._poll_failures_by_symbol.get(symbol, 0))
+                if failures > 0:
+                    self._emit_feed_status(
+                        status="recovered",
+                        symbol=str(symbol),
+                        consecutive_failures=failures,
+                    )
+                    self._poll_failures_by_symbol[str(symbol)] = 0
+                if record is not None:
+                    self._handle_event(record)
+            await asyncio.sleep(self.config.poll_interval_secs)
 
     def _handle_event(self, record: Dict[str, Any]) -> None:
         self.tape.write(
@@ -84,6 +119,32 @@ class ReferenceFeed:
             self.aggregator.ingest(quote)
         if self._on_quote is not None:
             self._on_quote(quote)
+
+    def _emit_feed_status(
+        self,
+        *,
+        status: str,
+        symbol: str,
+        consecutive_failures: int,
+        exc: Optional[BaseException] = None,
+    ) -> None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        self.tape.write(
+            channel="reference",
+            event_type="reference_feed_status",
+            market=symbol,
+            asset_id=None,
+            t_event_ms=now_ms,
+            raw={
+                "source": _source_kind(self.config.source),
+                "venue": _source_venue(self.config),
+                "status": status,
+                "symbol": symbol,
+                "consecutive_failures": int(consecutive_failures),
+                "error_class": exc.__class__.__name__ if exc is not None else None,
+                "error_detail": str(exc) if exc is not None else None,
+            },
+        )
 
 
 def _build_adapter(config: ReferenceFeedConfig) -> Optional[ReferenceAdapter]:
@@ -121,3 +182,21 @@ def _build_adapter(config: ReferenceFeedConfig) -> Optional[ReferenceAdapter]:
             )
         )
     raise ValueError(f"unsupported_reference_source:{config.source}")
+
+
+def _source_kind(source: str) -> str:
+    lower = str(source or "none").lower()
+    if lower == "poll_binance_perp":
+        return "perp"
+    return "spot"
+
+
+def _source_venue(config: ReferenceFeedConfig) -> str:
+    lower = str(config.source or "none").lower()
+    if lower == "poll_coinbase":
+        return "coinbase_spot"
+    if lower == "poll_kraken":
+        return "kraken_spot"
+    if lower == "poll_binance_perp":
+        return "binance_perp"
+    return lower
