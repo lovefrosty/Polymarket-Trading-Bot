@@ -336,6 +336,26 @@ class NoActiveMarketError(ValueError):
         super().__init__(f"no_active_market:{self.market_key}")
 
 
+class GammaFetchError(ValueError):
+    def __init__(
+        self,
+        *,
+        url: str,
+        error_code: str,
+        status: Optional[int] = None,
+        error_detail: Optional[str] = None,
+        transient: bool = True,
+    ) -> None:
+        self.url = str(url)
+        self.error_code = str(error_code)
+        self.status = None if status is None else int(status)
+        self.error_detail = None if error_detail is None else str(error_detail)
+        self.transient = bool(transient)
+        status_part = "unknown" if self.status is None else str(self.status)
+        detail_part = f" detail={self.error_detail}" if self.error_detail else ""
+        super().__init__(f"gamma_fetch_failed status={status_part} code={self.error_code} url={self.url}{detail_part}")
+
+
 async def discover_15m_crypto_by_slug(
     symbols: List[str],
     now_ts: Optional[int],
@@ -1319,21 +1339,51 @@ def _fetch_json(url: str):
                 return json.loads(raw)
         except HTTPError as exc:
             status = getattr(exc, "code", None)
-            if status in {403, 429} or (status is not None and 500 <= status < 600):
-                if attempt < max_attempts - 1:
-                    backoff = base_backoff * (2**attempt)
-                    jitter = _FETCH_RNG.uniform(0.0, backoff * 0.2)
-                    _FETCH_SLEEP(backoff + jitter)
-                    continue
-                raise ValueError(f"gamma_fetch_failed status={status} url={url}") from exc
-            raise ValueError(f"gamma_fetch_failed status={status} url={url}") from exc
+            transient = status in {403, 429} or (status is not None and 500 <= status < 600)
+            if transient and attempt < max_attempts - 1:
+                backoff = base_backoff * (2**attempt)
+                jitter = _FETCH_RNG.uniform(0.0, backoff * 0.2)
+                _FETCH_SLEEP(backoff + jitter)
+                continue
+            raise GammaFetchError(
+                url=url,
+                error_code=f"HTTP_{status}" if status is not None else "HTTP_UNKNOWN",
+                status=status,
+                error_detail=str(exc),
+                transient=bool(transient),
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise GammaFetchError(
+                url=url,
+                error_code="INVALID_PAYLOAD",
+                error_detail=str(exc),
+                transient=False,
+            ) from exc
+        except TimeoutError as exc:
+            if attempt < max_attempts - 1:
+                backoff = base_backoff * (2**attempt)
+                jitter = _FETCH_RNG.uniform(0.0, backoff * 0.2)
+                _FETCH_SLEEP(backoff + jitter)
+                continue
+            raise GammaFetchError(
+                url=url,
+                error_code="TIMEOUT",
+                error_detail=str(exc),
+            ) from exc
         except Exception as exc:
             if attempt < max_attempts - 1:
                 backoff = base_backoff * (2**attempt)
                 jitter = _FETCH_RNG.uniform(0.0, backoff * 0.2)
                 _FETCH_SLEEP(backoff + jitter)
                 continue
-            raise ValueError(f"gamma_fetch_failed status=unknown url={url}") from exc
+            error_code = "NETWORK_ERROR"
+            if exc.__class__.__name__ == "URLError":
+                error_code = "NETWORK_ERROR"
+            raise GammaFetchError(
+                url=url,
+                error_code=error_code,
+                error_detail=str(exc),
+            ) from exc
 
 
 

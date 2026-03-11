@@ -35,6 +35,7 @@ from core.event_tape import EventTape
 from core.execution_fsm import ExecutionFSM, ExecutionState
 from core.market_discovery import (
     GAMMA_BASE_URL,
+    GammaFetchError,
     NoActiveMarketError,
     deterministic_market_selection_key_str,
     resolve_markets,
@@ -1012,6 +1013,9 @@ class RuntimeEngine:
             "readiness_payload": dict(self._startup_readiness_payload),
         }
         a_pipeline_diag = self._a_pipeline_diag(now_ms=int(now_ms))
+        policy_cfg = self.constitution.get("policy", {}) if isinstance(self.constitution, dict) else {}
+        execution_cfg = self.constitution.get("execution", {}) if isinstance(self.constitution, dict) else {}
+        trading_cfg = self.constitution.get("trading", {}) if isinstance(self.constitution, dict) else {}
         self.db.upsert_system_state(
             as_of_ts=now_ms,
             is_frozen=is_frozen_any,
@@ -1024,6 +1028,18 @@ class RuntimeEngine:
                 "freeze_reasons": freeze_reason_codes,
                 "degraded_reasons": degraded_reason_codes,
                 "a_pipeline_diag": a_pipeline_diag,
+                "active_policy": {
+                    "max_spread_bps": float(policy_cfg.get("max_spread_bps", self.policy_thresholds.max_spread_bps)),
+                    "max_slippage_bps": float(policy_cfg.get("max_slippage_bps", self.policy_thresholds.max_slippage_bps)),
+                    "min_depth_at_qty": float(policy_cfg.get("min_depth_at_qty", self.policy_thresholds.min_depth_at_qty)),
+                },
+                "active_execution": {
+                    "maker_half_spread_bps": float(execution_cfg.get("maker_half_spread_bps", 40.0)),
+                    "maker_quote_size": float(execution_cfg.get("maker_quote_size", 1.0)),
+                },
+                "active_trading": {
+                    "paper_experiment_profile": str(trading_cfg.get("paper_experiment_profile") or ""),
+                },
                 **readiness_payload,
             },
         )
@@ -3813,6 +3829,25 @@ def _load_constitution(path: Path) -> Dict[str, Any]:
     return data
 
 
+def _apply_paper_experiment_profile(mode: str, constitution: Dict[str, Any]) -> Optional[str]:
+    profile = str(os.getenv("PAPER_EXPERIMENT_PROFILE", "")).strip().lower()
+    if mode != "PAPER" or profile != "aggressive_two_sided":
+        return None
+    trading_cfg = constitution.setdefault("trading", {})
+    policy_cfg = constitution.setdefault("policy", {})
+    execution_cfg = constitution.setdefault("execution", {})
+    if not isinstance(trading_cfg, dict) or not isinstance(policy_cfg, dict) or not isinstance(execution_cfg, dict):
+        return None
+    policy_cfg["max_spread_bps"] = 750.0
+    policy_cfg["max_slippage_bps"] = 300.0
+    # These remain diagnostic upper bounds; the active gate is still stricter.
+    policy_cfg["paper_hard_block_spread_bps"] = 900.0
+    policy_cfg["paper_hard_block_slippage_bps"] = 450.0
+    execution_cfg["maker_half_spread_bps"] = 25.0
+    trading_cfg["paper_experiment_profile"] = profile
+    return profile
+
+
 def _build_constraints(
     resolved_markets: List[Any],
     policy_cfg: Dict[str, Any],
@@ -3946,6 +3981,7 @@ def _append_discovery_request_rows(
             "n_btc_15m": _maybe_int(payload.get("n_btc_15m")),
             "n_with_end_ts": _maybe_int(payload.get("n_with_end_ts")),
             "n_active_now": _maybe_int(payload.get("n_active_now")),
+            "n_tradable_now": _maybe_int(payload.get("n_tradable_now")),
         }
         db.append_discovery_request(
             ts_ms=int(ts_ms),
@@ -3984,6 +4020,10 @@ def _discovery_none_found_retry_delay_ms(retry_index: int) -> int:
     return 10_000
 
 
+def _discovery_error_retry_delay_ms(retry_index: int) -> int:
+    return _discovery_none_found_retry_delay_ms(retry_index)
+
+
 def _discovery_effective_next_retry_ts_ms(
     now_ms: int,
     retry_index: int,
@@ -3992,6 +4032,62 @@ def _discovery_effective_next_retry_ts_ms(
     schedule_due_ms = int(now_ms) + int(_discovery_none_found_retry_delay_ms(retry_index))
     throttle_due_ms = int(now_ms) + int(max(0, discovery_period_ms))
     return int(max(schedule_due_ms, throttle_due_ms))
+
+
+def _build_discovery_error_payload(
+    *,
+    exc: Exception,
+    current_state: Optional[Any],
+    discovery_summary: Optional[Dict[str, Any]],
+    now_ms: int,
+    retry_index: int,
+    next_retry_ts_ms: int,
+) -> Dict[str, Any]:
+    summary_requests = _discovery_requests_from_summary(discovery_summary)
+    payload_base: Dict[str, Any] = {
+        "event": "DISCOVERY_REQUEST",
+        "status": "ERROR",
+        "requested_symbol": getattr(current_state, "reference_symbol", None) or "BTC",
+        "requested_horizon": "15m",
+        "requested_mode": "latest_active",
+        "now_wall_ms": int(now_ms),
+        "retry_index": int(retry_index),
+        "retry_delay_ms": int(max(0, int(next_retry_ts_ms) - int(now_ms))),
+        "next_retry_ts_ms": int(next_retry_ts_ms),
+    }
+    if summary_requests:
+        latest = summary_requests[-1]
+        for key in (
+            "requested_symbol",
+            "requested_horizon",
+            "requested_mode",
+            "n_total",
+            "n_btc_15m",
+            "n_with_end_ts",
+            "n_active_now",
+            "n_tradable_now",
+        ):
+            if latest.get(key) is not None:
+                payload_base[key] = latest.get(key)
+    if isinstance(exc, GammaFetchError):
+        payload_base.update(
+            {
+                "error": str(exc),
+                "error_code": exc.error_code,
+                "error_status": exc.status,
+                "error_detail": exc.error_detail,
+                "gamma_url": exc.url,
+                "transient": bool(exc.transient),
+            }
+        )
+    else:
+        payload_base.update(
+            {
+                "error": str(exc),
+                "error_code": exc.__class__.__name__.upper(),
+            }
+        )
+    return payload_base
 
 
 def _discovery_none_found_deadline_exceeded(
@@ -4217,6 +4313,9 @@ async def _run() -> None:
     mode, observe_live_alias = _resolve_runtime_mode(mode_raw)
     if mode not in {"OBSERVE", "PAPER", "TRADE"}:
         raise ValueError(f"unsupported_mode:{mode_raw}")
+    paper_experiment_profile = _apply_paper_experiment_profile(mode, constitution)
+    trading_cfg = constitution.get("trading", {}) if isinstance(constitution, dict) else {}
+    policy_cfg = constitution.get("policy", {}) if isinstance(constitution, dict) else {}
 
     effective_auto_discover = _effective_auto_discover(
         cli_auto_discover=bool(args.auto_discover),
@@ -4266,6 +4365,40 @@ async def _run() -> None:
                 "error": str(exc),
                 "discovery_requests": discovery_requests,
                 "diagnostics": dict(exc.diagnostics),
+            },
+        )
+        raise
+    except GammaFetchError as exc:
+        next_retry_ts_ms = _discovery_effective_next_retry_ts_ms(
+            now_ms=int(startup_discovery_now_ms),
+            retry_index=0,
+            discovery_period_ms=int(trading_cfg.get("rollover_check_period_ms", 30_000) or 30_000),
+        )
+        error_payload = _build_discovery_error_payload(
+            exc=exc,
+            current_state=None,
+            discovery_summary=startup_discovery_summary,
+            now_ms=int(startup_discovery_now_ms),
+            retry_index=0,
+            next_retry_ts_ms=int(next_retry_ts_ms),
+        )
+        discovery_requests = _discovery_requests_from_summary(startup_discovery_summary)
+        discovery_requests.append(dict(error_payload))
+        discovery_requests = _dedupe_discovery_requests(discovery_requests)
+        _append_discovery_request_rows(
+            db=db,
+            ts_ms=startup_discovery_now_ms,
+            discovery_requests=discovery_requests,
+        )
+        db.append_log(
+            startup_discovery_now_ms,
+            "ERROR",
+            "startup_discovery_fetch_error",
+            {
+                "error": str(exc),
+                "error_code": exc.error_code,
+                "next_retry_ts_ms": int(next_retry_ts_ms),
+                "discovery_requests": discovery_requests,
             },
         )
         raise
@@ -4799,6 +4932,8 @@ async def _run() -> None:
         none_found_retry_index = 0
         none_found_next_retry_ts_ms: Optional[int] = None
         none_found_start_ts_ms: Optional[int] = None
+        discovery_error_retry_index = 0
+        discovery_error_next_retry_ts_ms: Optional[int] = None
         none_found_deadline_alerted = False
         none_found_quotes_canceled = False
         none_found_deadline_ms = int(trading_cfg.get("rollover_none_found_deadline_ms", 180_000))
@@ -4905,6 +5040,9 @@ async def _run() -> None:
                 await asyncio.sleep(check_period_secs)
                 continue
             if none_found_next_retry_ts_ms is not None and int(now_ms) < int(none_found_next_retry_ts_ms):
+                await asyncio.sleep(check_period_secs)
+                continue
+            if discovery_error_next_retry_ts_ms is not None and int(now_ms) < int(discovery_error_next_retry_ts_ms):
                 await asyncio.sleep(check_period_secs)
                 continue
             last_book_recv_mono_ns = market_client.active_last_book_recv_mono_ns()
@@ -5098,19 +5236,43 @@ async def _run() -> None:
                 await asyncio.sleep(check_period_secs)
                 continue
             except Exception as exc:
+                retry_index = int(discovery_error_retry_index)
+                next_retry_ts_ms = _discovery_effective_next_retry_ts_ms(
+                    now_ms=int(now_ms),
+                    retry_index=retry_index,
+                    discovery_period_ms=int(trading_cfg.get("rollover_check_period_ms", rollover_manager.config.discovery_period_ms)),
+                )
+                discovery_error_retry_index += 1
+                discovery_error_next_retry_ts_ms = int(next_retry_ts_ms)
+                error_payload = _build_discovery_error_payload(
+                    exc=exc,
+                    current_state=current_state,
+                    discovery_summary=discovery_summary,
+                    now_ms=int(now_ms),
+                    retry_index=retry_index,
+                    next_retry_ts_ms=int(next_retry_ts_ms),
+                )
+                discovery_requests = _discovery_requests_from_summary(discovery_summary)
+                discovery_requests.append(dict(error_payload))
+                discovery_requests = _dedupe_discovery_requests(discovery_requests)
                 _append_discovery_request_rows(
                     db=db,
                     ts_ms=now_ms,
-                    discovery_requests=_discovery_requests_from_summary(discovery_summary),
+                    discovery_requests=discovery_requests,
                 )
                 _emit_rollover_abort(
                     now_ms=now_ms,
                     current_state=current_state,
                     intent_payload=intent_payload,
                     abort_reason="DISCOVERY_ERROR",
-                    extra_payload={"error": str(exc)},
+                    extra_payload={
+                        **error_payload,
+                        "discovery_summary": discovery_summary,
+                        "discovery_requests": discovery_requests,
+                    },
                     log_level="WARNING",
                     log_code="rollover_abort_discovery_error",
+                    count_toward_health=False,
                 )
                 await asyncio.sleep(check_period_secs)
                 continue
@@ -5118,6 +5280,8 @@ async def _run() -> None:
             none_found_retry_index = 0
             none_found_next_retry_ts_ms = None
             none_found_start_ts_ms = None
+            discovery_error_retry_index = 0
+            discovery_error_next_retry_ts_ms = None
             none_found_deadline_alerted = False
             none_found_quotes_canceled = False
 
