@@ -4223,14 +4223,23 @@ def _candidate_tradability(
         }
         if active is not None or closed is not None or accepting is not None:
             seen_metadata = True
-        if closed is True:
-            return False, "CANDIDATE_CLOSED", details
+        if active is True and (closed is True or accepting is False):
+            continue
         if active is False:
             return False, "CANDIDATE_INACTIVE", details
+        if closed is True:
+            return False, "CANDIDATE_CLOSED", details
         if accepting is False:
             return False, "CANDIDATE_NOT_ACCEPTING_ORDERS", details
     if not seen_metadata:
         return True, "CANDIDATE_TRADABILITY_UNKNOWN", details
+    for token_id in token_ids:
+        meta = asset_meta.get(token_id) or {}
+        active = meta.get("active")
+        closed = meta.get("closed")
+        accepting = meta.get("accepting_orders")
+        if active is True and (closed is True or accepting is False):
+            return True, "CANDIDATE_TRADABILITY_AMBIGUOUS", details
     return True, "CANDIDATE_TRADABLE", details
 
 
