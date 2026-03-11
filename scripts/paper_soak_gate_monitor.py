@@ -85,6 +85,11 @@ def _scalar(cur: sqlite3.Cursor, q: str) -> Optional[int]:
     return row[0] if row else None
 
 
+def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:
+    row = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,)).fetchone()
+    return bool(row)
+
+
 def _latest_ref_ages_ms(logs_dir: Path) -> Dict[str, Optional[int]]:
     files = sorted(logs_dir.glob("reference_*.jsonl"))
     now = int(time.time() * 1000)
@@ -166,21 +171,22 @@ def main(argv: list[str]) -> int:
         try:
             con = sqlite3.connect(str(db_path))
             cur = con.cursor()
+            available = {name for (name,) in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             counts = {
-                "orders": int(_scalar(cur, "select count(*) from orders") or 0),
-                "fills": int(_scalar(cur, "select count(*) from fills") or 0),
-                "quote": int(_scalar(cur, "select count(*) from decisions where action='QUOTE'") or 0),
-                "skip": int(_scalar(cur, "select count(*) from decisions where action='SKIP'") or 0),
-                "freeze": int(_scalar(cur, "select count(*) from decisions where action='FREEZE'") or 0),
-                "rollover_intent": int(_scalar(cur, "select count(*) from logs where msg='rollover_intent'") or 0),
-                "rollover_commit": int(_scalar(cur, "select count(*) from logs where msg='rollover_commit'") or 0),
-                "rollover_abort_discovery_error": int(_scalar(cur, "select count(*) from logs where msg='rollover_abort_discovery_error'") or 0),
-                "rollover_health_freeze": int(_scalar(cur, "select count(*) from logs where msg='rollover_health_freeze'") or 0),
+                "orders": int(_scalar(cur, "select count(*) from orders") or 0) if "orders" in available else 0,
+                "fills": int(_scalar(cur, "select count(*) from fills") or 0) if "fills" in available else 0,
+                "quote": int(_scalar(cur, "select count(*) from decisions where action='QUOTE'") or 0) if "decisions" in available else 0,
+                "skip": int(_scalar(cur, "select count(*) from decisions where action='SKIP'") or 0) if "decisions" in available else 0,
+                "freeze": int(_scalar(cur, "select count(*) from decisions where action='FREEZE'") or 0) if "decisions" in available else 0,
+                "rollover_intent": int(_scalar(cur, "select count(*) from logs where msg='rollover_intent'") or 0) if "logs" in available else 0,
+                "rollover_commit": int(_scalar(cur, "select count(*) from logs where msg='rollover_commit'") or 0) if "logs" in available else 0,
+                "rollover_abort_discovery_error": int(_scalar(cur, "select count(*) from logs where msg='rollover_abort_discovery_error'") or 0) if "logs" in available else 0,
+                "rollover_health_freeze": int(_scalar(cur, "select count(*) from logs where msg='rollover_health_freeze'") or 0) if "logs" in available else 0,
             }
             ages_ms = {
-                "book_age_ms": _scalar(cur, "select cast((strftime('%s','now')*1000 - max(ts_ms)) as integer) from market_data_book"),
-                "decision_age_ms": _scalar(cur, "select cast((strftime('%s','now')*1000 - max(ts_ms)) as integer) from decisions"),
-                "log_age_ms": _scalar(cur, "select cast((strftime('%s','now')*1000 - max(ts_ms)) as integer) from logs"),
+                "book_age_ms": _scalar(cur, "select cast((strftime('%s','now')*1000 - max(ts_ms)) as integer) from market_data_book") if "market_data_book" in available else None,
+                "decision_age_ms": _scalar(cur, "select cast((strftime('%s','now')*1000 - max(ts_ms)) as integer) from decisions") if "decisions" in available else None,
+                "log_age_ms": _scalar(cur, "select cast((strftime('%s','now')*1000 - max(ts_ms)) as integer) from logs") if "logs" in available else None,
             }
             con.close()
             status = compute_soak_gate_status(
