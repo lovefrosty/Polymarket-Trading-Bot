@@ -34,6 +34,13 @@ class CoreMMRunner:
         risk_manager: Optional[RiskManager] = None,
         broker: Optional[Any] = None,
         mode: str = "OBSERVE",
+        min_size: float = 100.0,
+        fallback_size: float = 20.0,
+        within_pct: float = 0.02,
+        trade_size: float = 50.0,
+        max_size: float = 100.0,
+        reverse_position_min_size: float = 20.0,
+        min_order_size_override: Optional[float] = None,
     ) -> None:
         self.mode = str(mode).upper()
         self.market_selector = market_selector
@@ -51,6 +58,13 @@ class CoreMMRunner:
             mode=self.mode,
         )
         self.current_market: Optional[MarketCandidate] = None
+        self._min_size = float(min_size)
+        self._fallback_size = float(fallback_size)
+        self._within_pct = float(within_pct)
+        self._trade_size = float(trade_size)
+        self._max_size = float(max_size)
+        self._reverse_position_min_size = float(reverse_position_min_size)
+        self._min_order_size_override = min_order_size_override
 
     def refresh_market_selection(self, events: Optional[Iterable[Dict[str, Any]]] = None) -> bool:
         candidates = self.market_selector.select_from_events(events) if events is not None else self.market_selector.select_markets()
@@ -62,7 +76,10 @@ class CoreMMRunner:
         return changed
 
     def on_market_message(self, message: Dict[str, Any], recv_wall_ms: Optional[int] = None) -> int:
-        return self.book_manager.process_message(message, recv_wall_ms=recv_wall_ms)
+        applied = self.book_manager.process_message(message, recv_wall_ms=recv_wall_ms)
+        if applied > 0 and isinstance(self.broker, PaperBroker):
+            self.broker.sweep_fills()
+        return applied
 
     def on_user_message(self, message: Dict[str, Any]) -> Sequence[Any]:
         return self.user_feed.apply_message(message)
@@ -80,7 +97,17 @@ class CoreMMRunner:
             market_id=self.current_market.slug,
             token_ids=self.current_market.token_ids,
             tick_size=self.current_market.tick_size,
-            min_order_size=float(self.current_market.min_incentive_size or 0.0),
+            min_size=self._min_size,
+            fallback_size=self._fallback_size,
+            within_pct=self._within_pct,
+            trade_size=self._trade_size,
+            max_size=self._max_size,
+            reverse_position_min_size=self._reverse_position_min_size,
+            min_order_size=(
+                float(self._min_order_size_override)
+                if self._min_order_size_override is not None
+                else float(self.current_market.min_incentive_size or 0.0)
+            ),
         )
         token_states = []
         token_ids = list(self.current_market.token_ids)

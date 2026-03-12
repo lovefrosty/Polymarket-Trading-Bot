@@ -78,7 +78,19 @@ class PaperBroker:
     def fills(self) -> List[Dict[str, Any]]:
         return list(self._fills)
 
-    def _try_fill(self, order: PaperOrder) -> Optional[Dict[str, Any]]:
+    def sweep_fills(self, token_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        fills: List[Dict[str, Any]] = []
+        for order in list(self._orders.values()):
+            if order.status != "open":
+                continue
+            if token_id is not None and order.token_id != str(token_id):
+                continue
+            fill = self._try_fill(order, allow_touch_fill=True)
+            if fill is not None:
+                fills.append(fill)
+        return fills
+
+    def _try_fill(self, order: PaperOrder, *, allow_touch_fill: bool = False) -> Optional[Dict[str, Any]]:
         book = self._book_manager.get_book(order.token_id)
         if book is None:
             return None
@@ -87,6 +99,11 @@ class PaperBroker:
             fill_price = float(book.best_ask)
         elif order.side == "sell" and book.best_bid is not None and float(order.price) <= float(book.best_bid):
             fill_price = float(book.best_bid)
+        elif allow_touch_fill:
+            if order.side == "buy" and book.best_bid is not None and float(order.price) >= float(book.best_bid):
+                fill_price = float(order.price)
+            elif order.side == "sell" and book.best_ask is not None and float(order.price) <= float(book.best_ask):
+                fill_price = float(order.price)
         if fill_price is None:
             return None
 

@@ -84,3 +84,27 @@ def test_market_selector_fetches_paginated_events() -> None:
     assert len(selected) == 1
     assert "offset=0" in calls[0][0]
     assert "offset=1" in calls[1][0]
+
+
+def test_market_selector_parses_stringified_market_fields() -> None:
+    markets = [{
+        "slug": "btc-updown-15m-1",
+        "conditionId": "c1",
+        "clobTokenIds": "[\"t1\", \"t2\"]",
+        "outcomes": "[\"Yes\", \"No\"]",
+        "outcomePrices": "[\"0.49\", \"0.51\"]",
+        "active": True,
+        "closed": False,
+        "accepting_orders": True,
+        "volatility_sum": 1,
+        "spread": 0.02,
+        "umaReward": "5",
+        "orderPriceMinTickSize": 0.01,
+        "orderMinSize": 5,
+    }]
+    selector = MarketSelector(config=MarketSelectionConfig())
+    selected = selector.select_from_markets(markets)
+    assert len(selected) == 1
+    assert selected[0].token_ids == ("t1", "t2")
+    assert selected[0].mid_price == 0.5
+    assert selected[0].reward_per_100 == 5.0
