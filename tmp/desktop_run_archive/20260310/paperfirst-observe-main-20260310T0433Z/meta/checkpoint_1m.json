@@ -1,0 +1,29 @@
+{
+  "db": {
+    "exists": true,
+    "tables": {
+      "decisions": {
+        "count": 80,
+        "exists": true,
+        "max_ts_ms": 1773117153310
+      },
+      "logs": {
+        "count": 4,
+        "exists": true,
+        "max_ts_ms": 1773117114134
+      },
+      "market_data_book": {
+        "count": 7906,
+        "exists": true,
+        "max_ts_ms": 1773117153253
+      }
+    }
+  },
+  "db_heartbeat_age_ms": 843,
+  "minute_mark": 1,
+  "process_alive": true,
+  "runtime_pid": 22872,
+  "schema_version": "overnight_observe_checkpoint_v1",
+  "status": "PASS",
+  "ts_ms": 1773117154153
+}

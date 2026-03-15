@@ -17,7 +17,8 @@ class TestMicrostructureTradeableBadges(unittest.TestCase):
                 "depth_at_qty_buy": 1.0,
                 "depth_at_qty_sell": 1.0,
                 "book_health": "UP",
-            }
+            },
+            policy_thresholds={"max_spread_bps": 200.0},
         )
         self.assertEqual(status, "WAIT")
         self.assertIn("Spread too wide", reason)

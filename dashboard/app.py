@@ -26,6 +26,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core.market_time import window_start_end_ms
+from config.settings import load_settings
 from dashboard.contracts import DashboardFilters, HealthGateStatus, RefreshPolicy, TopBarMetrics, ViewMode
 from dashboard import data_access as da
 from dashboard.panels.export import render_export_panel
@@ -491,9 +492,116 @@ def classify_spread_state(spread_bps: Optional[float], warn_bps: float = 100.0, 
     return "OK"
 
 
-def build_tradeable_hint(row: Dict[str, Any]) -> Tuple[str, str]:
+def _load_json_or_yaml(path: Path) -> Dict[str, Any]:
+    raw = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _active_policy_thresholds() -> Dict[str, float]:
+    thresholds = {
+        "max_spread_bps": 200.0,
+        "max_slippage_bps": 200.0,
+        "maker_half_spread_bps": 40.0,
+    }
+    try:
+        settings = load_settings()
+        thresholds.update(
+            {
+                "max_spread_bps": float(settings.max_spread_bps),
+                "max_slippage_bps": float(settings.max_slippage_bps),
+            }
+        )
+    except Exception:
+        pass
+
+    constitution = _load_json_or_yaml(_ROOT / "config" / "constitution.yaml")
+    policy_cfg = constitution.get("policy", {}) if isinstance(constitution, dict) else {}
+    execution_cfg = constitution.get("execution", {}) if isinstance(constitution, dict) else {}
+    if isinstance(policy_cfg, dict):
+        if "max_spread_bps" in policy_cfg:
+            thresholds["max_spread_bps"] = float(policy_cfg["max_spread_bps"])
+        if "max_slippage_bps" in policy_cfg:
+            thresholds["max_slippage_bps"] = float(policy_cfg["max_slippage_bps"])
+    if isinstance(execution_cfg, dict) and "maker_half_spread_bps" in execution_cfg:
+        thresholds["maker_half_spread_bps"] = float(execution_cfg["maker_half_spread_bps"])
+
+    if DB_PATH.exists():
+        try:
+            state = query_df("SELECT payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1")
+        except Exception:
+            state = pd.DataFrame()
+        if not state.empty:
+            payload = da.safe_json(safe_first(state, "payload_json", "{}"))
+            active_policy = payload.get("active_policy") or {}
+            active_execution = payload.get("active_execution") or {}
+            if isinstance(active_policy, dict):
+                if "max_spread_bps" in active_policy:
+                    thresholds["max_spread_bps"] = float(active_policy["max_spread_bps"])
+                if "max_slippage_bps" in active_policy:
+                    thresholds["max_slippage_bps"] = float(active_policy["max_slippage_bps"])
+            if isinstance(active_execution, dict) and "maker_half_spread_bps" in active_execution:
+                thresholds["maker_half_spread_bps"] = float(active_execution["maker_half_spread_bps"])
+    return thresholds
+
+
+def _spread_warn_threshold(block_bps: float) -> float:
+    return float(block_bps) * 0.7
+
+
+def _classify_spread_state_live(spread_bps: Optional[float]) -> str:
+    thresholds = _active_policy_thresholds()
+    return classify_spread_state(
+        spread_bps,
+        warn_bps=_spread_warn_threshold(float(thresholds["max_spread_bps"])),
+        block_bps=float(thresholds["max_spread_bps"]),
+    )
+
+
+def _market_eta_detail(eta_text: Optional[str]) -> str:
+    text = str(eta_text or "").strip().lower()
+    if not text:
+        return "window timing unavailable"
+    if text == "closed":
+        return "closed"
+    return f"closes in {eta_text}"
+
+
+def _build_action_hint(tradeable: str, why_blocked: str, policy_thresholds: Optional[Dict[str, float]] = None) -> str:
+    if str(tradeable).upper() == "YES":
+        return "Eligible - monitor entry window"
+    thresholds = policy_thresholds or _active_policy_thresholds()
+    reason = str(why_blocked or "").lower()
+    if "spread" in reason:
+        return f"WAIT for spread <= {float(thresholds['max_spread_bps']):.0f} bps"
+    if "slippage" in reason:
+        return f"WAIT for slippage <= {float(thresholds['max_slippage_bps']):.0f} bps"
+    if "price feed" in reason:
+        return "WAIT for two-source reference recovery"
+    if "book" in reason:
+        return "WAIT for fresh executable book data"
+    return "WAIT for policy clearance"
+
+
+def build_tradeable_hint(row: Dict[str, Any], policy_thresholds: Optional[Dict[str, float]] = None) -> Tuple[str, str]:
     spread = row.get("spread_bps")
-    state = classify_spread_state(spread)
+    thresholds = policy_thresholds or _active_policy_thresholds()
+    state = classify_spread_state(
+        spread,
+        warn_bps=_spread_warn_threshold(float(thresholds["max_spread_bps"])),
+        block_bps=float(thresholds["max_spread_bps"]),
+    )
     book_health = str(row.get("book_health") or row.get("book_health_state") or "").strip().upper()
     depth_buy = row.get("depth_at_qty_buy")
     depth_sell = row.get("depth_at_qty_sell")
@@ -512,7 +620,7 @@ def build_tradeable_hint(row: Dict[str, Any]) -> Tuple[str, str]:
     if book_health == "DOWN":
         return "WAIT", "Book feed degraded"
     if state == "BLOCKED":
-        return "WAIT", f"Spread too wide ({float(spread):.1f} bps)"
+        return "WAIT", f"Spread too wide ({float(spread):.1f} bps > {float(thresholds['max_spread_bps']):.1f} bps max)"
     if min_depth is not None and min_depth <= 0:
         return "WAIT", "No executable depth"
     if state == "CAUTION":
@@ -586,6 +694,7 @@ def build_trader_health_chips(metrics: TopBarMetrics, health_map: Dict[str, Heal
 
 
 def _latest_tradeability_summary() -> Tuple[str, str]:
+    thresholds = _active_policy_thresholds()
     row = query_df(
         """
         SELECT spread_bps, depth_at_qty_buy, depth_at_qty_sell, book_health
@@ -596,7 +705,7 @@ def _latest_tradeability_summary() -> Tuple[str, str]:
     )
     if row.empty:
         return "WAIT", "No recent microstructure snapshot"
-    status, reason = build_tradeable_hint(row.iloc[0].to_dict())
+    status, reason = build_tradeable_hint(row.iloc[0].to_dict(), policy_thresholds=thresholds)
     return status, reason
 
 
@@ -611,6 +720,7 @@ def build_signals_table_for_view(
         return pd.DataFrame(columns=["Market", "Direction", "EV", "Suggested price", "Confidence", "Tradeable", "Why blocked", "Action hint"])
 
     out = signal_df.copy()
+    policy_thresholds = _active_policy_thresholds()
     labels = out.apply(lambda row: label_token(label_registry, row.get("market"), row.get("token_id")), axis=1)
     out["market_label"] = labels.apply(lambda item: item.get("market_label"))
     out["outcome_label"] = labels.apply(lambda item: item.get("outcome_label"))
@@ -653,9 +763,11 @@ def build_signals_table_for_view(
     out["why_blocked"] = out.apply(_why_blocked, axis=1)
     out["tradeable"] = out["gate_result"].apply(lambda gate: "YES" if str(gate).upper() == "ALLOW" else "WAIT")
     out["action_hint"] = out.apply(
-        lambda row: "Eligible - monitor entry window"
-        if row.get("tradeable") == "YES"
-        else "WAIT for spread < 150 bps",
+        lambda row: _build_action_hint(
+            str(row.get("tradeable") or ""),
+            str(row.get("why_blocked") or ""),
+            policy_thresholds=policy_thresholds,
+        ),
         axis=1,
     )
 
@@ -685,7 +797,7 @@ def build_signals_table_for_view(
 def _runtime_schema_missing() -> bool:
     if not DB_PATH.exists():
         return True
-    required = {"system_state", "decisions", "alerts"}
+    required = {"decisions", "logs", "market_data_book"}
     present = set(da.existing_tables(DB_PATH))
     return not required.issubset(present)
 
@@ -772,6 +884,104 @@ def _selected_market_tokens(selected_market: str) -> List[str]:
     if tokens.empty:
         return []
     return [str(x) for x in tokens["token_id"].dropna().tolist()]
+
+
+def _selected_market_tokens_with_labels(selected_market: str, label_registry: Dict[str, Dict[str, Any]]) -> List[str]:
+    tokens = _selected_market_tokens(selected_market)
+    if tokens or selected_market == "ALL":
+        return tokens
+    token_map = (label_registry.get(selected_market) or {}).get("token_to_outcome") or {}
+    return sorted(str(token_id) for token_id in token_map.keys())
+
+
+def _recent_order_book_snapshot(
+    selected_market: str,
+    label_registry: Dict[str, Dict[str, Any]],
+    heavy_refresh: bool,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    if not _table_exists("market_data_book"):
+        return {"row_count": 0, "token_count": 0, "last_update_age_ms": None}, pd.DataFrame()
+    token_ids = _selected_market_tokens_with_labels(selected_market, label_registry)
+    if not token_ids:
+        return {"row_count": 0, "token_count": 0, "last_update_age_ms": None}, pd.DataFrame()
+
+    placeholders = ",".join("?" for _ in token_ids)
+    summary = _heavy_df(
+        f"book_summary::{selected_market}",
+        f"""
+        SELECT COUNT(*) AS row_count,
+               COUNT(DISTINCT token_id) AS token_count,
+               MAX(ts_ms) AS max_ts_ms
+        FROM market_data_book
+        WHERE token_id IN ({placeholders})
+        """,
+        tuple(token_ids),
+        heavy_refresh,
+    )
+    max_ts_ms = safe_first(summary, "max_ts_ms", None)
+    snapshot = {
+        "row_count": int(safe_first(summary, "row_count", 0) or 0),
+        "token_count": int(safe_first(summary, "token_count", 0) or 0),
+        "last_update_age_ms": (float(_now_ms() - max_ts_ms) if max_ts_ms is not None else None),
+    }
+
+    latest_rows = _heavy_df(
+        f"book_bbo::{selected_market}",
+        f"""
+        WITH latest_side AS (
+          SELECT token_id,
+                 CASE WHEN LOWER(side) IN ('buy','bid') THEN 'buy' ELSE 'sell' END AS side_norm,
+                 MAX(ts_ms) AS max_ts_ms
+          FROM market_data_book
+          WHERE token_id IN ({placeholders})
+          GROUP BY token_id, side_norm
+        )
+        SELECT b.token_id,
+               CASE WHEN LOWER(b.side) IN ('buy','bid') THEN 'buy' ELSE 'sell' END AS side_norm,
+               b.price,
+               b.size,
+               b.ts_ms
+        FROM market_data_book b
+        INNER JOIN latest_side l
+          ON l.token_id = b.token_id
+         AND l.max_ts_ms = b.ts_ms
+         AND l.side_norm = CASE WHEN LOWER(b.side) IN ('buy','bid') THEN 'buy' ELSE 'sell' END
+        WHERE b.token_id IN ({placeholders})
+        ORDER BY b.token_id, side_norm, b.price DESC
+        """,
+        tuple(token_ids) + tuple(token_ids),
+        heavy_refresh,
+    )
+    if latest_rows.empty:
+        return snapshot, pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for token_id, group in latest_rows.groupby("token_id"):
+        buys = group[group["side_norm"] == "buy"]
+        sells = group[group["side_norm"] == "sell"]
+        best_bid = float(buys["price"].max()) if not buys.empty else None
+        best_ask = float(sells["price"].min()) if not sells.empty else None
+        bid_size = None
+        ask_size = None
+        if best_bid is not None:
+            best_bid_rows = buys[buys["price"] == best_bid]
+            bid_size = float(best_bid_rows["size"].sum()) if not best_bid_rows.empty else None
+        if best_ask is not None:
+            best_ask_rows = sells[sells["price"] == best_ask]
+            ask_size = float(best_ask_rows["size"].sum()) if not best_ask_rows.empty else None
+        labels = label_token(label_registry, selected_market if selected_market != "ALL" else None, token_id)
+        rows.append(
+            {
+                "Market": labels["market_label"],
+                "Side": labels["outcome_label"],
+                "Best bid": best_bid,
+                "Bid size": bid_size,
+                "Best ask": best_ask,
+                "Ask size": ask_size,
+                "Book age (ms)": float(_now_ms() - float(group["ts_ms"].max())) if "ts_ms" in group else None,
+            }
+        )
+    return snapshot, pd.DataFrame(rows)
 
 
 def _time_to_window_end(slug: str) -> str:
@@ -1020,7 +1230,7 @@ def compute_health_a_to_e(filters: DashboardFilters) -> Dict[str, HealthGateStat
     c_spread_latest = safe_first(c_micro, "spread_bps", None)
     c_depth_buy = safe_first(c_micro, "depth_at_qty_buy", None)
     c_depth_sell = safe_first(c_micro, "depth_at_qty_sell", None)
-    c_spread_state = classify_spread_state(float(c_spread_latest) if c_spread_latest is not None and not pd.isna(c_spread_latest) else None)
+    c_spread_state = _classify_spread_state_live(float(c_spread_latest) if c_spread_latest is not None and not pd.isna(c_spread_latest) else None)
     c_status = "CRITICAL" if c_down > 0 or c_spread_state == "BLOCKED" else ("WARN" if c_stale > 0 or c_spread_state == "CAUTION" else "OK")
 
     d_alerts = query_df(
@@ -1225,11 +1435,11 @@ def _render_topbar(
     freeze_label = metrics.alert_state
     reasons = ", ".join(format_trader_reason(reason, None, None) for reason in metrics.freeze_reasons) if metrics.freeze_reasons else "none"
     market_label = label_token(label_registry, metrics.market_slug, None)["market_label"]
-    market_text = f"{market_label} - closes in {metrics.time_to_window_end}"
+    market_text = f"{market_label} - {_market_eta_detail(metrics.time_to_window_end)}"
 
     c_details = (health_map.get("C").details if health_map.get("C") is not None else {}) if health_map else {}
     spread_bps = c_details.get("latest_spread_bps") if isinstance(c_details, dict) else None
-    spread_limit = 150.0
+    spread_limit = float(_active_policy_thresholds()["max_spread_bps"])
 
     if metrics.alert_state == "OK":
         state_line = "Trading active - all gates healthy"
@@ -1416,6 +1626,18 @@ def _render_overview(
             f'<div class="{klass}"><b>Tradeability now:</b> {tradeable} | {reason}</div>',
             unsafe_allow_html=True,
         )
+
+    book_snapshot, book_bbo = _recent_order_book_snapshot(filters.selected_market, label_registry, heavy_refresh)
+    st.subheader("Order Book Telemetry")
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Book rows", str(book_snapshot.get("row_count", 0)))
+    b2.metric("Active tokens", str(book_snapshot.get("token_count", 0)))
+    last_age_ms = book_snapshot.get("last_update_age_ms")
+    b3.metric("Book freshness", _fmt_ms(last_age_ms))
+    if book_bbo.empty:
+        st.info("No recent order-book snapshot available for the selected market.")
+    else:
+        st.dataframe(book_bbo, width="stretch", height=180)
 
     st.subheader("Live Feed")
     if not feed_df.empty:
@@ -1677,7 +1899,7 @@ def _render_microstructure(
         tradeable_rows = []
         for _, row in trader_micro.iterrows():
             hint_status, hint_reason = build_tradeable_hint(row.to_dict())
-            spread_state = classify_spread_state(float(row.get("spread_bps")) if pd.notna(row.get("spread_bps")) else None)
+            spread_state = _classify_spread_state_live(float(row.get("spread_bps")) if pd.notna(row.get("spread_bps")) else None)
             tradeable_rows.append(
                 {
                     "Market": row.get("market_label"),

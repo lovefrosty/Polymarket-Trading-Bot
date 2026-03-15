@@ -1,0 +1,29 @@
+{
+  "details": {
+    "db": {
+      "exists": true,
+      "tables": {
+        "decisions": {
+          "count": 824,
+          "exists": true,
+          "max_ts_ms": 1773117527232
+        },
+        "logs": {
+          "count": 11,
+          "exists": true,
+          "max_ts_ms": 1773117528119
+        },
+        "market_data_book": {
+          "count": 81534,
+          "exists": true,
+          "max_ts_ms": 1773117527172
+        }
+      }
+    },
+    "db_heartbeat_age_ms": 42392,
+    "process_alive": false,
+    "runtime_pid": 22872
+  },
+  "status": "INVALIDATED",
+  "updated_ts_ms": 1773117570511
+}

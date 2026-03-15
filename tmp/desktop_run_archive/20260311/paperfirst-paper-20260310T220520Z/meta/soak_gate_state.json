@@ -1,0 +1,16 @@
+{
+  "clean_window_started_ts_ms": null,
+  "last_counts": {
+    "fills": 152,
+    "freeze": 14089,
+    "orders": 50609,
+    "quote": 25355,
+    "rollover_abort_discovery_error": 25,
+    "rollover_commit": 29,
+    "rollover_health_freeze": 8,
+    "rollover_intent": 142,
+    "skip": 20568
+  },
+  "last_sample_ts_ms": 1773240898674,
+  "started_ts_ms": 1773191308557
+}

@@ -83,6 +83,9 @@ class MarketWSClient:
         self._pending_confirm_first_recv_ms: Optional[int] = None
         self._pending_confirm_last_recv_ms: Optional[int] = None
         self._pending_confirm_reasons: List[str] = []
+        self._pending_reconnect_attempted: bool = False
+        self._pending_unsubscribe_before_subscribe: bool = False
+        self._reconnect_pending_on_connect: bool = False
         self._ws = None
         self._send_lock = asyncio.Lock()
 
@@ -104,7 +107,7 @@ class MarketWSClient:
                     if connected_once:
                         self.metrics.record_reconnect("market")
                     connected_once = True
-                    await self._subscribe(ws, self._active_asset_ids)
+                    await self._subscribe(ws, self._connect_asset_ids())
                     backoff_ms = self.config.reconnect_base_ms
                     await self._receive_loop(ws)
             except Exception:
@@ -169,12 +172,39 @@ class MarketWSClient:
         self._pending_confirm_first_recv_ms = None
         self._pending_confirm_last_recv_ms = None
         self._pending_confirm_reasons = []
+        self._pending_reconnect_attempted = False
+        self._pending_unsubscribe_before_subscribe = True
+        self._ignored_asset_set = set(prev_asset_ids)
+        self._active_asset_set = set()
+        self._last_sequence = None
 
+        unsubscribe_start_ns = time.monotonic_ns()
+        await self._best_effort_unsubscribe(prev_asset_ids)
+        unsubscribe_ms = float(max(0.0, (time.monotonic_ns() - unsubscribe_start_ns) / 1_000_000.0))
         wait_start_ns = time.monotonic_ns()
         await self._subscribe(self._ws, normalized)
+        confirmed = False
         try:
             await asyncio.wait_for(pending_event.wait(), timeout=max(0.5, float(first_book_timeout_secs)))
+            confirmed = True
         except asyncio.TimeoutError:
+            reconnected = False
+            if self._pending_failure_class() == "NO_PENDING_MESSAGES":
+                self._pending_reconnect_attempted = True
+                reconnected = await self._reconnect_pending_subscription(
+                    timeout_secs=max(0.5, float(first_book_timeout_secs))
+                )
+            if reconnected:
+                confirmed = True
+            else:
+                self._restore_active_subscription(prev_asset_ids)
+                if self._pending_reconnect_attempted and self._ws is not None:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+
+        if not confirmed:
             confirm_diag = self._pending_confirm_diag()
             confirm_wait_ms = float(max(0.0, (time.monotonic_ns() - wait_start_ns) / 1_000_000.0))
             if self._pending_subscription_id == pending_sub_id:
@@ -187,6 +217,7 @@ class MarketWSClient:
                 confirm_diag=confirm_diag,
                 abort_reason="CONFIRM_TIMEOUT",
                 confirm_wait_ms=confirm_wait_ms,
+                unsubscribe_ms=unsubscribe_ms,
             )
 
         self.asset_ids = list(normalized)
@@ -197,12 +228,10 @@ class MarketWSClient:
         self._active_market_closed = False
         self._last_sequence = None
         confirm_diag = self._pending_confirm_diag()
+        if self._pending_reconnect_attempted:
+            confirm_diag["failure_class"] = "RECONNECTED_FOR_ROLLOVER"
         confirm_wait_ms = float(max(0.0, (time.monotonic_ns() - wait_start_ns) / 1_000_000.0))
         self._clear_pending_subscription()
-
-        unsubscribe_start_ns = time.monotonic_ns()
-        await self._best_effort_unsubscribe(prev_asset_ids)
-        unsubscribe_ms = float(max(0.0, (time.monotonic_ns() - unsubscribe_start_ns) / 1_000_000.0))
         return ResubscribeResult(
             status="committed",
             previous_asset_ids=prev_asset_ids,
@@ -235,6 +264,41 @@ class MarketWSClient:
         async with self._send_lock:
             await ws.send(json.dumps(payload))
 
+    def _connect_asset_ids(self) -> List[str]:
+        if self._reconnect_pending_on_connect and self._pending_asset_ids:
+            return list(self._pending_asset_ids)
+        return list(self._active_asset_ids)
+
+    def _restore_active_subscription(self, prev_asset_ids: List[str]) -> None:
+        self._active_asset_set = set(prev_asset_ids)
+        self._ignored_asset_set = set()
+
+    async def _reconnect_pending_subscription(self, timeout_secs: float) -> bool:
+        current_ws = self._ws
+        pending_event = self._pending_first_book_event
+        if current_ws is None or pending_event is None:
+            return False
+        self._reconnect_pending_on_connect = True
+        try:
+            try:
+                await current_ws.close()
+            except Exception:
+                pass
+            deadline = time.monotonic() + max(0.5, float(timeout_secs))
+            while time.monotonic() < deadline:
+                if self._ws is not None and self._ws is not current_ws:
+                    break
+                await asyncio.sleep(0.05)
+            if self._ws is None or self._ws is current_ws:
+                return False
+            try:
+                await asyncio.wait_for(pending_event.wait(), timeout=max(0.5, float(timeout_secs)))
+                return True
+            except asyncio.TimeoutError:
+                return False
+        finally:
+            self._reconnect_pending_on_connect = False
+
     def _clear_pending_subscription(self) -> None:
         self._pending_subscription_id = None
         self._pending_asset_set = None
@@ -245,6 +309,9 @@ class MarketWSClient:
         self._pending_confirm_first_recv_ms = None
         self._pending_confirm_last_recv_ms = None
         self._pending_confirm_reasons = []
+        self._pending_reconnect_attempted = False
+        self._pending_unsubscribe_before_subscribe = False
+        self._reconnect_pending_on_connect = False
 
     def _pending_confirm_diag(self) -> Dict[str, Any]:
         return {
@@ -256,7 +323,25 @@ class MarketWSClient:
             "reasons": sorted(set(self._pending_confirm_reasons)),
             "pending_subscription_id": self._pending_subscription_id,
             "pending_asset_ids": list(self._pending_asset_ids),
+            "failure_class": self._pending_failure_class(),
+            "reconnect_attempted": bool(self._pending_reconnect_attempted),
+            "unsubscribe_before_subscribe": bool(self._pending_unsubscribe_before_subscribe),
         }
+
+    def _pending_failure_class(self) -> str:
+        counts = list(self._pending_confirm_counts.values())
+        rejects = list(self._pending_confirm_rejections.values())
+        no_messages = (
+            self._pending_confirm_first_recv_ms is None
+            and self._pending_confirm_last_recv_ms is None
+            and all(int(value) == 0 for value in counts)
+            and all(int(value) == 0 for value in rejects)
+        )
+        if no_messages:
+            return "NO_PENDING_MESSAGES"
+        if any(int(value) > 0 for value in rejects) or self._pending_confirm_reasons:
+            return "PENDING_MESSAGES_REJECTED"
+        return "UNKNOWN"
 
     async def _receive_loop(self, ws) -> None:
         while not self._stop_event.is_set():

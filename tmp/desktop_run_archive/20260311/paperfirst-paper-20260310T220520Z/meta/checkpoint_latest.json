@@ -1,0 +1,13 @@
+{
+  "ts_ms": 1773241036716,
+  "book_count": 5943947,
+  "decision_count": 60278,
+  "log_count": 725,
+  "book_age_ms": 30235300,
+  "decision_age_ms": 29946115,
+  "rollover_commit_count": 29,
+  "rollover_intent_count": 146,
+  "quote_count": 25355,
+  "skip_count": 20568,
+  "freeze_count": 14357
+}

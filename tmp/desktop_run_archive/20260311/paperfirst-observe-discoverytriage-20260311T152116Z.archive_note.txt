@@ -1,0 +1,3 @@
+reason=observe_soak_failed_candidate_not_live_contradictory_gamma_metadata
+archived_at=2026-03-11
+source_root=/Users/padraigjudge/Desktop/paperfirst-observe-discoverytriage-20260311T152116Z

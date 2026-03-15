@@ -1,0 +1,4 @@
+repo=/Users/padraigjudge/Desktop/Polymarket Bot
+root=/Users/padraigjudge/Desktop/paperfirst-observe-main-20260310T0433Z
+started_at=2026-03-10T04:31:21Z
+git_sha=3fffcad2615a13f1ad657ef06ffd9269dcb369d4

@@ -1,0 +1,25 @@
+{
+  "blocking_reason": "STALE_DB,ROLLOVER_FAILURES_PRESENT,ABORT_SWITCH_OUTPACING_COMMITS,NEED_2_CLEAN_COMMITS_SINCE_LAST_FAILURE",
+  "clean_rollover_commits_since_last_failure": 0,
+  "freshness_ms": {
+    "decisions_age_ms": 17037590,
+    "logs_age_ms": 17059378,
+    "market_data_book_age_ms": 20357000
+  },
+  "last_failure_ts_ms": 1773261941337,
+  "paper_gate": "CLOSED",
+  "reference_freshness_ms": {
+    "perp": 1015,
+    "spot": 954
+  },
+  "rollover_counts": {
+    "rollover_abort_candidate_not_live": 0,
+    "rollover_abort_discovery_error": 1,
+    "rollover_abort_switch": 15,
+    "rollover_commit": 4,
+    "rollover_health_freeze": 5,
+    "rollover_intent": 35
+  },
+  "run_root": "/Users/padraigjudge/Desktop/paperfirst-observe-livenessfix-20260311T185029Z",
+  "ts_ms": 1773279491322
+}

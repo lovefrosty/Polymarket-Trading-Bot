@@ -54,7 +54,9 @@ def render_market_context_panel(
     c2.metric("Token count", str(len(topbar.token_ids)))
     c3.metric("Window end ETA", topbar.time_to_window_end)
     if not is_dev:
-        st.caption(f"Market detail: {market_label} - closes in {topbar.time_to_window_end}")
+        eta = str(topbar.time_to_window_end or "").strip().lower()
+        market_detail = f"{market_label} - closed" if eta == "closed" else f"{market_label} - closes in {topbar.time_to_window_end}"
+        st.caption(f"Market detail: {market_detail}")
 
     if is_dev:
         token_preview = ", ".join(topbar.token_ids) if topbar.token_ids else "N/A"
