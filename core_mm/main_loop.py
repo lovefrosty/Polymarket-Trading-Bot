@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 from core_mm.book_manager import BookManager
-from core_mm.book_metrics import MeaningfulBBO, find_meaningful_bbo
+from core_mm.book_metrics import BookDiagnostic, MeaningfulBBO, classify_book_state, find_meaningful_bbo
 from core_mm.execution import ExecutionAdapter, ExecutionResult
 from core_mm.flow_filter import FlowFilterDecision, evaluate_volume_ratio
 from core_mm.order_manager import DesiredQuote, OrderAction, RestingOrder, SmartOrderManager
@@ -41,6 +41,7 @@ class TokenState:
 @dataclass(frozen=True)
 class TokenCycleDecision:
     token_id: str
+    book_diag: BookDiagnostic
     metrics: Optional[MeaningfulBBO]
     flow_filter: Optional[FlowFilterDecision]
     quote_plan: Optional[QuotePlan]
@@ -116,8 +117,14 @@ class TradingMainLoop:
 
     def _evaluate_token(self, *, market: MarketConfig, token_state: TokenState, now_ms: int) -> TokenCycleDecision:
         book = self._book_manager.get_book(token_state.token_id)
-        if book is None:
-            return TokenCycleDecision(token_state.token_id, None, None, None, None, None, ())
+        book_diag = classify_book_state(
+            book,
+            min_size=market.min_size,
+            fallback_size=market.fallback_size,
+            now_ms=now_ms,
+        )
+        if book_diag.state != "book_ok" or book is None:
+            return TokenCycleDecision(token_state.token_id, book_diag, None, None, None, None, None, ())
 
         metrics = find_meaningful_bbo(
             book.bids,
@@ -127,7 +134,7 @@ class TradingMainLoop:
             within_pct=market.within_pct,
         )
         if metrics is None:
-            return TokenCycleDecision(token_state.token_id, None, None, None, None, None, ())
+            return TokenCycleDecision(token_state.token_id, book_diag, None, None, None, None, None, ())
 
         flow = evaluate_volume_ratio(
             metrics.bid_sum_within_n_percent,
@@ -176,6 +183,22 @@ class TradingMainLoop:
                     side="buy",
                     price=quote_plan.bid_price,
                     size=size_plan.buy_amount,
+                    metadata={
+                        "market_id": market.market_id,
+                        "quote_mode": quote_plan.bid_mode,
+                        "risk_action": risk.action,
+                        "risk_reasons": list(risk.reasons),
+                        "position": float(token_state.position),
+                        "reverse_position": float(token_state.reverse_position),
+                        "best_bid": metrics.best_bid,
+                        "best_ask": metrics.best_ask,
+                        "mid": book.mid_price,
+                        "top_bid": metrics.top_bid,
+                        "top_ask": metrics.top_ask,
+                        "spread_bps": spread_bps,
+                        "bid_depth": metrics.bid_sum_within_n_percent,
+                        "ask_depth": metrics.ask_sum_within_n_percent,
+                    },
                 )
             )
         if flow.allow_sell and risk.allow_sell and quote_plan.ask_price is not None and size_plan.sell_amount > 0:
@@ -186,11 +209,28 @@ class TradingMainLoop:
                     side="sell",
                     price=quote_plan.ask_price,
                     size=size_plan.sell_amount,
+                    metadata={
+                        "market_id": market.market_id,
+                        "quote_mode": quote_plan.ask_mode,
+                        "risk_action": risk.action,
+                        "risk_reasons": list(risk.reasons),
+                        "position": float(token_state.position),
+                        "reverse_position": float(token_state.reverse_position),
+                        "best_bid": metrics.best_bid,
+                        "best_ask": metrics.best_ask,
+                        "mid": book.mid_price,
+                        "top_bid": metrics.top_bid,
+                        "top_ask": metrics.top_ask,
+                        "spread_bps": spread_bps,
+                        "bid_depth": metrics.bid_sum_within_n_percent,
+                        "ask_depth": metrics.ask_sum_within_n_percent,
+                    },
                 )
             )
 
         return TokenCycleDecision(
             token_id=token_state.token_id,
+            book_diag=book_diag,
             metrics=metrics,
             flow_filter=flow,
             quote_plan=quote_plan,
@@ -212,13 +252,16 @@ class TradingMainLoop:
             if action.action == "PLACE" and action.desired_quote is not None:
                 dq = action.desired_quote
                 results.append(
-                    self._execution_adapter.place_order(
-                        token_id=dq.token_id,
-                        side=dq.side,
-                        price=dq.price,
-                        size=dq.size,
+                        self._execution_adapter.place_order(
+                            token_id=dq.token_id,
+                            side=dq.side,
+                            price=dq.price,
+                            size=dq.size,
+                            client_order_id=dq.quote_key,
+                            quote_group_id=dq.metadata.get("market_id") if isinstance(dq.metadata, dict) else None,
+                            metadata=dq.metadata,
+                        )
                     )
-                )
                 continue
             if action.action == "CANCEL_AND_REPLACE":
                 if action.existing_order_id:
@@ -231,6 +274,9 @@ class TradingMainLoop:
                             side=dq.side,
                             price=dq.price,
                             size=dq.size,
+                            client_order_id=dq.quote_key,
+                            quote_group_id=dq.metadata.get("market_id") if isinstance(dq.metadata, dict) else None,
+                            metadata=dq.metadata,
                         )
                     )
         return results

@@ -1,6 +1,8 @@
 import unittest
 
-from core_mm.book_metrics import find_meaningful_bbo
+from core_mm.book_manager import BookView
+
+from core_mm.book_metrics import classify_book_state, find_meaningful_bbo
 
 
 class TestBookMetrics(unittest.TestCase):
@@ -38,6 +40,56 @@ class TestBookMetrics(unittest.TestCase):
         assert metrics is not None
         self.assertAlmostEqual(metrics.bid_sum_within_n_percent, 150.0)
         self.assertAlmostEqual(metrics.ask_sum_within_n_percent, 165.0)
+
+    def test_book_diagnostic_absent(self) -> None:
+        diag = classify_book_state(None, min_size=100, fallback_size=20, now_ms=2_000)
+        self.assertEqual(diag.state, "book_absent")
+
+    def test_book_diagnostic_empty(self) -> None:
+        book = BookView(
+            token_id="yes",
+            bids=((0.49, 10.0),),
+            asks=(),
+            best_bid=0.49,
+            best_ask=None,
+            best_bid_size=10.0,
+            best_ask_size=0.0,
+            mid_price=None,
+            last_update_ms=1_000,
+        )
+        diag = classify_book_state(book, min_size=100, fallback_size=20, now_ms=2_000)
+        self.assertEqual(diag.state, "book_empty")
+        self.assertEqual(diag.book_age_ms, 1000)
+
+    def test_book_diagnostic_below_meaningful_size(self) -> None:
+        book = BookView(
+            token_id="yes",
+            bids=((0.49, 5.0), (0.48, 8.0)),
+            asks=((0.51, 6.0), (0.52, 10.0)),
+            best_bid=0.49,
+            best_ask=0.51,
+            best_bid_size=5.0,
+            best_ask_size=6.0,
+            mid_price=0.50,
+            last_update_ms=1_000,
+        )
+        diag = classify_book_state(book, min_size=100, fallback_size=20, now_ms=2_000)
+        self.assertEqual(diag.state, "book_below_meaningful_size")
+
+    def test_book_diagnostic_ok(self) -> None:
+        book = BookView(
+            token_id="yes",
+            bids=((0.49, 150.0), (0.48, 20.0)),
+            asks=((0.51, 160.0), (0.52, 25.0)),
+            best_bid=0.49,
+            best_ask=0.51,
+            best_bid_size=150.0,
+            best_ask_size=160.0,
+            mid_price=0.50,
+            last_update_ms=1_000,
+        )
+        diag = classify_book_state(book, min_size=100, fallback_size=20, now_ms=2_000)
+        self.assertEqual(diag.state, "book_ok")
 
 
 if __name__ == "__main__":

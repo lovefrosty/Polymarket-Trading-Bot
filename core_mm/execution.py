@@ -55,6 +55,9 @@ class ExecutionAdapter:
         side: str,
         price: float,
         size: float,
+        client_order_id: Optional[str] = None,
+        quote_group_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         neg_risk: bool = False,
         time_in_force: Optional[str] = None,
     ) -> ExecutionResult:
@@ -63,6 +66,9 @@ class ExecutionAdapter:
             "side": str(side).upper(),
             "price": float(price),
             "size": float(size),
+            "client_order_id": client_order_id,
+            "quote_group_id": quote_group_id,
+            "metadata": dict(metadata or {}),
             "neg_risk": bool(neg_risk),
         }
 

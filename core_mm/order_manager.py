@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -11,6 +11,7 @@ class DesiredQuote:
     side: str
     price: float
     size: float
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)

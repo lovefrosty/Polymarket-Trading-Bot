@@ -1,0 +1,105 @@
+{
+  "canceled_orders": 81,
+  "cycle_summary": {
+    "cycles_total": 1433,
+    "estimated_inactive_time_ms": 1170295,
+    "estimated_quoteable_time_ms": 284200,
+    "freeze_cycles": 14,
+    "freeze_reason_counts": {
+      "book_absent": 28
+    },
+    "inactive_ratio": 0.8046057222609909,
+    "inferred_cycle_interval_ms": 1015,
+    "no_quote_cycles": 1139,
+    "no_quote_reason_counts": {
+      "ask_fallback_top_ask": 1463,
+      "ask_improve": 301,
+      "ask_improve_avg_cost_floor": 440,
+      "ask_join": 57,
+      "ask_join_avg_cost_floor": 17,
+      "bid_fallback_top_bid": 1856,
+      "bid_improve": 348,
+      "bid_join": 74,
+      "flow_blocks_buy": 1268,
+      "flow_blocks_sell": 1070,
+      "sleep_active": 1814,
+      "stop_loss": 116,
+      "take_profit": 61
+    },
+    "quoteable_cycles": 280,
+    "quoteable_ratio": 0.19539427773900908
+  },
+  "decisions": 2866,
+  "execution_quality": {
+    "avg_fee_bps": 25.0,
+    "avg_markout_1s_bps": 181.9322989773283,
+    "avg_markout_5s_bps": 95.09074328651808,
+    "avg_net_edge_bps": 118.27132173186294,
+    "avg_realized_spread_bps": 143.27132173186294,
+    "fills_measured": 564,
+    "negative_markout_1s_rate": 0.21808510638297873,
+    "negative_markout_5s_rate": 0.4095744680851064,
+    "negative_net_edge_rate": 0.18085106382978725
+  },
+  "fill_rate": 0.6886446886446886,
+  "fills": 188,
+  "final": true,
+  "per_token": {
+    "101317282184965184384884030994607665954564424907648382744575340154050160318519": {
+      "cumulative_fees": 3.3277500000000013,
+      "realized_net_pnl": 23.932249999999982,
+      "turnover": 1331.099999999999,
+      "unrealized_pnl": -5.660000000000001
+    },
+    "114611140835034983898831271997595839595601838975903744036851925139150414407268": {
+      "cumulative_fees": 3.3277500000000013,
+      "realized_net_pnl": 23.932249999999982,
+      "turnover": 1331.099999999999,
+      "unrealized_pnl": 0.0
+    },
+    "45671537856462595602047333338715490237794024039692075549180231707262455992177": {
+      "cumulative_fees": 3.3277500000000013,
+      "realized_net_pnl": 23.932249999999982,
+      "turnover": 1331.099999999999,
+      "unrealized_pnl": 0.0
+    },
+    "51119095203503094004106867150592512406688162258325821070275850496284502002031": {
+      "cumulative_fees": 3.3277500000000013,
+      "realized_net_pnl": 23.932249999999982,
+      "turnover": 1331.099999999999,
+      "unrealized_pnl": 0.0
+    },
+    "80594277577917507343227794878796340194868391629450318009645961150578223877641": {
+      "cumulative_fees": 3.3277500000000013,
+      "realized_net_pnl": 23.932249999999982,
+      "turnover": 1331.099999999999,
+      "unrealized_pnl": -1.1580000000000004
+    },
+    "90874431524655197581412178201570075942128011736971824839391988319499768653824": {
+      "cumulative_fees": 3.3277500000000013,
+      "realized_net_pnl": 23.932249999999982,
+      "turnover": 1331.099999999999,
+      "unrealized_pnl": 0.0
+    }
+  },
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": true,
+    "fills_present": true,
+    "loss_source_hints": [],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": true,
+    "quoteable_cycles_present": true,
+    "rationale": "economics_non_negative",
+    "result": "pass",
+    "structural_blocker_detected": false
+  },
+  "placed_orders": 273,
+  "realized_gross_pnl": 27.259999999999973,
+  "realized_net_pnl": 23.932249999999982,
+  "runtime_db_path": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/btc-paper-20260315T222135Z/runtime.db",
+  "total_fees": 3.3277500000000013,
+  "total_pnl": 17.11424999999998,
+  "turnover": 1331.099999999999,
+  "unrealized_pnl": -6.818000000000001,
+  "updated_at_ms": 1773615914895
+}

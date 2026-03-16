@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import List
+from typing import Any, Dict, List
 
 import pandas as pd
 
@@ -10,9 +10,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     st = None  # type: ignore[assignment]
 
-from dashboard.contracts import DashboardFilters, PanelDependency
+from dashboard.contracts import DashboardFilters, PanelDependency, ViewMode
 from dashboard.data_access import (
+    get_active_quote_summary,
     get_open_orders_latest,
+    get_portfolio_risk_summary,
     get_positions_as_of,
     get_trade_blotter,
     require_sources,
@@ -21,8 +23,8 @@ from dashboard.data_access import (
 
 PORTFOLIO_DEP = PanelDependency(
     panel_id="portfolio",
-    required_sources=("inventory", "open_orders_snapshot", "fills"),
-    optional_sources=("execution_quality", "pstar", "market_data_book", "decisions"),
+    required_sources=("inventory", "open_orders_snapshot", "fills", "decisions", "system_state"),
+    optional_sources=("execution_quality", "paper_pnl", "pstar", "market_data_book"),
 )
 
 
@@ -43,10 +45,155 @@ def _missing_hint(table_names: List[str]) -> str:
     return f"missing table(s): {', '.join(sorted(table_names))}"
 
 
+def _fmt_money(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    return f"${float(value):.2f}"
+
+
+def _fmt_bps(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    return f"{float(value):.1f} bps"
+
+
+def _fmt_ratio(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    return f"{float(value) * 100.0:.1f}%"
+
+
+def _fmt_qty(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    return f"{float(value):.2f}"
+
+
+def _fmt_edge(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    return f"{float(value):.3f}"
+
+
+def render_portfolio_summary_panel(
+    filters: DashboardFilters,
+    end_ts_ms: int,
+    view_mode: ViewMode,
+    compact: bool = False,
+) -> None:
+    assert st is not None
+    as_of_ts_ms = int(end_ts_ms)
+
+    summary = get_portfolio_risk_summary(as_of_ts_ms=as_of_ts_ms)
+    positions = _apply_filters(get_positions_as_of(as_of_ts_ms=as_of_ts_ms), filters)
+    open_orders = _apply_filters(get_open_orders_latest(as_of_ts_ms=as_of_ts_ms), filters)
+    quotes = _apply_filters(get_active_quote_summary(as_of_ts_ms=as_of_ts_ms), filters)
+    active_positions = int((positions["net_shares"].fillna(0.0).abs() > 0).sum()) if not positions.empty and "net_shares" in positions.columns else 0
+    gross_exposure = float(positions["gross_notional"].fillna(0.0).sum()) if not positions.empty and "gross_notional" in positions.columns else 0.0
+    net_exposure = float(positions["net_notional"].fillna(0.0).sum()) if not positions.empty and "net_notional" in positions.columns else 0.0
+    offered_spread = float(quotes["offered_spread_bps"].dropna().median()) if not quotes.empty and "offered_spread_bps" in quotes.columns and not quotes["offered_spread_bps"].dropna().empty else summary.get("offered_spread_bps")
+
+    st.subheader("Portfolio Summary" if not compact else "Live Portfolio / Risk")
+    cards = st.columns(6)
+    cards[0].metric("Positions", active_positions)
+    cards[1].metric("Active orders", int(len(open_orders)))
+    cards[2].metric("Gross exposure", _fmt_money(gross_exposure))
+    cards[3].metric("Net exposure", _fmt_money(net_exposure))
+    cards[4].metric("Hedge", _fmt_ratio(summary.get("hedge_completeness")))
+    cards[5].metric("Edge now", _fmt_edge(summary.get("current_edge")))
+
+    more_cards = st.columns(6)
+    more_cards[0].metric("Offered spread", _fmt_bps(offered_spread))
+    more_cards[1].metric("Realized PnL", _fmt_money(summary.get("realized_net_pnl")))
+    more_cards[2].metric("Unrealized PnL", _fmt_money(summary.get("unrealized_pnl")))
+    more_cards[3].metric("Total PnL", _fmt_money(summary.get("total_pnl")))
+    more_cards[4].metric("Largest drawdown", _fmt_money(summary.get("max_drawdown_abs")))
+    more_cards[5].metric("Max risk / trade", _fmt_money(summary.get("max_risk_per_trade_usd")))
+
+    if compact:
+        st.caption(
+            f"quote_state live={int(summary.get('live_quote_rows') or 0)} partial={int(summary.get('partial_quote_rows') or 0)} "
+            f"| trade_size={_fmt_qty(summary.get('trade_size'))} | max_size={_fmt_qty(summary.get('max_size'))} "
+            f"| configured_spread={_fmt_bps(summary.get('maker_half_spread_bps'))}"
+        )
+        return
+
+    status_cols = st.columns(4)
+    status_cols[0].metric("Per-market cap", _fmt_money(summary.get("per_market_cap_usd")), delta=_fmt_ratio(summary.get("per_market_cap_utilization")))
+    status_cols[1].metric("Portfolio cap", _fmt_money(summary.get("portfolio_cap_usd")), delta=_fmt_ratio(summary.get("portfolio_cap_utilization")))
+    status_cols[2].metric("Daily loss limit", _fmt_money(summary.get("daily_loss_limit_usdc")))
+    status_cols[3].metric("Daily notional limit", _fmt_money(summary.get("daily_notional_limit_usdc")))
+    st.caption(
+        f"hedge_state={summary.get('hedge_state')} | quote_size={_fmt_qty(summary.get('maker_quote_size'))} "
+        f"| trade_size={_fmt_qty(summary.get('trade_size'))} | max_size={_fmt_qty(summary.get('max_size'))} "
+        f"| recent_realized_spread={_fmt_bps(summary.get('recent_realized_spread_bps'))} "
+        f"| recent_net_edge={_fmt_bps(summary.get('recent_net_edge_bps'))}"
+    )
+
+    st.subheader("Quote Summary")
+    if quotes.empty:
+        st.caption("No live quotes for current filters.")
+    else:
+        display_quotes = quotes.copy()
+        st.dataframe(
+            display_quotes[
+                [
+                    col
+                    for col in [
+                        "market_slug",
+                        "token_id",
+                        "quote_state",
+                        "bid_count",
+                        "ask_count",
+                        "bid_size",
+                        "ask_size",
+                        "avg_bid",
+                        "avg_ask",
+                        "mid",
+                        "offered_spread_bps",
+                        "oldest_age_s",
+                    ]
+                    if col in display_quotes.columns
+                ]
+            ],
+            width="stretch",
+            height=180,
+        )
+
+    if positions.empty:
+        return
+
+    position_preview = positions.copy()
+    if "as_of_ts_ms" in position_preview.columns:
+        position_preview["as_of_ts"] = pd.to_datetime(position_preview["as_of_ts_ms"], unit="ms", utc=True)
+    st.subheader("Position Concentration")
+    st.dataframe(
+        position_preview[
+            [
+                col
+                for col in [
+                    "as_of_ts",
+                    "market_slug",
+                    "token_id",
+                    "net_shares",
+                    "gross_notional",
+                    "net_notional",
+                    "mark",
+                    "unrealized_pnl",
+                ]
+                if col in position_preview.columns
+            ]
+        ],
+        width="stretch",
+        height=180,
+    )
+
+
 def render_portfolio_panel(
     filters: DashboardFilters,
     start_ts_ms: int,
     end_ts_ms: int,
+    view_mode: ViewMode = "developer",
     panel_budget_ms: int = 450,
 ) -> None:
     assert st is not None
@@ -65,6 +212,8 @@ def render_portfolio_panel(
         st.caption(f"DEGRADED optional missing: {', '.join(missing_optional)}")
 
     as_of_ts_ms = int(end_ts_ms)
+
+    render_portfolio_summary_panel(filters, end_ts_ms=as_of_ts_ms, view_mode=view_mode, compact=False)
 
     st.subheader("Current Positions")
     positions = _apply_filters(get_positions_as_of(as_of_ts_ms=as_of_ts_ms), filters)
@@ -89,6 +238,8 @@ def render_portfolio_panel(
                         "avg_entry",
                         "mark_source",
                         "mark",
+                        "gross_notional",
+                        "net_notional",
                         "unrealized_pnl",
                     ]
                     if col in positions.columns

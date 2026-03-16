@@ -10,7 +10,7 @@ from core_mm.market_selector import MarketSelectionConfig, MarketSelector
 
 @pytest.fixture()
 def selector() -> MarketSelector:
-    return MarketSelector(config=MarketSelectionConfig())
+    return MarketSelector(config=MarketSelectionConfig(require_clob_candidate=False))
 
 
 def _candidate_events():
@@ -92,3 +92,60 @@ def test_runner_user_message_updates_shared_position_state(selector: MarketSelec
     )
     position = runner.position_tracker.get_position("yes_old")
     assert position.size == 5
+
+
+def test_runner_status_distinguishes_empty_books(selector: MarketSelector) -> None:
+    books = BookManager()
+    runner = CoreMMRunner(market_selector=selector, book_manager=books, mode="OBSERVE")
+    runner.refresh_market_selection([_candidate_events()[0]])
+    books.apply_snapshot("yes_old", bids=[(0.49, 150)], asks=[], ts_ms=1_000)
+    books.apply_snapshot("no_old", bids=[(0.49, 150)], asks=[(0.51, 160)], ts_ms=1_000)
+    status = runner.status()
+    assert status.has_books is False
+    assert status.book_diag["per_token"]["yes_old"]["state"] == "book_empty"
+    assert status.book_diag["per_token"]["no_old"]["state"] == "book_ok"
+
+
+def test_runner_respects_market_dwell_before_switching(selector: MarketSelector) -> None:
+    runner = CoreMMRunner(market_selector=selector, market_dwell_ms=900_000)
+    first = [
+        {
+            "slug": "btc-updown-15m-old",
+            "conditionId": "old",
+            "clobTokenIds": ["yes_old", "no_old"],
+            "active": True,
+            "closed": False,
+            "accepting_orders": True,
+            "volatility_sum": 3,
+            "spread": 0.03,
+            "prices": [0.48, 0.52],
+            "reward_per_100": 5,
+        }
+    ]
+    challenger = _candidate_events()
+
+    changed = runner.refresh_market_selection(first, now_ms=1_000)
+    assert changed is True
+    assert runner.current_market is not None
+    assert runner.current_market.condition_id == "old"
+
+    changed = runner.refresh_market_selection(challenger, now_ms=10_000)
+    assert changed is False
+    assert runner.current_market is not None
+    assert runner.current_market.condition_id == "old"
+
+    changed = runner.refresh_market_selection(challenger, now_ms=901_500)
+    assert changed is True
+    assert runner.current_market is not None
+    assert runner.current_market.condition_id == "new"
+
+
+def test_runner_clears_market_when_no_candidates_remain(selector: MarketSelector) -> None:
+    runner = CoreMMRunner(market_selector=selector)
+    changed = runner.refresh_market_selection(_candidate_events(), now_ms=1_000)
+    assert changed is True
+    assert runner.current_market is not None
+
+    changed = runner.refresh_market_selection([], now_ms=2_000)
+    assert changed is True
+    assert runner.current_market is None

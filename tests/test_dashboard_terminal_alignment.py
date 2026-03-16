@@ -10,12 +10,12 @@ import dashboard.app as app
 
 
 class TestDashboardTerminalAlignment(unittest.TestCase):
-    def test_runtime_schema_uses_live_tables_not_alerts(self) -> None:
+    def test_runtime_schema_uses_core_mm_live_tables(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "runtime.db"
             db_path.write_text("")
             with patch.object(app, "DB_PATH", db_path):
-                with patch("dashboard.app.da.existing_tables", return_value=["decisions", "logs", "market_data_book"]):
+                with patch("dashboard.app.da.existing_tables", return_value=["decisions", "fills", "open_orders_snapshot", "inventory", "system_state"]):
                     self.assertFalse(app._runtime_schema_missing())
 
     def test_action_hint_uses_live_policy_thresholds(self) -> None:

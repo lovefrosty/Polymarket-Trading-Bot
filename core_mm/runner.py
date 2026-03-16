@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Sequence
 
 from core_mm.book_manager import BookManager
+from core_mm.book_metrics import classify_book_state
 from core_mm.execution import ExecutionAdapter
 from core_mm.main_loop import MarketConfig, MarketCycleResult, TokenState, TradingMainLoop
 from core_mm.market_selector import MarketCandidate, MarketSelector
@@ -20,6 +22,7 @@ class RunnerStatus:
     market_id: Optional[str]
     token_ids: tuple[str, ...]
     has_books: bool
+    book_diag: Dict[str, Any]
 
 
 class CoreMMRunner:
@@ -41,6 +44,9 @@ class CoreMMRunner:
         max_size: float = 100.0,
         reverse_position_min_size: float = 20.0,
         min_order_size_override: Optional[float] = None,
+        fee_bps: float = 25.0,
+        fee_mode: str = "taker",
+        market_dwell_ms: int = 0,
     ) -> None:
         self.mode = str(mode).upper()
         self.market_selector = market_selector
@@ -49,7 +55,16 @@ class CoreMMRunner:
         self.user_feed = user_feed or UserFeedState(position_tracker=self.position_tracker)
         self.order_manager = order_manager or SmartOrderManager()
         self.risk_manager = risk_manager or RiskManager()
-        self.broker = broker or (PaperBroker(book_manager=self.book_manager, position_tracker=self.position_tracker) if self.mode == "PAPER" else None)
+        self.broker = broker or (
+            PaperBroker(
+                book_manager=self.book_manager,
+                position_tracker=self.position_tracker,
+                fee_bps=fee_bps,
+                fee_mode=fee_mode,
+            )
+            if self.mode == "PAPER"
+            else None
+        )
         self.main_loop = TradingMainLoop(
             book_manager=self.book_manager,
             order_manager=self.order_manager,
@@ -65,14 +80,51 @@ class CoreMMRunner:
         self._max_size = float(max_size)
         self._reverse_position_min_size = float(reverse_position_min_size)
         self._min_order_size_override = min_order_size_override
+        self._market_dwell_ms = max(0, int(market_dwell_ms))
+        self._market_selected_at_ms: Optional[int] = None
 
-    def refresh_market_selection(self, events: Optional[Iterable[Dict[str, Any]]] = None) -> bool:
-        candidates = self.market_selector.select_from_events(events) if events is not None else self.market_selector.select_markets()
+    def refresh_market_selection(
+        self,
+        events: Optional[Iterable[Dict[str, Any]]] = None,
+        *,
+        now_ms: Optional[int] = None,
+    ) -> bool:
+        active_now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        candidates = (
+            self.market_selector.select_from_events(events, now_ts=int(active_now_ms / 1000))
+            if events is not None
+            else self.market_selector.select_markets(now_ts=int(active_now_ms / 1000))
+        )
         if not candidates:
-            return False
+            changed = self.current_market is not None
+            self.current_market = None
+            if changed:
+                self._market_selected_at_ms = None
+            return changed
         selected = candidates[0]
+        if self.current_market is not None:
+            current_match = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.condition_id == self.current_market.condition_id
+                ),
+                None,
+            )
+            if current_match is not None:
+                if (
+                    selected.condition_id != self.current_market.condition_id
+                    and self._market_selected_at_ms is not None
+                    and self._market_dwell_ms > 0
+                    and active_now_ms < (self._market_selected_at_ms + self._market_dwell_ms)
+                ):
+                    selected = current_match
+                elif selected.condition_id == self.current_market.condition_id:
+                    selected = current_match
         changed = self.current_market is None or self.current_market.condition_id != selected.condition_id
         self.current_market = selected
+        if changed or self._market_selected_at_ms is None:
+            self._market_selected_at_ms = active_now_ms
         return changed
 
     def on_market_message(self, message: Dict[str, Any], recv_wall_ms: Optional[int] = None) -> int:
@@ -135,12 +187,34 @@ class CoreMMRunner:
 
     def status(self) -> RunnerStatus:
         token_ids = tuple(self.current_market.token_ids) if self.current_market is not None else ()
-        has_books = all(self.book_manager.get_book(token_id) is not None for token_id in token_ids)
+        token_diag: Dict[str, Dict[str, Any]] = {}
+        blocking_state_counts: Dict[str, int] = {}
+        tokens_ok = 0
+        for token_id in token_ids:
+            diag = classify_book_state(
+                self.book_manager.get_book(token_id),
+                min_size=self._min_size,
+                fallback_size=self._fallback_size,
+            )
+            token_diag[str(token_id)] = diag.as_dict()
+            if diag.state == "book_ok":
+                tokens_ok += 1
+            else:
+                blocking_state_counts[diag.state] = int(blocking_state_counts.get(diag.state, 0)) + 1
+        has_books = bool(token_ids) and all(
+            token_diag[token_id]["state"] not in {"book_absent", "book_empty"} for token_id in token_diag
+        )
         return RunnerStatus(
             mode=self.mode,
             market_id=(self.current_market.slug if self.current_market is not None else None),
             token_ids=token_ids,
             has_books=has_books,
+            book_diag={
+                "per_token": token_diag,
+                "tokens_ok": int(tokens_ok),
+                "tokens_blocked": max(0, len(token_diag) - int(tokens_ok)),
+                "blocking_state_counts": blocking_state_counts,
+            },
         )
 
     def _existing_orders_by_quote_key(self, market_id: str) -> Dict[str, RestingOrder]:

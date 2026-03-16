@@ -1,0 +1,85 @@
+{
+  "mode": "PAPER",
+  "market": "btc-updown-15m-1773612900",
+  "token_ids": [
+    "90874431524655197581412178201570075942128011736971824839391988319499768653824",
+    "80594277577917507343227794878796340194868391629450318009645961150578223877641"
+  ],
+  "feed": {
+    "connected": true,
+    "subscribed_token_ids": [
+      "80594277577917507343227794878796340194868391629450318009645961150578223877641",
+      "90874431524655197581412178201570075942128011736971824839391988319499768653824"
+    ],
+    "received_messages": 2381,
+    "applied_book_updates": 4570
+  },
+  "runner": {
+    "mode": "PAPER",
+    "market_id": "btc-updown-15m-1773612900",
+    "token_ids": [
+      "90874431524655197581412178201570075942128011736971824839391988319499768653824",
+      "80594277577917507343227794878796340194868391629450318009645961150578223877641"
+    ],
+    "has_books": true,
+    "book_diag": {
+      "per_token": {
+        "90874431524655197581412178201570075942128011736971824839391988319499768653824": {
+          "state": "book_ok",
+          "bid_levels": 36,
+          "ask_levels": 63,
+          "best_bid": 0.36,
+          "best_ask": 0.37,
+          "best_bid_size": 79.02,
+          "best_ask_size": 13.9,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1773612993860,
+          "book_age_ms": null
+        },
+        "80594277577917507343227794878796340194868391629450318009645961150578223877641": {
+          "state": "book_ok",
+          "bid_levels": 63,
+          "ask_levels": 36,
+          "best_bid": 0.63,
+          "best_ask": 0.64,
+          "best_bid_size": 13.9,
+          "best_ask_size": 79.02,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1773612993860,
+          "book_age_ms": null
+        }
+      },
+      "tokens_ok": 2,
+      "tokens_blocked": 0,
+      "blocking_state_counts": {}
+    }
+  },
+  "decisions": 15,
+  "order_actions": 13,
+  "fills": 12,
+  "last_error": null,
+  "symbols": [
+    "BTC"
+  ],
+  "runtime_db_path": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/phase0-smoke-20260315T221619Z/runtime.db",
+  "run_summary_path": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/phase0-smoke-20260315T221619Z/meta/run_summary.json",
+  "updated_at_ms": 1773612993919,
+  "config": {
+    "symbols": [
+      "BTC"
+    ],
+    "min_size": 10.0,
+    "fallback_size": 2.0,
+    "within_pct": 0.06,
+    "trade_size": 12.0,
+    "max_size": 150.0,
+    "reverse_position_min_size": 2.0,
+    "min_order_size": null,
+    "market_dwell_secs": 900.0,
+    "fee_bps": 25.0,
+    "fee_mode": "taker"
+  },
+  "stage": "running"
+}

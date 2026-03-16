@@ -1,0 +1,45 @@
+{
+  "mode": "PAPER",
+  "market": "btc-updown-15m-1773607500",
+  "token_ids": [
+    "28901133213765291613869303932486709200202262453779408893288384064418903808296",
+    "71645306124870773655209248707593178617065499581404098745928113036451062395336"
+  ],
+  "feed": {
+    "connected": true,
+    "subscribed_token_ids": [
+      "28901133213765291613869303932486709200202262453779408893288384064418903808296",
+      "71645306124870773655209248707593178617065499581404098745928113036451062395336"
+    ],
+    "received_messages": 3,
+    "applied_book_updates": 6
+  },
+  "runner": {
+    "mode": "PAPER",
+    "market_id": "btc-updown-15m-1773607500",
+    "token_ids": [
+      "28901133213765291613869303932486709200202262453779408893288384064418903808296",
+      "71645306124870773655209248707593178617065499581404098745928113036451062395336"
+    ],
+    "has_books": true
+  },
+  "decisions": 15,
+  "order_actions": 0,
+  "fills": 0,
+  "last_error": null,
+  "runtime_db_path": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/paper-smoke-20260315T205749Z/runtime.db",
+  "run_summary_path": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/paper-smoke-20260315T205749Z/meta/run_summary.json",
+  "updated_at_ms": 1773608487200,
+  "config": {
+    "min_size": 10.0,
+    "fallback_size": 2.0,
+    "within_pct": 0.06,
+    "trade_size": 12.0,
+    "max_size": 150.0,
+    "reverse_position_min_size": 2.0,
+    "min_order_size": null,
+    "fee_bps": 25.0,
+    "fee_mode": "taker"
+  },
+  "stage": "running"
+}

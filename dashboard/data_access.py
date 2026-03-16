@@ -21,13 +21,14 @@ from dashboard.contracts import DrillthroughContext
 
 
 _default_db = os.getenv("RUNTIME_DB_PATH", "runtime.db")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def resolve_db_path() -> Path:
     if st is None:
         return Path(_default_db)
     try:
-        runtime_db_path = st.secrets.get("runtime_db_path", _default_db)  # type: ignore[attr-defined]
+        runtime_db_path = st.session_state.get("runtime_db_override_path") or st.secrets.get("runtime_db_path", _default_db)  # type: ignore[attr-defined]
     except Exception:
         runtime_db_path = _default_db
     return Path(runtime_db_path)
@@ -151,6 +152,82 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def read_json_file(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def runtime_root_for_db(db_path: Optional[Path] = None) -> Path:
+    path = (db_path or resolve_db_path()).resolve()
+    if path.is_dir():
+        return path
+    return path.parent
+
+
+def get_run_status(runtime_root: Optional[Path] = None, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    root = Path(runtime_root) if runtime_root is not None else runtime_root_for_db(db_path)
+    return read_json_file(root / "meta" / "status.json")
+
+
+def get_run_summary(runtime_root: Optional[Path] = None, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    root = Path(runtime_root) if runtime_root is not None else runtime_root_for_db(db_path)
+    return read_json_file(root / "meta" / "run_summary.json")
+
+
+def _load_constitution_defaults() -> Dict[str, Any]:
+    path = _REPO_ROOT / "config" / "constitution.yaml"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def get_runtime_config_snapshot(runtime_root: Optional[Path] = None, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    constitution = _load_constitution_defaults()
+    trading = constitution.get("trading") if isinstance(constitution.get("trading"), dict) else {}
+    policy = constitution.get("policy") if isinstance(constitution.get("policy"), dict) else {}
+    execution = constitution.get("execution") if isinstance(constitution.get("execution"), dict) else {}
+
+    state = query_df(
+        "SELECT payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1",
+        db_path=db_path,
+    )
+    state_payload = safe_json(safe_first(state, "payload_json", "{}"))
+    state_config = state_payload.get("config") if isinstance(state_payload.get("config"), dict) else {}
+    status_config = get_run_status(runtime_root=runtime_root, db_path=db_path).get("config")
+    if not isinstance(status_config, dict):
+        status_config = {}
+
+    merged: Dict[str, Any] = {
+        "per_market_gross_cap_usd": _float_or_none(trading.get("cap_gross_usd")),
+        "portfolio_gross_cap_usd": _float_or_none(trading.get("cap_total_gross_usd")),
+        "portfolio_net_cap_ratio": _float_or_none(trading.get("cap_total_net_ratio")),
+        "per_market_net_cap_ratio": _float_or_none(trading.get("cap_net_ratio")),
+        "daily_loss_limit_usdc": _float_or_none(trading.get("max_daily_loss_usdc")),
+        "daily_notional_limit_usdc": _float_or_none(trading.get("max_daily_notional_usdc")),
+        "maker_quote_size": _float_or_none(execution.get("maker_quote_size")),
+        "maker_half_spread_bps": _float_or_none(execution.get("maker_half_spread_bps")),
+        "risk_padding_bps": _float_or_none(execution.get("risk_padding_bps")),
+        "max_spread_bps": _float_or_none(policy.get("max_spread_bps")),
+        "max_slippage_bps": _float_or_none(policy.get("max_slippage_bps")),
+    }
+    for key in ("trade_size", "max_size", "reverse_position_min_size", "min_order_size", "within_pct", "fee_bps", "fee_mode", "min_size", "fallback_size"):
+        value = status_config.get(key, state_config.get(key))
+        if key == "fee_mode":
+            merged[key] = str(value) if value is not None else None
+        else:
+            merged[key] = _float_or_none(value)
+    return merged
 
 
 def adapt_decisions(df: pd.DataFrame) -> pd.DataFrame:
@@ -531,6 +608,20 @@ def get_positions_as_of(as_of_ts_ms: int, db_path: Optional[Path] = None) -> pd.
         on="token_id",
         how="left",
     )
+    positions["gross_notional"] = positions.apply(
+        lambda row: (
+            float(row["yes_qty"]) * float(row["mark"] if row.get("mark") is not None and not pd.isna(row.get("mark")) else 0.5)
+            + float(row["no_qty"]) * float(1.0 - float(row["mark"]) if row.get("mark") is not None and not pd.isna(row.get("mark")) else 0.5)
+        ),
+        axis=1,
+    )
+    positions["net_notional"] = positions.apply(
+        lambda row: (
+            float(row["yes_qty"]) * float(row["mark"] if row.get("mark") is not None and not pd.isna(row.get("mark")) else 0.5)
+            - float(row["no_qty"]) * float(1.0 - float(row["mark"]) if row.get("mark") is not None and not pd.isna(row.get("mark")) else 0.5)
+        ),
+        axis=1,
+    )
     positions["unrealized_pnl"] = positions.apply(
         lambda row: (
             float((float(row["mark"]) - float(row["avg_entry"])) * float(row["net_shares"]))
@@ -555,6 +646,8 @@ def get_positions_as_of(as_of_ts_ms: int, db_path: Optional[Path] = None) -> pd.
             "avg_entry",
             "mark_source",
             "mark",
+            "gross_notional",
+            "net_notional",
             "unrealized_pnl",
         ]
     ].sort_values("token_id", ascending=True)
@@ -709,6 +802,354 @@ def get_trade_blotter(
         "net_edge_bps",
     ]
     return rows[ordered_cols]
+
+
+def get_paper_pnl_curve(
+    start_ts_ms: Optional[int] = None,
+    end_ts_ms: Optional[int] = None,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    if not table_exists("paper_pnl", db_path=db_path):
+        return pd.DataFrame(
+            columns=[
+                "ts_ms",
+                "realized_gross_pnl",
+                "realized_net_pnl",
+                "unrealized_pnl",
+                "total_pnl",
+                "cumulative_fees",
+                "turnover",
+                "win_count",
+                "loss_count",
+                "equity_peak",
+                "drawdown_abs",
+                "drawdown_pct",
+            ]
+        )
+
+    predicates: List[str] = []
+    params: List[Any] = []
+    if start_ts_ms is not None:
+        predicates.append("ts_ms >= ?")
+        params.append(int(start_ts_ms))
+    if end_ts_ms is not None:
+        predicates.append("ts_ms <= ?")
+        params.append(int(end_ts_ms))
+    where_sql = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+    rows = query_df(
+        f"""
+        SELECT
+          ts_ms,
+          MAX(realized_gross_pnl) AS realized_gross_pnl,
+          MAX(realized_net_pnl) AS realized_net_pnl,
+          SUM(COALESCE(unrealized_pnl, 0.0)) AS unrealized_pnl,
+          MAX(cumulative_fees) AS cumulative_fees,
+          MAX(turnover) AS turnover,
+          MAX(win_count) AS win_count,
+          MAX(loss_count) AS loss_count
+        FROM paper_pnl
+        {where_sql}
+        GROUP BY ts_ms
+        ORDER BY ts_ms ASC
+        """,
+        tuple(params),
+        db_path=db_path,
+    )
+    if rows.empty:
+        return rows
+
+    out = rows.copy()
+    for col in ["realized_gross_pnl", "realized_net_pnl", "unrealized_pnl", "cumulative_fees", "turnover"]:
+        out[col] = out[col].fillna(0.0).astype(float)
+    for col in ["win_count", "loss_count"]:
+        out[col] = out[col].fillna(0).astype(int)
+    out["total_pnl"] = out["realized_net_pnl"] + out["unrealized_pnl"]
+    peaks: List[float] = []
+    running_peak: Optional[float] = None
+    for value in out["total_pnl"].tolist():
+        current = float(value)
+        running_peak = current if running_peak is None else max(running_peak, current)
+        peaks.append(float(running_peak))
+    out["equity_peak"] = peaks
+    out["drawdown_abs"] = (out["equity_peak"] - out["total_pnl"]).clip(lower=0.0)
+    out["drawdown_pct"] = out.apply(
+        lambda row: (float(row["drawdown_abs"]) / float(row["equity_peak"])) if float(row["equity_peak"]) > 0 else None,
+        axis=1,
+    )
+    return out
+
+
+def get_paper_pnl_summary(as_of_ts_ms: Optional[int] = None, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    curve = get_paper_pnl_curve(end_ts_ms=as_of_ts_ms, db_path=db_path)
+    if curve.empty:
+        summary = get_run_summary(db_path=db_path)
+        if summary:
+            realized_net = _float_or_none(summary.get("realized_net_pnl")) or 0.0
+            unrealized = _float_or_none(summary.get("unrealized_pnl")) or 0.0
+            return {
+                "latest_ts_ms": _int_or_none(summary.get("updated_at_ms")),
+                "realized_gross_pnl": _float_or_none(summary.get("realized_gross_pnl")) or 0.0,
+                "realized_net_pnl": realized_net,
+                "unrealized_pnl": unrealized,
+                "total_pnl": realized_net + unrealized,
+                "cumulative_fees": _float_or_none(summary.get("total_fees")) or 0.0,
+                "turnover": _float_or_none(summary.get("turnover")) or 0.0,
+                "fills": _int_or_none(summary.get("fills")) or 0,
+                "decisions": _int_or_none(summary.get("decisions")) or 0,
+                "win_count": None,
+                "loss_count": None,
+                "max_drawdown_abs": None,
+                "max_drawdown_pct": None,
+            }
+        return {
+            "latest_ts_ms": None,
+            "realized_gross_pnl": 0.0,
+            "realized_net_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "total_pnl": 0.0,
+            "cumulative_fees": 0.0,
+            "turnover": 0.0,
+            "fills": 0,
+            "decisions": 0,
+            "win_count": None,
+            "loss_count": None,
+            "max_drawdown_abs": None,
+            "max_drawdown_pct": None,
+        }
+
+    latest = curve.iloc[-1]
+    return {
+        "latest_ts_ms": _int_or_none(latest.get("ts_ms")),
+        "realized_gross_pnl": float(latest.get("realized_gross_pnl") or 0.0),
+        "realized_net_pnl": float(latest.get("realized_net_pnl") or 0.0),
+        "unrealized_pnl": float(latest.get("unrealized_pnl") or 0.0),
+        "total_pnl": float(latest.get("total_pnl") or 0.0),
+        "cumulative_fees": float(latest.get("cumulative_fees") or 0.0),
+        "turnover": float(latest.get("turnover") or 0.0),
+        "fills": int(query_df("SELECT COUNT(*) AS n FROM fills", db_path=db_path).get("n", pd.Series([0])).iloc[0] if table_exists("fills", db_path=db_path) else 0),
+        "decisions": int(query_df("SELECT COUNT(*) AS n FROM decisions", db_path=db_path).get("n", pd.Series([0])).iloc[0] if table_exists("decisions", db_path=db_path) else 0),
+        "win_count": _int_or_none(latest.get("win_count")),
+        "loss_count": _int_or_none(latest.get("loss_count")),
+        "max_drawdown_abs": float(curve["drawdown_abs"].max()) if "drawdown_abs" in curve.columns else None,
+        "max_drawdown_pct": float(curve["drawdown_pct"].dropna().max()) if "drawdown_pct" in curve.columns and not curve["drawdown_pct"].dropna().empty else None,
+    }
+
+
+def get_current_edge_snapshot(as_of_ts_ms: int, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    if not table_exists("decisions", db_path=db_path):
+        return {}
+    latest = query_df(
+        """
+        WITH ranked AS (
+          SELECT
+            ts_ms,
+            decision_id,
+            market,
+            token_id,
+            action,
+            p_hat,
+            expected_edge,
+            expected_cost,
+            policy_json,
+            ROW_NUMBER() OVER (
+              PARTITION BY token_id
+              ORDER BY ts_ms DESC, COALESCE(decision_id, '') DESC
+            ) AS rn
+          FROM decisions
+          WHERE ts_ms <= ?
+        )
+        SELECT ts_ms, decision_id, market, token_id, action, p_hat, expected_edge, expected_cost, policy_json
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY ts_ms DESC, token_id ASC
+        """,
+        (int(as_of_ts_ms),),
+        db_path=db_path,
+    )
+    if latest.empty:
+        return {}
+
+    latest = latest.copy()
+    latest["ev"] = latest["expected_edge"].fillna(0.0) - latest["expected_cost"].fillna(0.0)
+    recent_eq = pd.DataFrame()
+    if table_exists("execution_quality", db_path=db_path):
+        recent_eq = query_df(
+            """
+            SELECT realized_spread_bps, net_edge_bps, markout_5s_bps
+            FROM execution_quality
+            WHERE ts_ms <= ?
+            ORDER BY ts_ms DESC
+            LIMIT 50
+            """,
+            (int(as_of_ts_ms),),
+            db_path=db_path,
+        )
+    newest = latest.iloc[0]
+    return {
+        "latest_ts_ms": _int_or_none(newest.get("ts_ms")),
+        "latest_market": newest.get("market"),
+        "latest_token_id": newest.get("token_id"),
+        "latest_action": newest.get("action"),
+        "latest_p_hat": _float_or_none(newest.get("p_hat")),
+        "latest_ev": _float_or_none(newest.get("ev")),
+        "best_ev": float(latest["ev"].max()) if "ev" in latest.columns else None,
+        "avg_ev": float(latest["ev"].mean()) if "ev" in latest.columns else None,
+        "recent_realized_spread_bps": percentile(recent_eq.get("realized_spread_bps", pd.Series(dtype=float)), 0.5),
+        "recent_net_edge_bps": percentile(recent_eq.get("net_edge_bps", pd.Series(dtype=float)), 0.5),
+        "recent_markout_5s_bps": percentile(recent_eq.get("markout_5s_bps", pd.Series(dtype=float)), 0.5),
+    }
+
+
+def get_active_quote_summary(as_of_ts_ms: int, db_path: Optional[Path] = None) -> pd.DataFrame:
+    open_orders = get_open_orders_latest(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    if open_orders.empty:
+        return pd.DataFrame(
+            columns=[
+                "token_id",
+                "market_slug",
+                "bid_count",
+                "ask_count",
+                "bid_size",
+                "ask_size",
+                "avg_bid",
+                "avg_ask",
+                "mid",
+                "offered_spread_bps",
+                "quote_state",
+                "oldest_age_s",
+                "newest_age_s",
+            ]
+        )
+
+    marks = get_mark_snapshot(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    mark_map = {
+        str(row["token_id"]): _float_or_none(row.get("mark"))
+        for _, row in marks.iterrows()
+        if row.get("token_id") is not None
+    }
+    rows: List[Dict[str, Any]] = []
+    for (token_id, market_slug), group in open_orders.groupby(["token_id", "market_slug"], dropna=False):
+        token_rows = group.copy()
+        bid_rows = token_rows[token_rows["side"].astype(str).str.lower() == "buy"]
+        ask_rows = token_rows[token_rows["side"].astype(str).str.lower() == "sell"]
+        bid_size = float(bid_rows["size"].fillna(0.0).sum()) if not bid_rows.empty else 0.0
+        ask_size = float(ask_rows["size"].fillna(0.0).sum()) if not ask_rows.empty else 0.0
+        avg_bid = None
+        avg_ask = None
+        if not bid_rows.empty:
+            weights = bid_rows["size"].fillna(0.0).astype(float)
+            prices = bid_rows["price"].fillna(0.0).astype(float)
+            avg_bid = float((prices * weights).sum() / weights.sum()) if float(weights.sum()) > 0 else float(prices.mean())
+        if not ask_rows.empty:
+            weights = ask_rows["size"].fillna(0.0).astype(float)
+            prices = ask_rows["price"].fillna(0.0).astype(float)
+            avg_ask = float((prices * weights).sum() / weights.sum()) if float(weights.sum()) > 0 else float(prices.mean())
+        mid = mark_map.get(str(token_id))
+        if mid is None and avg_bid is not None and avg_ask is not None:
+            mid = (float(avg_bid) + float(avg_ask)) / 2.0
+        spread_bps = None
+        if avg_bid is not None and avg_ask is not None and mid is not None and float(mid) > 0:
+            spread_bps = ((float(avg_ask) - float(avg_bid)) / float(mid)) * 10000.0
+        quote_state = "live" if avg_bid is not None and avg_ask is not None else ("partial" if avg_bid is not None or avg_ask is not None else "absent")
+        ages = ((int(as_of_ts_ms) - token_rows["ts_ms"].astype(float)) / 1000.0).clip(lower=0.0) if "ts_ms" in token_rows.columns else pd.Series(dtype=float)
+        rows.append(
+            {
+                "token_id": token_id,
+                "market_slug": market_slug,
+                "bid_count": int(len(bid_rows)),
+                "ask_count": int(len(ask_rows)),
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+                "avg_bid": avg_bid,
+                "avg_ask": avg_ask,
+                "mid": mid,
+                "offered_spread_bps": spread_bps,
+                "quote_state": quote_state,
+                "oldest_age_s": float(ages.max()) if not ages.empty else None,
+                "newest_age_s": float(ages.min()) if not ages.empty else None,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["market_slug", "token_id"]).reset_index(drop=True)
+
+
+def get_portfolio_risk_summary(as_of_ts_ms: int, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    positions = get_positions_as_of(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    open_orders = get_open_orders_latest(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    quotes = get_active_quote_summary(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    pnl = get_paper_pnl_summary(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    edge = get_current_edge_snapshot(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    cfg = get_runtime_config_snapshot(db_path=db_path)
+
+    gross_exposure = float(positions["gross_notional"].fillna(0.0).sum()) if "gross_notional" in positions.columns else 0.0
+    net_exposure = float(positions["net_notional"].fillna(0.0).sum()) if "net_notional" in positions.columns else 0.0
+    max_position_notional = float(positions["gross_notional"].fillna(0.0).max()) if not positions.empty and "gross_notional" in positions.columns else 0.0
+    active_positions = int((positions["net_shares"].fillna(0.0).abs() > 0).sum()) if "net_shares" in positions.columns else 0
+    active_orders = int(len(open_orders))
+    live_quote_rows = int((quotes["quote_state"] == "live").sum()) if not quotes.empty and "quote_state" in quotes.columns else 0
+    partial_quote_rows = int((quotes["quote_state"] == "partial").sum()) if not quotes.empty and "quote_state" in quotes.columns else 0
+    offered_spread_bps = percentile(quotes.get("offered_spread_bps", pd.Series(dtype=float)), 0.5)
+
+    fills = adapt_fills(query_df("SELECT ts_ms, payload_json FROM fills WHERE ts_ms <= ?", (int(as_of_ts_ms),), db_path=db_path))
+    if fills.empty:
+        hedge_completeness = 1.0
+        hedge_state = "no fills yet"
+    else:
+        hedge_count = int(fills["is_hedge"].sum())
+        primary_count = max(0, len(fills) - hedge_count)
+        hedge_completeness = 1.0 if primary_count == 0 else min(1.0, hedge_count / float(primary_count))
+        hedge_state = "hedged" if hedge_completeness >= 1.0 else ("partial" if hedge_count > 0 else "unhedged")
+
+    system_state = query_df("SELECT payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1", db_path=db_path)
+    system_payload = safe_json(safe_first(system_state, "payload_json", "{}"))
+    broker_stats = system_payload.get("broker_stats") if isinstance(system_payload.get("broker_stats"), dict) else {}
+    realized_net = _float_or_none(broker_stats.get("realized_net_pnl"))
+    if realized_net is not None:
+        pnl["realized_net_pnl"] = realized_net
+        pnl["total_pnl"] = float(realized_net) + float(pnl.get("unrealized_pnl") or 0.0)
+
+    max_risk_per_trade_shares = cfg.get("trade_size") or cfg.get("maker_quote_size")
+    price_ref = edge.get("latest_p_hat")
+    max_risk_per_trade_usd = float(max_risk_per_trade_shares) * float(price_ref) if max_risk_per_trade_shares is not None and price_ref is not None else None
+    per_market_cap = cfg.get("per_market_gross_cap_usd")
+    portfolio_cap = cfg.get("portfolio_gross_cap_usd")
+
+    return {
+        "active_positions": active_positions,
+        "active_orders": active_orders,
+        "live_quote_rows": live_quote_rows,
+        "partial_quote_rows": partial_quote_rows,
+        "gross_exposure": gross_exposure,
+        "net_exposure": net_exposure,
+        "max_position_notional": max_position_notional,
+        "hedge_completeness": hedge_completeness,
+        "hedge_state": hedge_state,
+        "offered_spread_bps": offered_spread_bps,
+        "current_edge": edge.get("latest_ev"),
+        "recent_realized_spread_bps": edge.get("recent_realized_spread_bps"),
+        "recent_net_edge_bps": edge.get("recent_net_edge_bps"),
+        "realized_net_pnl": pnl.get("realized_net_pnl"),
+        "unrealized_pnl": pnl.get("unrealized_pnl"),
+        "total_pnl": pnl.get("total_pnl"),
+        "turnover": pnl.get("turnover"),
+        "cumulative_fees": pnl.get("cumulative_fees"),
+        "max_drawdown_abs": pnl.get("max_drawdown_abs"),
+        "max_drawdown_pct": pnl.get("max_drawdown_pct"),
+        "win_count": pnl.get("win_count"),
+        "loss_count": pnl.get("loss_count"),
+        "per_market_cap_usd": per_market_cap,
+        "portfolio_cap_usd": portfolio_cap,
+        "per_market_cap_utilization": (max_position_notional / float(per_market_cap)) if per_market_cap not in (None, 0) else None,
+        "portfolio_cap_utilization": (gross_exposure / float(portfolio_cap)) if portfolio_cap not in (None, 0) else None,
+        "daily_loss_limit_usdc": cfg.get("daily_loss_limit_usdc"),
+        "daily_notional_limit_usdc": cfg.get("daily_notional_limit_usdc"),
+        "maker_quote_size": cfg.get("maker_quote_size"),
+        "maker_half_spread_bps": cfg.get("maker_half_spread_bps"),
+        "trade_size": cfg.get("trade_size"),
+        "max_size": cfg.get("max_size"),
+        "max_risk_per_trade_shares": max_risk_per_trade_shares,
+        "max_risk_per_trade_usd": max_risk_per_trade_usd,
+        "latest_p_hat": edge.get("latest_p_hat"),
+    }
 
 
 def query_evidence_rows(

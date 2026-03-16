@@ -31,7 +31,7 @@ from dashboard.contracts import DashboardFilters, HealthGateStatus, RefreshPolic
 from dashboard import data_access as da
 from dashboard.panels.export import render_export_panel
 from dashboard.panels.market_context import render_market_context_panel
-from dashboard.panels.portfolio import render_portfolio_panel
+from dashboard.panels.portfolio import render_portfolio_panel, render_portfolio_summary_panel
 from dashboard.panels.rollover import render_rollover_panel
 from dashboard.panels.reliability import render_health_panel, render_logs_panel
 from dashboard.panels.replay_diff import render_replay_diff_panel
@@ -162,6 +162,8 @@ def _status_class(level: str) -> str:
     return "ok"
 
 
+RUNTIME_DB_OVERRIDE_KEY = "runtime_db_override_path"
+CORE_MM_RUNTIME_CONTEXT_KEY = "core_mm_runtime_context"
 DB_PATH = da.resolve_db_path()
 
 
@@ -399,9 +401,10 @@ else:
 
 
 def build_label_registry(selected_market: str) -> Dict[str, Dict[str, Any]]:
+    db_path = _current_db_path()
     db_sig = "missing"
-    if DB_PATH.exists():
-        db_sig = f"{DB_PATH}:{int(DB_PATH.stat().st_mtime_ns)}"
+    if db_path.exists():
+        db_sig = f"{db_path}:{int(db_path.stat().st_mtime_ns)}"
     return _build_label_registry_cached(selected_market, db_sig)
 
 
@@ -537,7 +540,7 @@ def _active_policy_thresholds() -> Dict[str, float]:
     if isinstance(execution_cfg, dict) and "maker_half_spread_bps" in execution_cfg:
         thresholds["maker_half_spread_bps"] = float(execution_cfg["maker_half_spread_bps"])
 
-    if DB_PATH.exists():
+    if _current_db_path().exists():
         try:
             state = query_df("SELECT payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1")
         except Exception:
@@ -794,20 +797,194 @@ def build_signals_table_for_view(
     return slim
 
 
+def _current_db_path() -> Path:
+    if st is not None:
+        override = st.session_state.get(RUNTIME_DB_OVERRIDE_KEY)
+        if override:
+            return Path(str(override))
+    return Path(str(DB_PATH))
+
+
+def _current_runtime_root() -> Path:
+    if st is not None:
+        ctx = st.session_state.get(CORE_MM_RUNTIME_CONTEXT_KEY)
+        if isinstance(ctx, dict) and ctx.get("runtime_root"):
+            return Path(str(ctx["runtime_root"]))
+    return da.runtime_root_for_db(_current_db_path())
+
+
+def _safe_json_file(path: Path) -> Dict[str, Any]:
+    return da.read_json_file(path)
+
+
+def _fmt_age_s(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    seconds = max(0.0, float(value))
+    if seconds < 60.0:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60.0
+    if minutes < 60.0:
+        return f"{minutes:.1f}m"
+    return f"{minutes / 60.0:.1f}h"
+
+
+def _core_mm_runtime_candidates_uncached() -> List[Dict[str, Any]]:
+    repo_root = _ROOT
+    candidates: List[Dict[str, Any]] = []
+    runtime_dbs: List[Path] = []
+    default_db = repo_root / "runtime.db"
+    if default_db.exists():
+        runtime_dbs.append(default_db)
+    for pattern in ("tmp/core_mm_runs/*/runtime.db", "tmp/desktop_run_archive/*/core_mm_runs/*/runtime.db"):
+        runtime_dbs.extend(repo_root.glob(pattern))
+    seen: set[str] = set()
+    for db_path in runtime_dbs:
+        resolved = db_path.resolve().as_posix()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        runtime_root = db_path.parent
+        status_path = runtime_root / "meta" / "status.json"
+        summary_path = runtime_root / "meta" / "run_summary.json"
+        status = _safe_json_file(status_path)
+        summary = _safe_json_file(summary_path)
+        archived = "desktop_run_archive" in runtime_root.parts
+        latest_mtime = max(
+            db_path.stat().st_mtime if db_path.exists() else 0.0,
+            status_path.stat().st_mtime if status_path.exists() else 0.0,
+            summary_path.stat().st_mtime if summary_path.exists() else 0.0,
+        )
+        updated_at_ms = status.get("updated_at_ms") if isinstance(status, dict) else None
+        age_s = None
+        if updated_at_ms is not None:
+            try:
+                age_s = max(0.0, datetime.now(timezone.utc).timestamp() - (float(updated_at_ms) / 1000.0))
+            except (TypeError, ValueError):
+                age_s = None
+        if age_s is None:
+            age_s = max(0.0, datetime.now(timezone.utc).timestamp() - latest_mtime)
+        stage = str(status.get("stage") or ("archived" if archived else "unknown"))
+        mode = str(status.get("mode") or "N/A").upper()
+        is_repo_default = db_path.resolve() == default_db.resolve()
+        active_hint = (not archived) and stage == "running" and age_s <= 15 * 60
+        label_prefix = "Repo runtime" if is_repo_default else runtime_root.name
+        label = f"{label_prefix} [{mode} {stage} {_fmt_age_s(age_s)}]"
+        candidates.append(
+            {
+                "label": label,
+                "runtime_root": runtime_root.as_posix(),
+                "db_path": db_path.resolve().as_posix(),
+                "status_path": status_path.resolve().as_posix(),
+                "summary_path": summary_path.resolve().as_posix(),
+                "status": status,
+                "summary": summary,
+                "archived": archived,
+                "active_hint": active_hint,
+                "latest_mtime": latest_mtime,
+                "age_s": age_s,
+                "is_repo_default": is_repo_default,
+            }
+        )
+    candidates.sort(
+        key=lambda row: (
+            1 if bool(row.get("active_hint")) else 0,
+            1 if bool(row.get("is_repo_default")) else 0,
+            float(row.get("latest_mtime") or 0.0),
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+if st is not None and hasattr(st, "cache_data"):
+
+    @st.cache_data(ttl=5, show_spinner=False)
+    def _core_mm_runtime_candidates_cached(_sentinel: str = "v1") -> List[Dict[str, Any]]:
+        _ = _sentinel
+        return _core_mm_runtime_candidates_uncached()
+
+else:
+
+    def _core_mm_runtime_candidates_cached(_sentinel: str = "v1") -> List[Dict[str, Any]]:
+        _ = _sentinel
+        return _core_mm_runtime_candidates_uncached()
+
+
+def _build_runtime_source_selector() -> None:
+    assert st is not None
+    candidates = _core_mm_runtime_candidates_cached()
+    if not candidates:
+        st.sidebar.caption("No standalone core_mm runtime found.")
+        return
+    labels = [str(item.get("label")) for item in candidates]
+    default_db = str(_current_db_path().resolve())
+    selected_index = 0
+    for idx, row in enumerate(candidates):
+        if str(row.get("db_path")) == default_db:
+            selected_index = idx
+            break
+    selected_label = st.sidebar.selectbox("Runtime source", labels, index=selected_index, key="runtime_source_select")
+    selected = candidates[labels.index(selected_label)]
+    st.session_state[RUNTIME_DB_OVERRIDE_KEY] = str(selected.get("db_path"))
+    st.session_state[CORE_MM_RUNTIME_CONTEXT_KEY] = selected
+    st.sidebar.caption(f"Runtime root: {selected.get('runtime_root')}")
+
+
+def _render_selected_run_status(view_mode: ViewMode) -> None:
+    assert st is not None
+    db_path = _current_db_path()
+    runtime_root = _current_runtime_root()
+    status = da.get_run_status(runtime_root=runtime_root, db_path=db_path)
+    summary = da.get_run_summary(runtime_root=runtime_root, db_path=db_path)
+    pnl_summary = da.get_paper_pnl_summary(db_path=db_path)
+    if not status and not summary:
+        st.caption(f"runtime_db={db_path}")
+        return
+
+    stage = str(status.get("stage") or "unknown")
+    mode = str(status.get("mode") or "N/A").upper()
+    market = str(status.get("market") or "unknown")
+    updated_at_ms = status.get("updated_at_ms")
+    age_s = None
+    if updated_at_ms is not None:
+        try:
+            age_s = max(0.0, datetime.now(timezone.utc).timestamp() - float(updated_at_ms) / 1000.0)
+        except (TypeError, ValueError):
+            age_s = None
+    last_error = status.get("last_error")
+    st.caption(
+        f"core_mm runtime={runtime_root.name} mode={mode} stage={stage} market={market} "
+        f"age={_fmt_age_s(age_s)} last_error={last_error or 'none'}"
+    )
+    cols = st.columns(4)
+    cols[0].metric("Decisions", int(status.get("decisions") or summary.get("decisions") or 0))
+    cols[1].metric("Fills", int(status.get("fills") or summary.get("fills") or 0))
+    cols[2].metric("Total PnL", f"${float(pnl_summary.get('total_pnl') or 0.0):.2f}")
+    dd_value = pnl_summary.get("max_drawdown_abs")
+    cols[3].metric("Max drawdown", f"${float(dd_value):.2f}" if dd_value is not None else "N/A")
+    if is_developer_mode(view_mode):
+        st.caption(
+            f"runtime_db={db_path} realized={float(pnl_summary.get('realized_net_pnl') or 0.0):.2f} "
+            f"unrealized={float(pnl_summary.get('unrealized_pnl') or 0.0):.2f}"
+        )
+
+
 def _runtime_schema_missing() -> bool:
-    if not DB_PATH.exists():
+    db_path = _current_db_path()
+    if not db_path.exists():
         return True
-    required = {"decisions", "logs", "market_data_book"}
-    present = set(da.existing_tables(DB_PATH))
+    required = {"decisions", "fills", "open_orders_snapshot", "inventory", "system_state"}
+    present = set(da.existing_tables(db_path))
     return not required.issubset(present)
 
 
 def _table_exists(name: str) -> bool:
-    return da.table_exists(name, DB_PATH)
+    return da.table_exists(name, _current_db_path())
 
 
 def query_df(sql: str, params: Sequence[Any] = ()) -> pd.DataFrame:
-    return da.query_df(sql, params=params, db_path=DB_PATH)
+    return da.query_df(sql, params=params, db_path=_current_db_path())
 
 
 def q(sql: str) -> pd.DataFrame:
@@ -1329,6 +1506,7 @@ def should_refresh_heavy(tick: int, policy: RefreshPolicy) -> bool:
 def _build_filters() -> Tuple[DashboardFilters, RefreshPolicy, ViewMode]:
     assert st is not None
     st.sidebar.header("Controls")
+    _build_runtime_source_selector()
     stored_view = _normalize_view_mode(str(st.session_state.get("view_mode", "trader")))
     selected_view = st.sidebar.radio(
         "View Mode",
@@ -1992,11 +2170,11 @@ def render_dashboard() -> None:
     st.set_page_config(page_title="Polymarket Terminal", layout="wide")
     st.markdown(TERMINAL_CSS, unsafe_allow_html=True)
     st.title("Polymarket Terminal")
-    st.caption("Retro operator console for SQLite runtime telemetry and A-E safety gates.")
+    st.caption("Retro operator console for standalone core_mm runtime telemetry and paper trading state.")
 
     if _runtime_schema_missing():
         st.markdown(
-            '<div class="warn"><b>Runtime not initialized</b> - start <code>scripts/run_system.py</code> to create tables and live telemetry.</div>',
+            '<div class="warn"><b>Runtime not initialized</b> - start <code>scripts/run_core_mm.py --runtime-root ...</code> to create standalone runtime telemetry.</div>',
             unsafe_allow_html=True,
         )
 
@@ -2050,6 +2228,7 @@ def render_dashboard() -> None:
             _render_topbar(metrics, health, view_mode, label_registry)
         with status_slot.container():
             st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
+            _render_selected_run_status(view_mode)
 
         start_ts, end_ts = _time_filter(filters.window_minutes)
 
@@ -2058,6 +2237,11 @@ def render_dashboard() -> None:
                 "market_context",
                 lambda: render_market_context_panel(filters, metrics, view_mode=view_mode, label_token_fn=lambda market, token: label_token(label_registry, market, token)),
                 budget_ms=200,
+            )
+            _render_panel(
+                "portfolio_summary",
+                lambda: render_portfolio_summary_panel(filters, end_ts_ms=end_ts, view_mode=view_mode, compact=True),
+                budget_ms=250,
             )
             _render_panel("overview", lambda: _render_overview(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
 
@@ -2116,7 +2300,7 @@ def render_dashboard() -> None:
             with portfolio_slot.container():
                 _render_panel(
                     "portfolio",
-                    lambda: render_portfolio_panel(filters, start_ts, end_ts),
+                    lambda: render_portfolio_panel(filters, start_ts, end_ts, view_mode=view_mode),
                     budget_ms=450,
                 )
 
