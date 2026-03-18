@@ -1,3 +1,0 @@
-reason=paper_soak_failed_stale_runtime_after_rollover_discovery_error
-archived_at=2026-03-11
-source_root=/Users/padraigjudge/Desktop/paperfirst-paper-20260310T220520Z
