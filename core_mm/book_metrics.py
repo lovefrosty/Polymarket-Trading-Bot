@@ -202,8 +202,12 @@ def _sum_near_mid(
 ) -> Tuple[float, float]:
     if mid is None or mid <= 0 or within_pct < 0:
         return 0.0, 0.0
-    lower = mid * (1.0 - float(within_pct))
-    upper = mid * (1.0 + float(within_pct))
+    # Use a minimum absolute half-window of 0.03 to prevent the percentage window
+    # from collapsing to zero for low-priced tokens (e.g. $0.05 NO tokens where
+    # 6% of mid = $0.003 — smaller than the tick, so nothing is measured).
+    half_window = max(mid * float(within_pct), 0.03)
+    lower = mid - half_window
+    upper = mid + half_window
     bid_sum = sum(size for price, size in bid_levels if price >= lower)
     ask_sum = sum(size for price, size in ask_levels if price <= upper)
     return float(bid_sum), float(ask_sum)

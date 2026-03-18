@@ -1341,5 +1341,441 @@ def percentile(series: Iterable[float], pct: float) -> Optional[float]:
     return float(values[idx])
 
 
+def get_execution_quality_df(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Return all execution_quality rows with ts, side, prices, and markout columns."""
+    if not table_exists("execution_quality", db_path=db_path):
+        return pd.DataFrame()
+    df = query_df(
+        """
+        SELECT
+          ts_ms,
+          order_id,
+          token_id,
+          side,
+          fill_price,
+          mid_at_placement,
+          mid_at_fill,
+          realized_spread_bps,
+          markout_1s_bps,
+          markout_5s_bps,
+          net_edge_bps,
+          slippage_bps,
+          fill_trigger,
+          quote_mode
+        FROM execution_quality
+        ORDER BY fill_ts_ms ASC
+        """,
+        db_path=db_path,
+    )
+    if df.empty:
+        return df
+    df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
+    return df
+
+
+def get_fills_recent(limit: int = 20, db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Return the most recent fills with payload fields unpacked."""
+    if not table_exists("fills", db_path=db_path):
+        return pd.DataFrame()
+    df = query_df(
+        f"""
+        SELECT
+          ts_ms,
+          order_id,
+          token_id,
+          side,
+          fill_price,
+          fill_qty,
+          payload_json
+        FROM fills
+        ORDER BY ts_ms DESC
+        LIMIT {int(limit)}
+        """,
+        db_path=db_path,
+    )
+    if df.empty:
+        return df
+    realized_deltas: List[Optional[float]] = []
+    fee_usdc: List[Optional[float]] = []
+    for _, row in df.iterrows():
+        payload = safe_json(row.get("payload_json"))
+        realized_deltas.append(_float_or_none(payload.get("realized_net_pnl_delta")))
+        fee_usdc.append(_float_or_none(payload.get("fee_usdc")))
+    df["realized_net_pnl_delta"] = realized_deltas
+    df["fee_usdc"] = fee_usdc
+    df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
+    return df
+
+
+def get_latest_system_payload(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Return the latest system_state payload_json as a dict."""
+    if not table_exists("system_state", db_path=db_path):
+        return {}
+    df = query_df("SELECT payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1", db_path=db_path)
+    return safe_json(safe_first(df, "payload_json", "{}"))
+
+
+def get_per_token_inventory(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Return latest inventory per token_id."""
+    if not table_exists("inventory", db_path=db_path):
+        return pd.DataFrame()
+    return query_df(
+        """
+        SELECT i.token_id, i.yes_qty, i.ts_ms
+        FROM inventory i
+        INNER JOIN (SELECT token_id, MAX(ts_ms) AS max_ts FROM inventory GROUP BY token_id) latest
+          ON i.token_id = latest.token_id AND i.ts_ms = latest.max_ts
+        """,
+        db_path=db_path,
+    )
+
+
+def get_per_token_fill_counts(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Return fill count and volume per token_id and side."""
+    if not table_exists("fills", db_path=db_path):
+        return pd.DataFrame()
+    return query_df(
+        """
+        SELECT token_id, side,
+               COUNT(*) AS fill_count,
+               COALESCE(SUM(fill_qty), 0.0) AS fill_volume,
+               COALESCE(SUM(fill_price * fill_qty), 0.0) AS fill_notional
+        FROM fills
+        GROUP BY token_id, side
+        """,
+        db_path=db_path,
+    )
+
+
+def get_drawdown_series(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Return drawdown time series from paper_pnl curve."""
+    curve = get_paper_pnl_curve(db_path=db_path)
+    if curve.empty or "total_pnl" not in curve.columns:
+        return pd.DataFrame()
+    plot = curve[["ts_ms", "total_pnl"]].copy()
+    plot["ts"] = pd.to_datetime(plot["ts_ms"], unit="ms", utc=True)
+    plot["equity_peak"] = plot["total_pnl"].cummax()
+    plot["drawdown"] = plot["total_pnl"] - plot["equity_peak"]
+    return plot
+
+
+def get_decision_action_counts(db_path: Optional[Path] = None) -> Dict[str, int]:
+    """Return counts of each decision action type."""
+    if not table_exists("decisions", db_path=db_path):
+        return {}
+    df = query_df("SELECT action, COUNT(*) AS n FROM decisions GROUP BY action", db_path=db_path)
+    return {str(row["action"]): int(row["n"]) for _, row in df.iterrows()}
+
+
+def get_market_history_summary(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Per-market aggregated stats: fills, PnL, avg markout, avg spread, quote counts."""
+    if not table_exists("fills", db_path=db_path):
+        return pd.DataFrame()
+    fills_df = query_df(
+        """
+        SELECT market_slug, COUNT(*) AS fills,
+               COALESCE(SUM(fill_qty), 0.0) AS fill_volume
+        FROM (
+            SELECT json_extract(payload_json, '$.market_slug') AS market_slug,
+                   fill_qty
+            FROM fills
+            WHERE json_extract(payload_json, '$.market_slug') IS NOT NULL
+        )
+        GROUP BY market_slug
+        """,
+        db_path=db_path,
+    )
+    # Per-market PnL (latest snapshot per market)
+    pnl_df = pd.DataFrame()
+    if table_exists("paper_pnl", db_path=db_path):
+        pnl_df = query_df(
+            """
+            SELECT p.market_slug,
+                   SUM(p.realized_net_pnl) AS realized_net_pnl,
+                   SUM(p.unrealized_pnl)   AS unrealized_pnl,
+                   SUM(p.win_count)        AS win_count,
+                   SUM(p.loss_count)       AS loss_count,
+                   MIN(p.ts_ms)            AS first_ts_ms,
+                   MAX(p.ts_ms)            AS last_ts_ms
+            FROM paper_pnl p
+            INNER JOIN (
+                SELECT market_slug, token_id, MAX(ts_ms) AS max_ts
+                FROM paper_pnl GROUP BY market_slug, token_id
+            ) latest ON p.market_slug = latest.market_slug
+                     AND p.token_id = latest.token_id
+                     AND p.ts_ms = latest.max_ts
+            WHERE p.market_slug IS NOT NULL
+            GROUP BY p.market_slug
+            """,
+            db_path=db_path,
+        )
+    # Per-market execution quality
+    eq_df = pd.DataFrame()
+    if table_exists("execution_quality", db_path=db_path):
+        eq_df = query_df(
+            """
+            SELECT json_extract(payload_json, '$.market_slug') AS market_slug,
+                   AVG(realized_spread_bps) AS avg_spread_bps,
+                   AVG(markout_1s_bps)      AS avg_markout_1s,
+                   AVG(net_edge_bps)        AS avg_net_edge_bps,
+                   COUNT(*)                 AS eq_samples
+            FROM execution_quality
+            WHERE json_extract(payload_json, '$.market_slug') IS NOT NULL
+            GROUP BY json_extract(payload_json, '$.market_slug')
+            """,
+            db_path=db_path,
+        )
+    # Per-market decision counts
+    dec_df = pd.DataFrame()
+    if table_exists("decisions", db_path=db_path):
+        dec_df = query_df(
+            """
+            SELECT market,
+                   COUNT(*) AS total_decisions,
+                   SUM(CASE WHEN action='QUOTE' THEN 1 ELSE 0 END) AS quote_decisions
+            FROM decisions WHERE market IS NOT NULL
+            GROUP BY market
+            """,
+            db_path=db_path,
+        )
+        if not dec_df.empty:
+            dec_df = dec_df.rename(columns={"market": "market_slug"})
+
+    result = fills_df if not fills_df.empty else pd.DataFrame(columns=["market_slug"])
+    for other, on in [(pnl_df, "market_slug"), (eq_df, "market_slug"), (dec_df, "market_slug")]:
+        if not other.empty:
+            result = result.merge(other, on=on, how="outer") if not result.empty else other
+    return result
+
+
+def get_per_token_stats_for_market(market_slug: str, db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Per-token fill counts and inventory for a specific market."""
+    if not table_exists("fills", db_path=db_path):
+        return pd.DataFrame()
+    return query_df(
+        """
+        SELECT f.token_id, f.side,
+               COUNT(*) AS fill_count,
+               COALESCE(SUM(f.fill_qty), 0.0) AS fill_volume,
+               AVG(f.fill_price) AS avg_price
+        FROM fills f
+        WHERE json_extract(f.payload_json, '$.market_slug') = ?
+        GROUP BY f.token_id, f.side
+        """,
+        params=(market_slug,),
+        db_path=db_path,
+    )
+
+
+def get_per_symbol_summary(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Per-symbol (BTC/ETH/SOL/XRP) aggregated stats from market history."""
+    hist = get_market_history_summary(db_path=db_path)
+    if hist.empty:
+        return pd.DataFrame()
+
+    _SYM_ORDER = ["BTC", "ETH", "SOL", "XRP"]
+
+    def _sym(slug: str) -> str:
+        s = str(slug).lower()
+        for sym in ["btc", "eth", "sol", "xrp"]:
+            if s.startswith(sym + "-"):
+                return sym.upper()
+        return "?"
+
+    hist["symbol"] = hist["market_slug"].map(_sym)
+    agg = hist.groupby("symbol", as_index=False).agg(
+        markets=("market_slug", "count"),
+        fills=("fills", "sum"),
+        fill_volume=("fill_volume", "sum"),
+        realized_net_pnl=("realized_net_pnl", "sum"),
+        total_decisions=("total_decisions", "sum"),
+        avg_spread_bps=("avg_spread_bps", "mean"),
+    )
+    # Ensure all 4 symbols always appear
+    for sym in _SYM_ORDER:
+        if sym not in agg["symbol"].values:
+            agg = pd.concat(
+                [agg, pd.DataFrame([{"symbol": sym, "markets": 0, "fills": 0,
+                    "fill_volume": 0.0, "realized_net_pnl": 0.0, "total_decisions": 0,
+                    "avg_spread_bps": float("nan")}])],
+                ignore_index=True,
+            )
+    agg["symbol"] = pd.Categorical(agg["symbol"], categories=_SYM_ORDER, ordered=True)
+    return agg.sort_values("symbol").reset_index(drop=True)
+
+
+def get_alpha_overlay_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Extract alpha overlay diagnostics from recent decision metadata."""
+    if not table_exists("decisions", db_path=db_path):
+        return {}
+    df = query_df(
+        """
+        SELECT policy_json FROM decisions
+        WHERE action = 'QUOTE'
+        ORDER BY ts_ms DESC
+        LIMIT 100
+        """,
+        db_path=db_path,
+    )
+    if df.empty:
+        return {}
+
+    vol_regimes: List[str] = []
+    adversity_ratios: List[float] = []
+    extra_skews: List[int] = []
+    spread_mults: List[float] = []
+    complement_bps: List[float] = []
+    depth_changes: List[float] = []
+
+    for _, row in df.iterrows():
+        payload = safe_json(row.get("policy_json"))
+        quotes = payload.get("desired_quotes") or []
+        for q_item in quotes:
+            meta = q_item.get("metadata") or {}
+            vol_regime = meta.get("alpha_vol_regime")
+            if vol_regime is not None:
+                vol_regimes.append(str(vol_regime))
+            adv = _float_or_none(meta.get("alpha_adversity"))
+            if adv is not None:
+                adversity_ratios.append(adv)
+            skew = meta.get("alpha_extra_skew")
+            if skew is not None:
+                extra_skews.append(int(skew))
+            sm = _float_or_none(meta.get("alpha_spread_mult"))
+            if sm is not None:
+                spread_mults.append(sm)
+            comp = _float_or_none(meta.get("alpha_complement_bps"))
+            if comp is not None:
+                complement_bps.append(comp)
+            dc = _float_or_none(meta.get("alpha_depth_change"))
+            if dc is not None:
+                depth_changes.append(dc)
+
+    regime_counts: Dict[str, int] = {}
+    for r in vol_regimes:
+        regime_counts[r] = regime_counts.get(r, 0) + 1
+
+    return {
+        "samples": len(vol_regimes),
+        "vol_regime_counts": regime_counts,
+        "avg_adversity_ratio": float(sum(adversity_ratios) / len(adversity_ratios)) if adversity_ratios else None,
+        "avg_extra_skew": float(sum(extra_skews) / len(extra_skews)) if extra_skews else None,
+        "avg_spread_mult": float(sum(spread_mults) / len(spread_mults)) if spread_mults else None,
+        "max_spread_mult": max(spread_mults) if spread_mults else None,
+        "skew_nonzero_pct": (sum(1 for s in extra_skews if s != 0) / len(extra_skews) * 100.0) if extra_skews else None,
+        "avg_complement_bps": float(sum(complement_bps) / len(complement_bps)) if complement_bps else None,
+        "max_complement_bps": max(abs(c) for c in complement_bps) if complement_bps else None,
+        "complement_active_pct": (sum(1 for c in complement_bps if abs(c) > 50) / len(complement_bps) * 100.0) if complement_bps else None,
+        "avg_depth_change": float(sum(depth_changes) / len(depth_changes)) if depth_changes else None,
+        "depth_change_active_pct": (sum(1 for d in depth_changes if abs(d) > 0.01) / len(depth_changes) * 100.0) if depth_changes else None,
+    }
+
+
+def get_memory_layer_stats(memory_db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read memory layer data from the shared memory.db."""
+    if memory_db_path is None or not memory_db_path.exists():
+        return {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(memory_db_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # Symbol-level memories
+        memories = []
+        try:
+            rows = cur.execute("SELECT data_json FROM market_memory ORDER BY symbol").fetchall()
+            import json
+            for row in rows:
+                data = json.loads(row[0])
+                memories.append(data)
+        except Exception:
+            pass
+
+        # Recent session history
+        sessions = []
+        try:
+            rows = cur.execute(
+                "SELECT summary_json FROM session_history ORDER BY ts_ms DESC LIMIT 20"
+            ).fetchall()
+            import json
+            for row in rows:
+                data = json.loads(row[0])
+                sessions.append(data)
+        except Exception:
+            pass
+
+        conn.close()
+
+        return {
+            "memories": memories,
+            "sessions": sessions,
+            "total_symbols": len(set(m.get("symbol", "") for m in memories)),
+            "total_sessions": len(sessions),
+        }
+    except Exception:
+        return {}
+
+
+def get_latest_book_snapshot(token_id: str, db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Return latest L2 book levels for *token_id* with cumulative size."""
+    if not table_exists("book_snapshots", db_path=db_path):
+        return pd.DataFrame(columns=["side", "price", "size", "cumulative_size"])
+    df = query_df(
+        """
+        SELECT side, price, size
+        FROM book_snapshots
+        WHERE token_id = ?
+          AND ts_ms = (SELECT MAX(ts_ms) FROM book_snapshots WHERE token_id = ?)
+        ORDER BY side, price
+        """,
+        params=(token_id, token_id),
+        db_path=db_path,
+    )
+    if df.empty:
+        df["cumulative_size"] = pd.Series(dtype="float64")
+        return df
+    rows: list[dict] = []
+    for side in ("bid", "ask"):
+        sub = df[df["side"] == side].copy()
+        if side == "bid":
+            sub = sub.sort_values("price", ascending=False)
+        else:
+            sub = sub.sort_values("price", ascending=True)
+        sub["cumulative_size"] = sub["size"].cumsum()
+        rows.extend(sub.to_dict("records"))
+    return pd.DataFrame(rows)
+
+
+def get_book_snapshot_at(ts_ms: int, token_id: str, db_path: Optional[Path] = None) -> pd.DataFrame:
+    """Return L2 book at closest snapshot <= *ts_ms*."""
+    if not table_exists("book_snapshots", db_path=db_path):
+        return pd.DataFrame(columns=["side", "price", "size", "cumulative_size"])
+    df = query_df(
+        """
+        SELECT side, price, size
+        FROM book_snapshots
+        WHERE token_id = ?
+          AND ts_ms = (SELECT MAX(ts_ms) FROM book_snapshots WHERE token_id = ? AND ts_ms <= ?)
+        ORDER BY side, price
+        """,
+        params=(token_id, token_id, ts_ms),
+        db_path=db_path,
+    )
+    if df.empty:
+        df["cumulative_size"] = pd.Series(dtype="float64")
+        return df
+    rows: list[dict] = []
+    for side in ("bid", "ask"):
+        sub = df[df["side"] == side].copy()
+        if side == "bid":
+            sub = sub.sort_values("price", ascending=False)
+        else:
+            sub = sub.sort_values("price", ascending=True)
+        sub["cumulative_size"] = sub["size"].cumsum()
+        rows.extend(sub.to_dict("records"))
+    return pd.DataFrame(rows)
+
+
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)

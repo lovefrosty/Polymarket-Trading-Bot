@@ -28,7 +28,7 @@ def _candidate_event():
 
 def test_paper_broker_records_fee_aware_fill_details() -> None:
     books = BookManager()
-    books.apply_snapshot("yes", bids=[(0.48, 100)], asks=[(0.52, 100)], ts_ms=1_000)
+    books.apply_snapshot("yes", bids=[(0.48, 100)], asks=[(0.52, 100)], ts_ms=int(time.time() * 1000))
     broker = PaperBroker(book_manager=books, fee_bps=25.0, fee_mode="taker")
     result = broker.place_order(
         token_id="yes",
@@ -53,7 +53,7 @@ def test_paper_broker_records_fee_aware_fill_details() -> None:
 
 def test_standalone_telemetry_writes_sqlite_and_jsonl(tmp_path: Path) -> None:
     books = BookManager()
-    broker = PaperBroker(book_manager=books, fee_bps=25.0, fee_mode="maker")
+    broker = PaperBroker(book_manager=books, fee_bps=25.0, fee_mode="maker", min_queue_wait_ms=0)
     runner = CoreMMRunner(
         market_selector=MarketSelector(
             config=MarketSelectionConfig(require_clob_candidate=False, current_window_only=False)
@@ -69,16 +69,15 @@ def test_standalone_telemetry_writes_sqlite_and_jsonl(tmp_path: Path) -> None:
         reverse_position_min_size=2,
     )
     runner.refresh_market_selection([_candidate_event()])
-    books.apply_snapshot("yes_test", bids=[(0.49, 150)], asks=[(0.51, 160)], ts_ms=1_000)
-    books.apply_snapshot("no_test", bids=[(0.49, 150)], asks=[(0.51, 160)], ts_ms=1_000)
+    base_now_ms = int(time.time() * 1000)
+    books.apply_snapshot("yes_test", bids=[(0.49, 150)], asks=[(0.51, 160)], ts_ms=base_now_ms - 1_000)
+    books.apply_snapshot("no_test", bids=[(0.49, 150)], asks=[(0.51, 160)], ts_ms=base_now_ms - 1_000)
     telemetry = StandaloneTelemetry(
         runtime_root=tmp_path,
         book_manager=books,
         position_tracker=runner.position_tracker,
         mode="PAPER",
     )
-
-    base_now_ms = int(time.time() * 1000)
     result = asyncio.run(runner.run_cycle(now_ms=base_now_ms, usdc_balance=2500))
     assert result is not None
     broker.sweep_fills()
@@ -134,3 +133,75 @@ def test_standalone_telemetry_writes_sqlite_and_jsonl(tmp_path: Path) -> None:
         ).fetchone()[0]
     )
     assert decision_payload["book_diag"]["state"] == "book_ok"
+
+
+def test_telemetry_records_book_snapshots(tmp_path: Path) -> None:
+    books = BookManager()
+    broker = PaperBroker(book_manager=books, fee_bps=25.0, fee_mode="maker", min_queue_wait_ms=0)
+    runner = CoreMMRunner(
+        market_selector=MarketSelector(
+            config=MarketSelectionConfig(require_clob_candidate=False, current_window_only=False)
+        ),
+        book_manager=books,
+        broker=broker,
+        mode="PAPER",
+        min_size=10,
+        fallback_size=2,
+        within_pct=0.06,
+        trade_size=12,
+        max_size=150,
+        reverse_position_min_size=2,
+    )
+    runner.refresh_market_selection([_candidate_event()])
+    now_ms = int(time.time() * 1000)
+    books.apply_snapshot(
+        "yes_test",
+        bids=[(0.49, 150), (0.48, 200), (0.47, 300)],
+        asks=[(0.51, 160), (0.52, 250)],
+        ts_ms=now_ms - 1_000,
+    )
+    books.apply_snapshot(
+        "no_test",
+        bids=[(0.49, 100)],
+        asks=[(0.51, 120)],
+        ts_ms=now_ms - 1_000,
+    )
+    telemetry = StandaloneTelemetry(
+        runtime_root=tmp_path,
+        book_manager=books,
+        position_tracker=runner.position_tracker,
+        mode="PAPER",
+    )
+    result = asyncio.run(runner.run_cycle(now_ms=now_ms, usdc_balance=2500))
+    telemetry.record_cycle(
+        now_ms=now_ms,
+        runner=runner,
+        result=result,
+        feed_status={"connected": True},
+        last_error=None,
+        config={},
+    )
+    telemetry.close()
+
+    cx = sqlite3.connect((tmp_path / "runtime.db").as_posix())
+    try:
+        # Check book_snapshots table was created and populated
+        total = cx.execute("SELECT COUNT(*) FROM book_snapshots").fetchone()[0]
+        assert total > 0, "Expected book snapshot rows"
+
+        # Should have bids + asks for both tokens
+        yes_bids = cx.execute(
+            "SELECT COUNT(*) FROM book_snapshots WHERE token_id='yes_test' AND side='bid'"
+        ).fetchone()[0]
+        yes_asks = cx.execute(
+            "SELECT COUNT(*) FROM book_snapshots WHERE token_id='yes_test' AND side='ask'"
+        ).fetchone()[0]
+        assert yes_bids == 3  # 3 bid levels
+        assert yes_asks == 2  # 2 ask levels
+
+        no_rows = cx.execute(
+            "SELECT COUNT(*) FROM book_snapshots WHERE token_id='no_test'"
+        ).fetchone()[0]
+        assert no_rows == 2  # 1 bid + 1 ask
+    finally:
+        cx.close()

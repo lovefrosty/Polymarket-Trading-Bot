@@ -10,9 +10,59 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     st = None  # type: ignore[assignment]
 
+from dataclasses import dataclass
+
 from dashboard.contracts import DashboardFilters, HealthGateStatus, PanelDependency
 from dashboard.data_access import query_df, query_evidence_rows, require_sources
-from core.metrics import classify_reliability_rows
+
+
+@dataclass(frozen=True)
+class ReliabilityScoreRow:
+    source: str
+    score: float
+    status: str
+    reasons: List[str]
+
+
+def classify_reliability_rows(values: Dict[str, Dict[str, float]]) -> List[ReliabilityScoreRow]:
+    rows: List[ReliabilityScoreRow] = []
+    for source, raw in values.items():
+        score = 0.0
+        reasons: List[str] = []
+        ws_lag = float(raw.get("ws_lag_ms", 0.0))
+        ack = float(raw.get("ack_ms", 0.0))
+        invalid_ratio = float(raw.get("invalid_ratio", 0.0))
+        mismatch_ratio = float(raw.get("mismatch_ratio", 0.0))
+        freeze_ratio = float(raw.get("freeze_ratio", 0.0))
+        if ws_lag > 0.0:
+            score += min(35.0, max(0.0, (ws_lag - 1000.0) / 100.0))
+            if ws_lag > 1500:
+                reasons.append("ws_lag_high")
+        if ack > 0.0:
+            score += min(25.0, max(0.0, (ack - 300.0) / 40.0))
+            if ack > 500:
+                reasons.append("ack_high")
+        if invalid_ratio > 0.0:
+            score += min(20.0, invalid_ratio * 100.0)
+            if invalid_ratio > 0.05:
+                reasons.append("invalid_ratio_high")
+        if mismatch_ratio > 0.0:
+            score += min(15.0, mismatch_ratio * 80.0)
+            if mismatch_ratio > 0.05:
+                reasons.append("reconciliation_mismatch")
+        if freeze_ratio > 0.0:
+            score += min(15.0, freeze_ratio * 120.0)
+            if freeze_ratio > 0.05:
+                reasons.append("freeze_rate_high")
+        score = max(0.0, min(100.0, score))
+        status = "OK"
+        if score >= 70.0:
+            status = "CRITICAL"
+        elif score >= 35.0:
+            status = "WARN"
+        rows.append(ReliabilityScoreRow(source=str(source), score=round(score, 2), status=status, reasons=reasons))
+    rows.sort(key=lambda row: row.score, reverse=True)
+    return rows
 
 HEALTH_DEP = PanelDependency(
     panel_id="health_a_to_e",

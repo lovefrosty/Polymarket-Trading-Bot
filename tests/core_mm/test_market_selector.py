@@ -218,6 +218,43 @@ def test_market_selector_does_not_require_global_clob_scan_for_direct_markets() 
     assert selected[0].condition_id == "live"
 
 
+def test_market_selector_spread_adjusted_score_prefers_wider_spread() -> None:
+    """Wider spread = more gross edge for market maker → higher score."""
+    markets = [
+        {
+            "slug": "btc-updown-15m-narrow",
+            "conditionId": "narrow",
+            "clobTokenIds": ["n1", "n2"],
+            "active": True,
+            "closed": False,
+            "accepting_orders": True,
+            "volatility_sum": 2.0,
+            "spread": 0.01,  # 1% spread → 50 bps half-spread
+            "prices": [0.49, 0.51],
+            "reward_per_100": 5,
+        },
+        {
+            "slug": "btc-updown-15m-wide",
+            "conditionId": "wide",
+            "clobTokenIds": ["w1", "w2"],
+            "active": True,
+            "closed": False,
+            "accepting_orders": True,
+            "volatility_sum": 2.0,
+            "spread": 0.06,  # 6% spread → 300 bps half-spread
+            "prices": [0.47, 0.53],
+            "reward_per_100": 5,
+        },
+    ]
+    selector = MarketSelector(config=_config(current_window_only=False))
+    selected = selector.select_from_markets(markets)
+    # Wide spread market should rank first (more gross edge)
+    assert selected[0].condition_id == "wide"
+    assert selected[1].condition_id == "narrow"
+    # Score should reflect spread edge
+    assert selected[0].score > selected[1].score
+
+
 def test_market_selector_filters_extreme_binary_outcome_price() -> None:
     selector = MarketSelector(config=_config(current_window_only=False))
     selected = selector.select_from_markets(

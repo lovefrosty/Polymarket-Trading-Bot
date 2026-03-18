@@ -16,6 +16,134 @@ except ModuleNotFoundError:  # pragma: no cover
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+_CLOB_BASE_URL = "https://clob.polymarket.com"
+
+
+# ---------------------------------------------------------------------------
+# CLOB candidate discovery (inlined from core.clob_discovery)
+# Only the sync path is needed here; async/FeeRateClient are not used.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _ClobCandidate:
+    condition_id: str
+    token_ids: List[str]
+    outcomes: List[str]
+    prices: List[Optional[float]]
+    accepting_orders: Optional[bool]
+    active: Optional[bool]
+    closed: Optional[bool]
+    archived: Optional[bool]
+
+
+def _list_clob_candidates(
+    source: str = "sampling-markets",
+    fallback: str = "simplified-markets",
+    base_url: str = _CLOB_BASE_URL,
+) -> List[_ClobCandidate]:
+    candidates: List[_ClobCandidate] = []
+    cursor: Optional[str] = None
+    while True:
+        params = {"next_cursor": cursor} if cursor else None
+        data = _fetch_clob_endpoint(base_url, source, params=params)
+        payload = _extract_clob_payload(data)
+        if payload is None and fallback:
+            data = _fetch_clob_endpoint(base_url, fallback, params=params)
+            payload = _extract_clob_payload(data)
+        if payload is None:
+            raise ValueError("clob_candidate_payload_missing")
+        for entry in payload:
+            candidate = _parse_clob_candidate(entry)
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+        cursor = _extract_clob_next_cursor(data)
+        if not cursor:
+            break
+    candidates.sort(key=lambda item: item.condition_id)
+    return candidates
+
+
+def _fetch_clob_endpoint(base_url: str, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+    if params:
+        query = urlencode({k: str(v) for k, v in params.items() if v is not None})
+        if query:
+            url = f"{url}?{query}"
+    return _fetch_json(url, timeout=5.0)
+
+
+def _parse_clob_candidate(entry: Dict[str, Any]) -> Optional[_ClobCandidate]:
+    condition_id = entry.get("condition_id") or entry.get("conditionId")
+    if not condition_id:
+        return None
+    accepting_orders = entry.get("accepting_orders")
+    active = entry.get("active")
+    closed = entry.get("closed")
+    archived = entry.get("archived")
+    if accepting_orders is not None and not accepting_orders:
+        return None
+    if active is not None and not active:
+        return None
+    if closed is not None and closed:
+        return None
+    if archived is not None and archived:
+        return None
+    tokens = entry.get("tokens") or []
+    if not isinstance(tokens, list) or len(tokens) != 2:
+        return None
+    token_ids: List[str] = []
+    outcomes: List[str] = []
+    prices: List[Optional[float]] = []
+    for token in tokens:
+        token_id = token.get("token_id") or token.get("tokenId")
+        outcome = token.get("outcome")
+        price = token.get("price")
+        if not token_id:
+            return None
+        token_ids.append(str(token_id))
+        outcomes.append(str(outcome) if outcome is not None else "")
+        try:
+            prices.append(float(price) if price is not None else None)
+        except (TypeError, ValueError):
+            prices.append(None)
+    return _ClobCandidate(
+        condition_id=str(condition_id),
+        token_ids=token_ids,
+        outcomes=outcomes,
+        prices=prices,
+        accepting_orders=accepting_orders if accepting_orders is not None else None,
+        active=active if active is not None else None,
+        closed=closed if closed is not None else None,
+        archived=archived if archived is not None else None,
+    )
+
+
+def _extract_clob_payload(data: Any) -> Optional[List[Dict[str, Any]]]:
+    if isinstance(data, dict):
+        payload = data.get("data")
+        return payload if isinstance(payload, list) else None
+    if isinstance(data, list):
+        return data
+    return None
+
+
+def _extract_clob_next_cursor(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    cursor = data.get("next_cursor") or data.get("nextCursor")
+    if not cursor:
+        return None
+    cursor_str = str(cursor)
+    if cursor_str == "LTE=":
+        return None
+    try:
+        import base64
+        if base64.b64decode(cursor_str).decode("utf-8") == "-1":
+            return None
+    except Exception:
+        pass
+    return cursor_str
 
 
 @dataclass(frozen=True)
@@ -240,7 +368,11 @@ class MarketSelector:
         tradable = active is not False and closed is not True and (
             (not self.config.require_accepting_orders) or accepting_orders is not False
         )
-        score = reward_per_100 / (volatility_sum + 1.0)
+        # Spread-adjusted score: spread is gross edge for a market maker.
+        # Half-spread in bps captures per-side edge, reward adds incentive bonus.
+        spread_edge_bps = (spread * 10_000.0) / 2.0
+        reward_bps_equiv = reward_per_100 * 100.0
+        score = (spread_edge_bps + reward_bps_equiv) / (volatility_sum + 1.0)
         return MarketCandidate(
             reference_symbol=reference_symbol,
             slug=slug,
@@ -282,11 +414,9 @@ class MarketSelector:
         ):
             return set(self._clob_condition_ids_cache)
         try:
-            from core.clob_discovery import list_clob_candidates
-
             self._clob_condition_ids_cache = {
                 str(candidate.condition_id)
-                for candidate in list_clob_candidates()
+                for candidate in _list_clob_candidates()
                 if getattr(candidate, "condition_id", None)
             }
             self._clob_condition_ids_cache_ts = now

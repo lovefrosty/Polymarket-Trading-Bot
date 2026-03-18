@@ -76,5 +76,16 @@ class TestRiskManager(unittest.TestCase):
         self.assertAlmostEqual(decision.exit_price or 0.0, 0.55)
 
 
+    def test_aggregate_position_notional_config_defaults_disabled(self) -> None:
+        config = RiskConfig()
+        self.assertEqual(config.max_total_position_notional, 0.0)
+        self.assertEqual(config.max_markets_with_position, 0)
+
+    def test_aggregate_position_notional_config_custom(self) -> None:
+        config = RiskConfig(max_total_position_notional=50.0, max_markets_with_position=3)
+        self.assertEqual(config.max_total_position_notional, 50.0)
+        self.assertEqual(config.max_markets_with_position, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

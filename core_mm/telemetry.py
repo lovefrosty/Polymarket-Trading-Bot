@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from core_mm.book_manager import BookManager
 from core_mm.main_loop import MarketCycleResult, TokenCycleDecision
+from core_mm.memory import SessionSummary
 from core_mm.positions import PositionTracker
 from core_mm.runner import CoreMMRunner
 
@@ -56,24 +57,91 @@ class StandaloneTelemetry:
         self._write_run_summary(final=True)
         self._cx.close()
 
+    def to_session_summary(self, *, run_id: str, symbol: str, market_slug: str = "") -> SessionSummary:
+        """Build a SessionSummary from telemetry data for memory ingestion."""
+        self.flush()
+        cur = self._cx.cursor()
+
+        def scalar(sql: str) -> Any:
+            row = cur.execute(sql).fetchone()
+            return row[0] if row else None
+
+        total_fills = int(scalar("SELECT COUNT(*) FROM fills") or 0)
+        decisions = int(scalar("SELECT COUNT(*) FROM decisions") or 0)
+        realized_pnl = float(scalar("SELECT COALESCE(MAX(realized_net_pnl), 0.0) FROM paper_pnl") or 0.0)
+        placed_orders = int(scalar("SELECT COUNT(*) FROM orders WHERE status IN ('open', 'replace')") or 0)
+        fill_rate = _safe_div(total_fills, placed_orders)
+
+        # Adverse fills: count fills where markout_1s_bps < 0
+        adverse_fills = int(scalar(
+            "SELECT COUNT(*) FROM execution_quality WHERE markout_1s_bps IS NOT NULL AND markout_1s_bps < 0"
+        ) or 0)
+
+        # Average spread from execution quality
+        avg_spread = float(scalar(
+            "SELECT COALESCE(AVG(realized_spread_bps), 0.0) FROM execution_quality WHERE realized_spread_bps IS NOT NULL"
+        ) or 0.0)
+
+        # Average vol from execution quality markout variance (proxy)
+        avg_vol = float(scalar(
+            "SELECT COALESCE(AVG(ABS(markout_1s_bps)), 0.0) FROM execution_quality WHERE markout_1s_bps IS NOT NULL"
+        ) or 0.0)
+
+        # Max position seen
+        max_pos = float(scalar(
+            "SELECT COALESCE(MAX(ABS(yes_qty)), 0.0) FROM inventory"
+        ) or 0.0)
+
+        # Duration
+        first_ts = scalar("SELECT MIN(ts_ms) FROM decisions")
+        last_ts = scalar("SELECT MAX(ts_ms) FROM decisions")
+        duration_secs = 0.0
+        if first_ts is not None and last_ts is not None:
+            duration_secs = max(0.0, (int(last_ts) - int(first_ts)) / 1000.0)
+
+        return SessionSummary(
+            run_id=run_id,
+            symbol=symbol,
+            market_slug=market_slug,
+            duration_secs=duration_secs,
+            total_fills=total_fills,
+            adverse_fills=adverse_fills,
+            fill_rate=fill_rate,
+            realized_pnl=realized_pnl,
+            avg_spread_bps=avg_spread,
+            avg_vol_bps=avg_vol,
+            max_position=max_pos,
+            decisions=decisions,
+            ts_ms=_now_ms(),
+        )
+
     def record_cycle(
         self,
         *,
         now_ms: int,
         runner: CoreMMRunner,
-        result: Optional[MarketCycleResult],
+        result: Optional[MarketCycleResult] = None,
+        results: Optional[Sequence[MarketCycleResult]] = None,
         feed_status: Dict[str, Any],
         last_error: Optional[str],
         config: Dict[str, Any],
     ) -> None:
-        market_slug = runner.current_market.slug if runner.current_market is not None else None
-        if result is not None:
-            for token_decision in result.token_decisions:
+        # Support both single result (backward compat) and multi-result list
+        all_results: List[MarketCycleResult] = []
+        if results is not None:
+            all_results = [r for r in results if r is not None]
+        elif result is not None:
+            all_results = [result]
+        for r in all_results:
+            market_slug = r.market_id
+            for token_decision in r.token_decisions:
                 self._record_decision(now_ms=now_ms, market_slug=market_slug, token_decision=token_decision)
-            for action in result.order_actions:
+            for action in r.order_actions:
                 self._record_order_action(now_ms=now_ms, market_slug=market_slug, action=action)
 
+        market_slug = runner.current_market.slug if runner.current_market is not None else None
         self._record_open_orders(now_ms=now_ms, runner=runner, market_slug=market_slug)
+        self._record_book_snapshot(now_ms=now_ms, runner=runner)
         self._record_inventory(now_ms=now_ms, runner=runner)
         self._record_system_state(
             now_ms=now_ms,
@@ -272,6 +340,28 @@ class StandaloneTelemetry:
             }
             self._queues["open_orders_snapshot"].append(row)
 
+    def _record_book_snapshot(self, *, now_ms: int, runner: CoreMMRunner) -> None:
+        if runner.current_market is None:
+            return
+        max_levels = 20
+        for token_id in runner.current_market.token_ids:
+            book = self._book_manager.get_book(str(token_id))
+            if book is None:
+                continue
+            eid = self._next_event_id()
+            for price, size in book.bids[:max_levels]:
+                self._queues["book_snapshots"].append({
+                    "ts_ms": now_ms, "event_id": eid,
+                    "token_id": str(token_id), "side": "bid",
+                    "price": float(price), "size": float(size),
+                })
+            for price, size in book.asks[:max_levels]:
+                self._queues["book_snapshots"].append({
+                    "ts_ms": now_ms, "event_id": eid,
+                    "token_id": str(token_id), "side": "ask",
+                    "price": float(price), "size": float(size),
+                })
+
     def _record_fill(
         self,
         *,
@@ -425,10 +515,16 @@ class StandaloneTelemetry:
         if last_error:
             reasons.append(str(last_error))
         broker_stats = runner.broker.stats() if hasattr(runner.broker, "stats") else {}
+        merge_stats = runner.merge_stats if hasattr(runner, "merge_stats") else {}
+        flow_stats = runner.main_loop.flow_stats if hasattr(runner, "main_loop") and hasattr(runner.main_loop, "flow_stats") else {}
+        per_token_quote_stats = runner.per_token_quote_stats if hasattr(runner, "per_token_quote_stats") else {}
         payload = {
             "runner": asdict(runner_status),
             "feed": dict(feed_status),
             "broker_stats": broker_stats,
+            "merge_stats": merge_stats,
+            "flow_stats": flow_stats,
+            "per_token_quote_stats": per_token_quote_stats,
             "config": config,
         }
         row = {
@@ -639,6 +735,14 @@ class StandaloneTelemetry:
               win_count INTEGER,
               loss_count INTEGER,
               payload_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS book_snapshots (
+              ts_ms INTEGER,
+              event_id INTEGER,
+              token_id TEXT,
+              side TEXT,
+              price REAL,
+              size REAL
             );
             CREATE TABLE IF NOT EXISTS execution_quality (
               ts_ms INTEGER,

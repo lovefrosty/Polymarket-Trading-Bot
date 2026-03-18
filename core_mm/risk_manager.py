@@ -12,6 +12,9 @@ class RiskConfig:
     sleep_hours: float = 2.0
     volatility_threshold: float = 0.0
     hard_position_cap: float = 250.0
+    # Aggregate multi-market limits (0 = disabled)
+    max_total_position_notional: float = 0.0
+    max_markets_with_position: int = 0
 
 
 @dataclass(frozen=True)

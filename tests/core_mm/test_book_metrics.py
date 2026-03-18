@@ -41,6 +41,21 @@ class TestBookMetrics(unittest.TestCase):
         self.assertAlmostEqual(metrics.bid_sum_within_n_percent, 150.0)
         self.assertAlmostEqual(metrics.ask_sum_within_n_percent, 165.0)
 
+    def test_low_price_token_depth_uses_absolute_floor(self) -> None:
+        # Token at $0.05/$0.06: mid=0.055, within_pct=0.06 → percentage window=0.0033
+        # Without the floor this would give bid_sum=0, ask_sum=0 → flow blocks all trading.
+        # With the 0.03 absolute floor: window=[0.025, 0.085] → captures both levels.
+        metrics = find_meaningful_bbo(
+            bids=[(0.05, 200), (0.04, 150)],
+            asks=[(0.06, 90), (0.07, 80)],
+            min_size=10,
+            fallback_size=2,
+            within_pct=0.06,
+        )
+        assert metrics is not None
+        self.assertGreater(metrics.bid_sum_within_n_percent, 0.0)
+        self.assertGreater(metrics.ask_sum_within_n_percent, 0.0)
+
     def test_book_diagnostic_absent(self) -> None:
         diag = classify_book_state(None, min_size=100, fallback_size=20, now_ms=2_000)
         self.assertEqual(diag.state, "book_absent")

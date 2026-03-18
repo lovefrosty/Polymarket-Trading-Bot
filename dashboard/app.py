@@ -25,7 +25,6 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.market_time import window_start_end_ms
 from config.settings import load_settings
 from dashboard.contracts import DashboardFilters, HealthGateStatus, RefreshPolicy, TopBarMetrics, ViewMode
 from dashboard import data_access as da
@@ -35,42 +34,75 @@ from dashboard.panels.portfolio import render_portfolio_panel, render_portfolio_
 from dashboard.panels.rollover import render_rollover_panel
 from dashboard.panels.reliability import render_health_panel, render_logs_panel
 from dashboard.panels.replay_diff import render_replay_diff_panel
+from dashboard.panels.core_mm_live import render_core_mm_panel, render_global_status_bar
 from dashboard.panels.signals import render_signals_panel
 from dashboard.panels.staleness import render_staleness_panel
 
 
 TERMINAL_CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&display=swap');
+
 :root {
-  --bg:#000000;
-  --panel:transparent;
-  --muted:#9aa4b2;
-  --text:#e6edf3;
-  --border:rgba(230,237,243,0.18);
-  --accent-green:#6ee7b7;
-  --accent-amber:#facc15;
-  --accent-red:#f87171;
+  --bg: #0a0a0f;
+  --bg-card: rgba(15, 15, 25, 0.85);
+  --panel: transparent;
+  --muted: #7a8599;
+  --text: #e6edf3;
+  --border: rgba(0, 240, 255, 0.12);
+  --border-bright: rgba(0, 240, 255, 0.30);
+  --accent-cyan: #00f0ff;
+  --accent-magenta: #ff2a6d;
+  --accent-green: #05ffa1;
+  --accent-amber: #fcee0a;
+  --accent-red: #ff3b5c;
+  --glow-cyan: 0 0 8px rgba(0,240,255,0.3), 0 0 20px rgba(0,240,255,0.1);
+  --glow-green: 0 0 8px rgba(5,255,161,0.3), 0 0 20px rgba(5,255,161,0.1);
+  --glow-red: 0 0 8px rgba(255,59,92,0.3), 0 0 20px rgba(255,59,92,0.1);
+  --glow-magenta: 0 0 8px rgba(255,42,109,0.3), 0 0 20px rgba(255,42,109,0.1);
 }
-html, body, [class*="css"], [data-testid="stAppViewContainer"]  {
+
+/* ── Base ───────────────────────────────────────────────────────────── */
+html, body, [class*="css"], [data-testid="stAppViewContainer"] {
   background-color: var(--bg) !important;
   color: var(--text) !important;
-  font-family: "IBM Plex Mono", "Menlo", "Consolas", "Courier New", monospace !important;
+  font-family: 'Rajdhani', 'Share Tech', 'Orbitron', 'IBM Plex Mono', monospace !important;
+  letter-spacing: 0.03em;
 }
+
+/* ── Scanline overlay ───────────────────────────────────────────────── */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
+  z-index: 9999;
   background-image: repeating-linear-gradient(
     to bottom,
-    rgba(230, 237, 243, 0.02),
-    rgba(230, 237, 243, 0.02) 1px,
+    rgba(0, 240, 255, 0.015),
+    rgba(0, 240, 255, 0.015) 1px,
     transparent 1px,
     transparent 3px
   );
 }
+
+/* ── Grid background texture ────────────────────────────────────────── */
+[data-testid="stAppViewContainer"]::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(0,240,255,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,240,255,0.03) 1px, transparent 1px);
+  background-size: 50px 50px;
+}
+
 .block-container { padding-top: 0.8rem; }
-div[data-testid="stMetric"], div[data-testid="stMetric"] > div,
+
+/* ── Transparent backgrounds ────────────────────────────────────────── */
+div[data-testid="stMetric"] > div,
 div[data-testid="stContainer"], div[data-testid="stVerticalBlock"],
 div[data-testid="stHorizontalBlock"], div[data-testid="stTable"],
 div[data-testid="stMarkdownContainer"], section[data-testid="stSidebar"],
@@ -78,47 +110,250 @@ div[data-testid="stMarkdownContainer"], section[data-testid="stSidebar"],
   background: transparent !important;
   box-shadow: none !important;
 }
+
+/* ── Metric cards: glassmorphism + neon border ──────────────────────── */
 div[data-testid="stMetric"] {
-  border: 1px solid var(--border);
-  padding: 10px;
-  border-radius: 10px;
+  background: var(--bg-card) !important;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-bright);
+  border-radius: 8px;
+  padding: 12px;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
 }
+div[data-testid="stMetric"]:hover {
+  border-color: var(--accent-cyan);
+  box-shadow: var(--glow-cyan);
+}
+
+/* ── Metric text ────────────────────────────────────────────────────── */
+div[data-testid="stMetricLabel"] p {
+  color: var(--accent-cyan) !important;
+  text-transform: uppercase;
+  font-size: 0.75em !important;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+}
+div[data-testid="stMetricValue"] {
+  color: var(--text) !important;
+  font-family: 'Orbitron', 'Rajdhani', monospace !important;
+  font-weight: 700;
+}
+div[data-testid="stMetricDelta"] > div {
+  font-family: 'Rajdhani', monospace !important;
+}
+
+/* ── Data frames ────────────────────────────────────────────────────── */
 div[data-testid="stDataFrame"] {
-  background: transparent !important;
+  background: var(--bg-card) !important;
+  backdrop-filter: blur(8px);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 4px;
 }
 div[data-testid="stDataFrame"] * {
   background: transparent !important;
   color: var(--text) !important;
 }
-div[data-testid="stMetricLabel"] p,
-div[data-testid="stMetricValue"] {
+
+/* ── Sidebar ────────────────────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+  border-right: 1px solid var(--border-bright);
+  background: rgba(10,10,15,0.95) !important;
+}
+
+/* ── Headings with glow ─────────────────────────────────────────────── */
+h1 {
+  color: var(--accent-cyan) !important;
+  font-family: 'Orbitron', 'Rajdhani', monospace !important;
+  text-shadow: 0 0 10px rgba(0,240,255,0.4), 0 0 30px rgba(0,240,255,0.15);
+  letter-spacing: 0.08em;
+}
+h2 {
   color: var(--text) !important;
+  font-family: 'Orbitron', 'Rajdhani', monospace !important;
+  text-shadow: 0 0 6px rgba(0,240,255,0.2);
+  letter-spacing: 0.05em;
 }
-section[data-testid="stSidebar"] { border-right: 1px solid var(--border); }
-h1,h2,h3 { color: var(--text) !important; }
+h3 {
+  color: var(--muted) !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.85em !important;
+}
+
 small, .muted { color: var(--muted) !important; }
-.alert { background:rgba(248,113,113,0.08); border:1px solid var(--accent-red); padding:8px 10px; border-radius:10px; }
-.ok { background:rgba(110,231,183,0.06); border:1px solid var(--accent-green); padding:8px 10px; border-radius:10px; }
-.warn { background:rgba(250,204,21,0.06); border:1px solid var(--accent-amber); padding:8px 10px; border-radius:10px; }
-.topbar { border:1px solid var(--border); border-radius:12px; background:transparent; padding:12px; margin-bottom:10px; }
-.readonly-btn {
-  border:1px dashed var(--accent-amber);
-  background:rgba(250,204,21,0.06);
-  color:var(--text);
-  padding:8px;
-  border-radius:10px;
+
+/* ── Status badges ──────────────────────────────────────────────────── */
+.alert {
+  background: rgba(255,59,92,0.08);
+  border: 1px solid var(--accent-red);
+  box-shadow: var(--glow-red);
+  padding: 8px 14px;
+  border-radius: 6px;
 }
+.ok {
+  background: rgba(5,255,161,0.06);
+  border: 1px solid var(--accent-green);
+  box-shadow: var(--glow-green);
+  padding: 8px 14px;
+  border-radius: 6px;
+}
+.warn {
+  background: rgba(252,238,10,0.05);
+  border: 1px solid var(--accent-amber);
+  padding: 8px 14px;
+  border-radius: 6px;
+}
+
+/* ── Top bar ────────────────────────────────────────────────────────── */
+.topbar {
+  border: 1px solid var(--border-bright);
+  border-radius: 8px;
+  background: var(--bg-card);
+  backdrop-filter: blur(12px);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.readonly-btn {
+  border: 1px dashed var(--accent-amber);
+  background: rgba(252,238,10,0.06);
+  color: var(--text);
+  padding: 8px;
+  border-radius: 6px;
+}
+
+/* ── Tabs: cyberpunk neon style ──────────────────────────────────────── */
 div[data-baseweb="tab-list"] {
   background: transparent !important;
+  gap: 2px !important;
+  border-bottom: 1px solid var(--border) !important;
 }
 button[data-baseweb="tab"] {
-  border: 1px solid var(--border) !important;
-  border-radius: 8px !important;
-  margin-right: 6px !important;
+  background: rgba(0,240,255,0.04) !important;
+  color: var(--accent-cyan) !important;
+  border: 1px solid transparent !important;
+  border-bottom: none !important;
+  border-radius: 6px 6px 0 0 !important;
+  margin-right: 2px !important;
+  padding: 8px 18px !important;
+  font-family: 'Orbitron', 'Rajdhani', monospace !important;
+  font-weight: 600 !important;
+  font-size: 0.78em !important;
+  letter-spacing: 0.1em !important;
+  text-transform: uppercase !important;
+  transition: all 0.2s ease !important;
 }
+button[data-baseweb="tab"]:hover {
+  background: rgba(0,240,255,0.10) !important;
+  color: #ffffff !important;
+  border-color: var(--border-bright) !important;
+  border-bottom: none !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+  background: rgba(0,240,255,0.12) !important;
+  color: #ffffff !important;
+  border: 1px solid var(--accent-cyan) !important;
+  border-bottom: 2px solid var(--accent-cyan) !important;
+  box-shadow: 0 0 8px rgba(0,240,255,0.2), inset 0 0 12px rgba(0,240,255,0.05);
+}
+button[data-baseweb="tab"] p, button[data-baseweb="tab"] span {
+  color: inherit !important;
+  font-family: 'Orbitron', 'Rajdhani', monospace !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.1em !important;
+}
+
+/* ── Expanders ──────────────────────────────────────────────────────── */
+details[data-testid="stExpander"] {
+  border: 1px solid var(--border) !important;
+  border-radius: 6px !important;
+  background: var(--bg-card) !important;
+}
+details[data-testid="stExpander"] summary {
+  color: var(--accent-cyan) !important;
+  font-family: 'Rajdhani', monospace !important;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+/* ── Scrollbar ──────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb {
+  background: rgba(0,240,255,0.25);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(0,240,255,0.4); }
+
+/* ── Custom component classes ───────────────────────────────────────── */
+.neon-card {
+  background: var(--bg-card);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border-bright);
+  border-radius: 8px;
+  padding: 16px;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+.neon-card:hover {
+  box-shadow: var(--glow-cyan);
+}
+.neon-card-green {
+  border-color: rgba(5,255,161,0.3);
+}
+.neon-card-green:hover {
+  box-shadow: var(--glow-green);
+}
+.neon-card-magenta {
+  border-color: rgba(255,42,109,0.3);
+}
+.neon-card-magenta:hover {
+  box-shadow: var(--glow-magenta);
+}
+
+.cyber-label {
+  color: var(--accent-cyan);
+  font-family: 'Orbitron', monospace;
+  font-size: 0.65em;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+.cyber-value {
+  color: var(--text);
+  font-family: 'Orbitron', monospace;
+  font-size: 1.4em;
+  font-weight: 700;
+}
+.cyber-value-green { color: var(--accent-green); }
+.cyber-value-red { color: var(--accent-red); }
+.cyber-value-amber { color: var(--accent-amber); }
+
+/* ── Pulse animation for live indicators ────────────────────────────── */
+@keyframes neon-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+.live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  box-shadow: 0 0 6px var(--accent-green);
+  animation: neon-pulse 2s ease-in-out infinite;
+  margin-right: 6px;
+}
+.live-dot-warn {
+  background: var(--accent-amber);
+  box-shadow: 0 0 6px var(--accent-amber);
+}
+.live-dot-alert {
+  background: var(--accent-red);
+  box-shadow: 0 0 6px var(--accent-red);
+}
+
 hr { border: none; border-top: 1px solid var(--border); }
 </style>
 """
@@ -169,6 +404,32 @@ DB_PATH = da.resolve_db_path()
 
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _parse_end_epoch_from_slug(slug: str) -> Optional[int]:
+    if not slug:
+        return None
+    parts = slug.split("-")
+    tail = parts[-1] if parts else ""
+    if not tail.isdigit():
+        return None
+    try:
+        value = int(tail)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    if value > 1_000_000_000_000:
+        return int(value / 1000)
+    return value
+
+
+def window_start_end_ms(slug: str, window_secs: int = 900) -> Optional[Tuple[int, int]]:
+    end_sec = _parse_end_epoch_from_slug(slug)
+    if end_sec is None:
+        return None
+    end_ms = end_sec * 1000
+    return end_ms - window_secs * 1000, end_ms
 
 
 def _iso(ts_ms: Optional[int]) -> str:
@@ -868,8 +1129,20 @@ def _core_mm_runtime_candidates_uncached() -> List[Dict[str, Any]]:
         mode = str(status.get("mode") or "N/A").upper()
         is_repo_default = db_path.resolve() == default_db.resolve()
         active_hint = (not archived) and stage == "running" and age_s <= 15 * 60
-        label_prefix = "Repo runtime" if is_repo_default else runtime_root.name
-        label = f"{label_prefix} [{mode} {stage} {_fmt_age_s(age_s)}]"
+        run_name = status.get("run_name") if isinstance(status, dict) else None
+        label_prefix = run_name or ("Repo runtime" if is_repo_default else runtime_root.name)
+        symbols_str = ",".join(status.get("symbols") or []) if isinstance(status, dict) else ""
+        fills_count = (status.get("fills") if isinstance(status, dict) else 0) or (summary.get("fills") if isinstance(summary, dict) else 0) or 0
+        pnl_val = (summary.get("realized_net_pnl") if isinstance(summary, dict) else None) or 0.0
+        pnl_sign = "+" if pnl_val > 0 else ""
+        pnl_str = f" | {pnl_sign}${pnl_val:.2f}" if pnl_val else ""
+        fills_str = f" | {fills_count} fills" if fills_count else ""
+        # Only prepend symbols if run_name doesn't already contain them
+        sym_prefix = f"{symbols_str} \u2014 " if symbols_str and not run_name else ""
+        if active_hint:
+            label = f"\u25cf {sym_prefix}{label_prefix} [{mode} {_fmt_age_s(age_s)}{fills_str}{pnl_str}]"
+        else:
+            label = f"  {sym_prefix}{label_prefix} [{mode} {stage} {_fmt_age_s(age_s)}{pnl_str}]"
         candidates.append(
             {
                 "label": label,
@@ -2167,10 +2440,16 @@ def render_dashboard() -> None:
     if st is None:
         raise RuntimeError("streamlit_not_installed")
 
-    st.set_page_config(page_title="Polymarket Terminal", layout="wide")
+    st.set_page_config(page_title="POLYMARKET TERMINAL", layout="wide", page_icon="")
     st.markdown(TERMINAL_CSS, unsafe_allow_html=True)
-    st.title("Polymarket Terminal")
-    st.caption("Retro operator console for standalone core_mm runtime telemetry and paper trading state.")
+    st.markdown(
+        '<h1 style="font-family:Orbitron,monospace;font-size:1.6em;margin-bottom:0;'
+        'background:linear-gradient(90deg,#00f0ff,#05ffa1);-webkit-background-clip:text;'
+        '-webkit-text-fill-color:transparent;text-shadow:none;">'
+        'POLYMARKET TERMINAL</h1>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Autonomous market-making engine // Paper trading runtime")
 
     if _runtime_schema_missing():
         st.markdown(
@@ -2182,38 +2461,30 @@ def render_dashboard() -> None:
 
     topbar_slot = st.empty()
     status_slot = st.empty()
+    global_status_slot = st.empty()
 
     if is_developer_mode(view_mode):
-        tab_overview, tab_rollover, tab_health, tab_signals, tab_inventory, tab_portfolio, tab_micro, tab_logs = st.tabs(
-            ["Overview", "Rollover", "Health (A-E)", "Signals", "Inventory & Quotes", "Portfolio", "Microstructure", "Logs"]
+        tab_core_mm, tab_data, tab_intel, tab_system, tab_rollover = st.tabs(
+            ["CORE MM", "DATA", "INTEL", "SYSTEM", "ROLLOVER"]
         )
     else:
-        tab_overview, tab_health, tab_signals, tab_inventory, tab_micro, tab_logs = st.tabs(
-            ["Overview", "Health (A-E)", "Signals", "Inventory & Quotes", "Microstructure", "Logs"]
+        tab_core_mm, tab_data, tab_intel, tab_system = st.tabs(
+            ["CORE MM", "DATA", "INTEL", "SYSTEM"]
         )
         tab_rollover = None
-        tab_portfolio = None
 
-    with tab_overview:
-        overview_slot = st.empty()
-    with tab_health:
-        health_slot = st.empty()
-    with tab_signals:
-        signals_slot = st.empty()
-    with tab_inventory:
-        inventory_slot = st.empty()
-    with tab_micro:
-        micro_slot = st.empty()
-    with tab_logs:
-        logs_slot = st.empty()
+    with tab_core_mm:
+        core_mm_slot = st.empty()
+    with tab_data:
+        data_slot = st.empty()
+    with tab_intel:
+        intel_slot = st.empty()
+    with tab_system:
+        system_slot = st.empty()
     rollover_slot = None
-    portfolio_slot = None
     if tab_rollover is not None:
         with tab_rollover:
             rollover_slot = st.empty()
-    if tab_portfolio is not None:
-        with tab_portfolio:
-            portfolio_slot = st.empty()
 
     use_fragment = bool(policy.auto_refresh and hasattr(st, "fragment"))
 
@@ -2230,9 +2501,12 @@ def render_dashboard() -> None:
             st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
             _render_selected_run_status(view_mode)
 
+        with global_status_slot.container():
+            render_global_status_bar(_current_db_path())
+
         start_ts, end_ts = _time_filter(filters.window_minutes)
 
-        with overview_slot.container():
+        with core_mm_slot.container():
             _render_panel(
                 "market_context",
                 lambda: render_market_context_panel(filters, metrics, view_mode=view_mode, label_token_fn=lambda market, token: label_token(label_registry, market, token)),
@@ -2243,13 +2517,47 @@ def render_dashboard() -> None:
                 lambda: render_portfolio_summary_panel(filters, end_ts_ms=end_ts, view_mode=view_mode, compact=True),
                 budget_ms=250,
             )
+            if is_developer_mode(view_mode):
+                _render_panel(
+                    "portfolio",
+                    lambda: render_portfolio_panel(filters, start_ts, end_ts, view_mode=view_mode),
+                    budget_ms=450,
+                )
             _render_panel("overview", lambda: _render_overview(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
+            st.divider()
+            _render_panel(
+                "core_mm",
+                lambda: render_core_mm_panel(_current_db_path()),
+                budget_ms=500,
+            )
 
-        if rollover_slot is not None:
-            with rollover_slot.container():
-                _render_panel("rollover", lambda: render_rollover_panel(filters), budget_ms=350)
+        with data_slot.container():
+            _render_panel("inventory", lambda: _render_inventory_quotes(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
+            st.divider()
+            with st.expander("Microstructure", expanded=False):
+                _render_panel("microstructure", lambda: _render_microstructure(filters, heavy_refresh, view_mode, label_registry), budget_ms=500)
 
-        with health_slot.container():
+        with intel_slot.container():
+            _render_panel(
+                "signals",
+                lambda: render_signals_panel(
+                    filters,
+                    start_ts,
+                    _apply_decision_filters,
+                    view_mode=view_mode,
+                    build_signals_view=lambda df: build_signals_table_for_view(df, view_mode, label_registry),
+                    allow_widgets=allow_panel_widgets,
+                ),
+                budget_ms=450,
+            )
+            if is_developer_mode(view_mode):
+                _render_panel(
+                    "replay_diff",
+                    lambda: render_replay_diff_panel(filters, start_ts),
+                    budget_ms=300,
+                )
+
+        with system_slot.container():
             _render_panel(
                 "health",
                 lambda: render_health_panel(
@@ -2272,42 +2580,7 @@ def render_dashboard() -> None:
             )
             if context is not None:
                 st.session_state["drillthrough_context"] = context
-
-        with signals_slot.container():
-            _render_panel(
-                "signals",
-                lambda: render_signals_panel(
-                    filters,
-                    start_ts,
-                    _apply_decision_filters,
-                    view_mode=view_mode,
-                    build_signals_view=lambda df: build_signals_table_for_view(df, view_mode, label_registry),
-                    allow_widgets=allow_panel_widgets,
-                ),
-                budget_ms=450,
-            )
-            if is_developer_mode(view_mode):
-                _render_panel(
-                    "replay_diff",
-                    lambda: render_replay_diff_panel(filters, start_ts),
-                    budget_ms=300,
-                )
-
-        with inventory_slot.container():
-            _render_panel("inventory", lambda: _render_inventory_quotes(filters, heavy_refresh, view_mode, label_registry), budget_ms=450)
-
-        if portfolio_slot is not None:
-            with portfolio_slot.container():
-                _render_panel(
-                    "portfolio",
-                    lambda: render_portfolio_panel(filters, start_ts, end_ts, view_mode=view_mode),
-                    budget_ms=450,
-                )
-
-        with micro_slot.container():
-            _render_panel("microstructure", lambda: _render_microstructure(filters, heavy_refresh, view_mode, label_registry), budget_ms=500)
-
-        with logs_slot.container():
+            st.divider()
             _render_panel(
                 "logs",
                 lambda: render_logs_panel(
@@ -2324,6 +2597,10 @@ def render_dashboard() -> None:
                 lambda: render_export_panel(filters, start_ts, end_ts, drillthrough_context),
                 budget_ms=250,
             )
+
+        if rollover_slot is not None:
+            with rollover_slot.container():
+                _render_panel("rollover", lambda: render_rollover_panel(filters), budget_ms=350)
 
     if use_fragment:
         refresh_seconds = max(1, int(round(policy.topbar_refresh_ms / 1000.0)))
