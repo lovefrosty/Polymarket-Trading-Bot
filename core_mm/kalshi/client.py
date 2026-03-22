@@ -62,18 +62,19 @@ def load_private_key_from_string(pem_text: str) -> Any:
 
 
 def sign_pss(private_key: Any, message: str) -> str:
-    """Produce a hex-encoded PSS-RSA signature of *message*."""
+    """Produce a base64-encoded PSS-RSA signature of *message*."""
     if _padding is None or hashes is None:
         raise RuntimeError("cryptography package required: pip install cryptography")
+    import base64
     signature = private_key.sign(
         message.encode("utf-8"),
         _padding.PSS(
             mgf=_padding.MGF1(hashes.SHA256()),
-            salt_length=_padding.PSS.MAX_LENGTH,
+            salt_length=_padding.PSS.DIGEST_LENGTH,
         ),
         hashes.SHA256(),
     )
-    return signature.hex()
+    return base64.b64encode(signature).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -152,31 +153,31 @@ class KalshiClient:
             params["series_ticker"] = series_ticker
         if event_ticker:
             params["event_ticker"] = event_ticker
-        data = self._request("GET", "/trade-api/v2/markets", params=params, auth=False)
+        data = self._request("GET", "/trade-api/v2/markets", params=params, auth=True)
         return data.get("markets") or []
 
     def get_market(self, ticker: str) -> Dict[str, Any]:
         """GET /trade-api/v2/markets/{ticker} → single market dict."""
-        data = self._request("GET", f"/trade-api/v2/markets/{ticker}", auth=False)
+        data = self._request("GET", f"/trade-api/v2/markets/{ticker}", auth=True)
         return data.get("market") or data
 
     def get_events(self, *, status: str = "open", limit: int = 100) -> List[Dict[str, Any]]:
         """GET /trade-api/v2/events → list of event dicts."""
         params: Dict[str, Any] = {"limit": limit, "status": status}
-        data = self._request("GET", "/trade-api/v2/events", params=params, auth=False)
+        data = self._request("GET", "/trade-api/v2/events", params=params, auth=True)
         return data.get("events") or []
 
     def get_orderbook(self, ticker: str, *, depth: int = 20) -> Dict[str, Any]:
         """GET /trade-api/v2/markets/{ticker}/orderbook → {yes: [...], no: [...]}."""
         params: Dict[str, Any] = {"depth": depth}
-        return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook", params=params, auth=False)
+        return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook", params=params, auth=True)
 
     def get_trades(self, *, ticker: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """GET /trade-api/v2/trades → list of public trades."""
         params: Dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
-        data = self._request("GET", "/trade-api/v2/trades", params=params, auth=False)
+        data = self._request("GET", "/trade-api/v2/trades", params=params, auth=True)
         return data.get("trades") or []
 
     # -- Order Management (authenticated) -----------------------------------
