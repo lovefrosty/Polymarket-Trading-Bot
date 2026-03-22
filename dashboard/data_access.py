@@ -181,6 +181,624 @@ def get_run_summary(runtime_root: Optional[Path] = None, db_path: Optional[Path]
     return read_json_file(root / "meta" / "run_summary.json")
 
 
+def _friendly_symbol_from_market_slug(slug: Any) -> Optional[str]:
+    if slug is None:
+        return None
+    text = str(slug).strip()
+    if not text:
+        return None
+    head = text.split("-", 1)[0].strip().upper()
+    if head.startswith("KX") and len(head) > 2:
+        head = head[2:]
+    return head or None
+
+
+def _infer_exchange_from_market_slug(slug: Any) -> str:
+    head = str(slug or "").strip().upper()
+    if head.startswith("KX"):
+        return "Kalshi"
+    if head:
+        return "Polymarket"
+    return "Unknown"
+
+
+def _market_label_from_slug(slug: Any) -> str:
+    text = str(slug or "").strip()
+    if not text:
+        return "Unknown market"
+    parts = text.split("-")
+    if len(parts) >= 3 and parts[1].lower() == "updown":
+        symbol = parts[0].upper()
+        horizon = parts[2]
+        return f"{symbol} {horizon} Up/Down"
+    return text
+
+
+def _format_age_s(age_s: float) -> str:
+    if age_s < 60:
+        return f"{age_s:.0f}s"
+    mins = age_s / 60.0
+    if mins < 60:
+        return f"{mins:.0f}m"
+    hours = mins / 60.0
+    return f"{hours:.1f}h"
+
+
+def _runtime_health_snapshot(status: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    runner = payload.get("runner") if isinstance(payload.get("runner"), dict) else {}
+    selection = status.get("selection") if isinstance(status.get("selection"), dict) else {}
+    if not selection and isinstance(payload.get("selection"), dict):
+        selection = payload.get("selection")  # type: ignore[assignment]
+    active_market_health = status.get("active_market_health") if isinstance(status.get("active_market_health"), dict) else {}
+    if not active_market_health and isinstance(payload.get("active_market_health"), dict):
+        active_market_health = payload.get("active_market_health")  # type: ignore[assignment]
+
+    book_diag = runner.get("book_diag") if isinstance(runner.get("book_diag"), dict) else {}
+    per_token = book_diag.get("per_token") if isinstance(book_diag.get("per_token"), dict) else {}
+    spread_samples: List[float] = []
+    tokens_ok = int(book_diag.get("tokens_ok") or 0)
+    tokens_blocked = int(book_diag.get("tokens_blocked") or 0)
+    for diag in per_token.values():
+        if not isinstance(diag, dict):
+            continue
+        bid = _float_or_none(diag.get("best_bid"))
+        ask = _float_or_none(diag.get("best_ask"))
+        if bid is None or ask is None or bid <= 0.0 or ask <= 0.0:
+            continue
+        mid = (bid + ask) / 2.0
+        if mid > 0:
+            spread_samples.append(((ask - bid) / mid) * 10000.0)
+
+    quoteable = active_market_health.get("quoteable")
+    if quoteable is None:
+        quoteable = active_market_health.get("book_valid_both_sides")
+    if quoteable is None:
+        quoteable = bool(runner.get("has_books")) and tokens_ok > 0 and tokens_blocked == 0
+    quoteable = bool(quoteable)
+
+    book_health = str(
+        active_market_health.get("book_health")
+        or active_market_health.get("state")
+        or ("healthy" if quoteable else "degraded")
+    )
+    state = str(active_market_health.get("state") or ("healthy" if quoteable else "degraded"))
+    spread_bps = _float_or_none(active_market_health.get("spread_bps"))
+    if spread_bps is None:
+        spread_bps = percentile(spread_samples, 0.5) if spread_samples else None
+
+    selected_reason = (
+        selection.get("selected_reason")
+        or selection.get("reason")
+        or selection.get("selected_reason_code")
+        or active_market_health.get("reason")
+        or active_market_health.get("selected_reason")
+    )
+
+    freeze_reasons = selection.get("freeze_reasons")
+    if not isinstance(freeze_reasons, list):
+        freeze_reasons = []
+    return {
+        "selection": selection,
+        "active_market_health": active_market_health,
+        "book_health": book_health,
+        "state": state,
+        "quoteable": quoteable,
+        "spread_bps": spread_bps,
+        "selected_reason": selected_reason,
+        "book_valid_both_sides": bool(active_market_health.get("book_valid_both_sides") if active_market_health.get("book_valid_both_sides") is not None else quoteable),
+        "tokens_ok": tokens_ok,
+        "tokens_blocked": tokens_blocked,
+        "freeze_reasons": freeze_reasons,
+    }
+
+
+def get_runtime_status_snapshot(runtime_root: Optional[Path] = None, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    runtime_root_path = Path(runtime_root) if runtime_root is not None else runtime_root_for_db(db_path)
+    resolved_db_path = Path(db_path) if db_path is not None else runtime_root_path / "runtime.db"
+    status = get_run_status(runtime_root=runtime_root_path, db_path=resolved_db_path)
+    payload = get_latest_system_payload(db_path=resolved_db_path if resolved_db_path.exists() else db_path)
+    runner = payload.get("runner") if isinstance(payload.get("runner"), dict) else {}
+    health = _runtime_health_snapshot(status, payload)
+    market = str(status.get("market") or runner.get("market_id") or "")
+    mode = str(status.get("mode") or runner.get("mode") or "UNKNOWN").upper()
+    stage = str(status.get("stage") or "unknown")
+    strategy_name = str(status.get("run_name") or runtime_root_path.name)
+    exchange = str(status.get("exchange") or payload.get("exchange") or _infer_exchange_from_market_slug(market))
+
+    updated_at_ms = _int_or_none(status.get("updated_at_ms"))
+    if updated_at_ms is None:
+        updated_at_ms = _int_or_none(payload.get("updated_at_ms"))
+
+    decisions = _int_or_none(status.get("decisions"))
+    fills = _int_or_none(status.get("fills"))
+    orders = _int_or_none(status.get("order_actions"))
+
+    broker_stats = payload.get("broker_stats") if isinstance(payload.get("broker_stats"), dict) else {}
+    realized_net_pnl = _float_or_none(broker_stats.get("realized_net_pnl"))
+    unrealized_pnl = _float_or_none(broker_stats.get("unrealized_pnl"))
+    total_pnl = None
+    if realized_net_pnl is not None or unrealized_pnl is not None:
+        total_pnl = float(realized_net_pnl or 0.0) + float(unrealized_pnl or 0.0)
+
+    return {
+        "runtime_root": runtime_root_path.as_posix(),
+        "db_path": (Path(db_path).resolve().as_posix() if db_path is not None else (runtime_root_path / "runtime.db").resolve().as_posix()),
+        "exchange": exchange,
+        "mode": mode,
+        "stage": stage,
+        "market": market,
+        "strategy_name": strategy_name,
+        "symbols": status.get("symbols") if isinstance(status.get("symbols"), list) else [],
+        "updated_at_ms": updated_at_ms,
+        "decisions": decisions,
+        "fills": fills,
+        "order_actions": orders,
+        "realized_net_pnl": realized_net_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "total_pnl": total_pnl,
+        "selection": health["selection"],
+        "active_market_health": health["active_market_health"],
+        "selected_reason": health["selected_reason"],
+        "book_health": health["book_health"],
+        "quoteable": health["quoteable"],
+        "book_valid_both_sides": health["book_valid_both_sides"],
+        "spread_bps": health["spread_bps"],
+        "state": health["state"],
+        "freeze_reasons": health["freeze_reasons"],
+        "runner": runner,
+        "status": status,
+        "payload_json": payload,
+    }
+
+
+def discover_core_mm_runtimes(repo_root: Optional[Path] = None) -> pd.DataFrame:
+    root = Path(repo_root) if repo_root is not None else _REPO_ROOT
+    db_paths: List[Path] = []
+    default_db = root / "runtime.db"
+    if default_db.exists():
+        db_paths.append(default_db)
+    for pattern in (
+        "tmp/core_mm_runs/*/runtime.db",
+        "tmp/desktop_run_archive/*/core_mm_runs/*/runtime.db",
+    ):
+        db_paths.extend(root.glob(pattern))
+
+    seen: set[str] = set()
+    rows: List[Dict[str, Any]] = []
+    for db_path in db_paths:
+        resolved = db_path.resolve().as_posix()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not db_path.exists():
+            continue
+        runtime_root = db_path.parent
+        status = get_run_status(runtime_root=runtime_root, db_path=db_path)
+        summary = get_run_summary(runtime_root=runtime_root, db_path=db_path)
+        snapshot = get_runtime_status_snapshot(runtime_root=runtime_root, db_path=db_path)
+        status_path = runtime_root / "meta" / "status.json"
+        summary_path = runtime_root / "meta" / "run_summary.json"
+        archived = "desktop_run_archive" in runtime_root.parts
+        latest_mtime = max(
+            db_path.stat().st_mtime if db_path.exists() else 0.0,
+            status_path.stat().st_mtime if status_path.exists() else 0.0,
+            summary_path.stat().st_mtime if summary_path.exists() else 0.0,
+        )
+        updated_at_ms = snapshot.get("updated_at_ms")
+        age_s = None
+        if updated_at_ms is not None:
+            try:
+                age_s = max(0.0, datetime.now(timezone.utc).timestamp() - (float(updated_at_ms) / 1000.0))
+            except (TypeError, ValueError):
+                age_s = None
+        if age_s is None:
+            age_s = max(0.0, datetime.now(timezone.utc).timestamp() - latest_mtime)
+        stage = str(snapshot.get("stage") or ("archived" if archived else "unknown"))
+        mode = str(snapshot.get("mode") or "N/A").upper()
+        run_name = str(snapshot.get("strategy_name") or runtime_root.name)
+        market = str(snapshot.get("market") or "")
+        active_hint = (not archived) and stage == "running" and age_s <= 15 * 60
+        fills = int(snapshot.get("fills") or summary.get("fills") or 0)
+        pnl_val = float(snapshot.get("total_pnl") or summary.get("realized_net_pnl") or 0.0)
+        decision_count = int(snapshot.get("decisions") or summary.get("decisions") or 0)
+        selection_reason = snapshot.get("selected_reason") or ""
+        rows.append(
+            {
+                "label": f"{'● ' if active_hint else '  '}{run_name} [{mode} {stage} {_format_age_s(age_s)}]",
+                "runtime_root": runtime_root.as_posix(),
+                "db_path": db_path.resolve().as_posix(),
+                "status_path": status_path.resolve().as_posix(),
+                "summary_path": summary_path.resolve().as_posix(),
+                "archived": archived,
+                "active_hint": active_hint,
+                "is_repo_default": db_path.resolve() == default_db.resolve(),
+                "latest_mtime": latest_mtime,
+                "age_s": age_s,
+                "mode": mode,
+                "stage": stage,
+                "exchange": snapshot.get("exchange") or _infer_exchange_from_market_slug(market),
+                "market": market,
+                "market_label": _market_label_from_slug(str(market)),
+                "strategy_name": run_name,
+                "symbols": snapshot.get("symbols") or [],
+                "decisions": decision_count,
+                "fills": fills,
+                "order_actions": int(snapshot.get("order_actions") or 0),
+                "realized_net_pnl": float(snapshot.get("realized_net_pnl") or summary.get("realized_net_pnl") or 0.0),
+                "unrealized_pnl": float(snapshot.get("unrealized_pnl") or summary.get("unrealized_pnl") or 0.0),
+                "total_pnl": pnl_val,
+                "selection_reason": selection_reason,
+                "book_health": snapshot.get("book_health") or "unknown",
+                "quoteable": bool(snapshot.get("quoteable")),
+                "spread_bps": snapshot.get("spread_bps"),
+                "selection": snapshot.get("selection") or {},
+                "active_market_health": snapshot.get("active_market_health") or {},
+                "status": status,
+                "summary": summary,
+                "snapshot": snapshot,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "label",
+                "runtime_root",
+                "db_path",
+                "status_path",
+                "summary_path",
+                "archived",
+                "active_hint",
+                "is_repo_default",
+                "latest_mtime",
+                "age_s",
+                "mode",
+                "stage",
+                "exchange",
+                "market",
+                "market_label",
+                "strategy_name",
+                "symbols",
+                "decisions",
+                "fills",
+                "order_actions",
+                "realized_net_pnl",
+                "unrealized_pnl",
+                "total_pnl",
+                "selection_reason",
+                "book_health",
+                "quoteable",
+                "spread_bps",
+                "selection",
+                "active_market_health",
+                "status",
+                "summary",
+                "snapshot",
+            ]
+        )
+    out = pd.DataFrame(rows)
+    out = out.sort_values(
+        by=["active_hint", "is_repo_default", "latest_mtime"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+    return out
+
+
+def get_portfolio_curve_from_runtimes(runtimes: Optional[pd.DataFrame] = None, repo_root: Optional[Path] = None) -> pd.DataFrame:
+    runtime_df = runtimes if runtimes is not None else discover_core_mm_runtimes(repo_root=repo_root)
+    if runtime_df.empty or "db_path" not in runtime_df.columns:
+        return pd.DataFrame()
+
+    curves: List[pd.DataFrame] = []
+    for _, row in runtime_df.iterrows():
+        db_path = str(row.get("db_path") or "")
+        if not db_path:
+            continue
+        curve = get_paper_pnl_curve(db_path=Path(db_path))
+        if curve.empty:
+            continue
+        curve = curve.copy()
+        curve["source"] = str(row.get("strategy_name") or Path(db_path).parent.name)
+        curves.append(curve)
+    if not curves:
+        return pd.DataFrame()
+
+    combined = pd.concat(curves, ignore_index=True, sort=False)
+    agg_map: Dict[str, str] = {
+        "realized_gross_pnl": "sum",
+        "realized_net_pnl": "sum",
+        "unrealized_pnl": "sum",
+        "cumulative_fees": "sum",
+        "turnover": "sum",
+        "win_count": "sum",
+        "loss_count": "sum",
+    }
+    grouped = combined.groupby("ts_ms", as_index=False).agg(agg_map)
+    grouped = grouped.sort_values("ts_ms").reset_index(drop=True)
+    grouped["total_pnl"] = grouped["realized_net_pnl"] + grouped["unrealized_pnl"]
+    peaks: List[float] = []
+    running_peak: Optional[float] = None
+    for value in grouped["total_pnl"].tolist():
+        current = float(value)
+        running_peak = current if running_peak is None else max(running_peak, current)
+        peaks.append(float(running_peak))
+    grouped["equity_peak"] = peaks
+    grouped["drawdown_abs"] = (grouped["equity_peak"] - grouped["total_pnl"]).clip(lower=0.0)
+    grouped["drawdown_pct"] = grouped.apply(
+        lambda row: (float(row["drawdown_abs"]) / float(row["equity_peak"])) if float(row["equity_peak"]) > 0 else None,
+        axis=1,
+    )
+    return grouped
+
+
+def get_strategy_market_summary(db_path: Optional[Path] = None) -> pd.DataFrame:
+    if not table_exists("decisions", db_path=db_path):
+        return pd.DataFrame()
+
+    market_hist = get_market_history_summary(db_path=db_path)
+    if market_hist.empty:
+        market_hist = pd.DataFrame(columns=["market_slug"])
+    elif "decisions" not in market_hist.columns and "total_decisions" in market_hist.columns:
+        market_hist = market_hist.rename(columns={"total_decisions": "decisions"})
+
+    latest_decisions = query_df(
+        """
+        WITH ranked AS (
+          SELECT
+            market AS market_slug,
+            token_id,
+            action,
+            reason_codes,
+            p_hat,
+            expected_edge,
+            expected_cost,
+            ts_ms,
+            ROW_NUMBER() OVER (
+              PARTITION BY market
+              ORDER BY ts_ms DESC, COALESCE(decision_id, '') DESC
+            ) AS rn
+          FROM decisions
+          WHERE market IS NOT NULL
+        )
+        SELECT market_slug, token_id, action, reason_codes, p_hat, expected_edge, expected_cost, ts_ms AS latest_decision_ts_ms
+        FROM ranked
+        WHERE rn = 1
+        """,
+        db_path=db_path,
+    )
+
+    latest_ts = 0
+    if not market_hist.empty and "last_ts_ms" in market_hist.columns:
+        latest_ts = int(pd.to_numeric(market_hist["last_ts_ms"], errors="coerce").fillna(0).max() or 0)
+    if latest_decisions is not None and not latest_decisions.empty and "latest_decision_ts_ms" in latest_decisions.columns:
+        latest_ts = max(latest_ts, int(pd.to_numeric(latest_decisions["latest_decision_ts_ms"], errors="coerce").fillna(0).max() or 0))
+    if latest_ts <= 0:
+        latest_ts = _now_ms()
+
+    open_orders = get_open_orders_latest(as_of_ts_ms=latest_ts, db_path=db_path)
+    if not open_orders.empty and "market_slug" in open_orders.columns:
+        order_counts = open_orders.groupby("market_slug", as_index=False).agg(active_orders=("order_id", "count"))
+    else:
+        order_counts = pd.DataFrame(columns=["market_slug", "active_orders"])
+
+    quotes = get_active_quote_summary(as_of_ts_ms=latest_ts, db_path=db_path)
+    if not quotes.empty and "market_slug" in quotes.columns:
+        quote_summary = quotes.groupby("market_slug", as_index=False).agg(
+            current_spread_bps=("offered_spread_bps", "median"),
+            quote_state=("quote_state", "first"),
+            quote_rows=("token_id", "count"),
+        )
+    else:
+        quote_summary = pd.DataFrame(columns=["market_slug", "current_spread_bps", "quote_state", "quote_rows"])
+
+    result = market_hist.copy()
+    if not latest_decisions.empty:
+        result = result.merge(latest_decisions, on="market_slug", how="left")
+    if not order_counts.empty:
+        result = result.merge(order_counts, on="market_slug", how="left")
+    if not quote_summary.empty:
+        result = result.merge(quote_summary, on="market_slug", how="left")
+
+    if result.empty:
+        return result
+
+    if "active_orders" not in result.columns:
+        result["active_orders"] = 0
+    result["active_orders"] = pd.to_numeric(result["active_orders"], errors="coerce").fillna(0).astype(int)
+    if "current_spread_bps" not in result.columns:
+        result["current_spread_bps"] = pd.Series(dtype=float)
+    if "quote_state" not in result.columns:
+        result["quote_state"] = "absent"
+    result["symbol"] = result["market_slug"].map(_friendly_symbol_from_market_slug)
+    if "realized_net_pnl" not in result.columns:
+        result["realized_net_pnl"] = 0.0
+    if "unrealized_pnl" not in result.columns:
+        result["unrealized_pnl"] = 0.0
+    result["total_pnl"] = pd.to_numeric(result["realized_net_pnl"], errors="coerce").fillna(0.0) + pd.to_numeric(result["unrealized_pnl"], errors="coerce").fillna(0.0)
+    if "latest_decision_ts_ms" not in result.columns:
+        result["latest_decision_ts_ms"] = pd.Series(dtype="float64")
+    if "last_ts_ms" in result.columns:
+        result["last_update_ms"] = pd.to_numeric(result["last_ts_ms"], errors="coerce").fillna(0).astype(int)
+    else:
+        result["last_update_ms"] = 0
+    if "latest_decision_ts_ms" in result.columns:
+        result["last_update_ms"] = pd.concat(
+            [
+                pd.to_numeric(result["last_update_ms"], errors="coerce").fillna(0),
+                pd.to_numeric(result["latest_decision_ts_ms"], errors="coerce").fillna(0),
+            ],
+            axis=1,
+        ).max(axis=1)
+    result["last_update_ms"] = result["last_update_ms"].astype(int)
+    result["state"] = result.get("action", pd.Series(dtype=object)).fillna("UNKNOWN").map(
+        lambda value: {
+            "QUOTE": "quoting",
+            "SKIP": "waiting",
+            "FREEZE": "frozen",
+        }.get(str(value).upper(), str(value).lower())
+    )
+    result["state"] = result["state"].fillna("unknown")
+    if "reason_codes" not in result.columns:
+        result["reason_codes"] = ""
+    result["profitability_usd"] = pd.to_numeric(result["total_pnl"], errors="coerce").fillna(0.0)
+    if "decisions" not in result.columns:
+        result["decisions"] = 0
+    result = result.sort_values(["last_update_ms", "decisions"], ascending=[False, False]).reset_index(drop=True)
+    return result[
+        [
+            col
+            for col in [
+                "market_slug",
+                "symbol",
+                "market",
+                "decisions",
+                "quotes",
+                "skips",
+                "freezes",
+                "active_orders",
+                "fills",
+                "realized_net_pnl",
+                "unrealized_pnl",
+                "total_pnl",
+                "profitability_usd",
+                "current_spread_bps",
+                "quote_state",
+                "state",
+                "latest_decision_ts_ms",
+                "last_update_ms",
+                "action",
+                "reason_codes",
+                "p_hat",
+                "expected_edge",
+                "expected_cost",
+            ]
+            if col in result.columns
+        ]
+    ]
+
+
+def get_strategy_operation_rows(db_path: Optional[Path] = None, limit: int = 60) -> pd.DataFrame:
+    if not table_exists("decisions", db_path=db_path):
+        return pd.DataFrame()
+
+    capped_limit = max(1, int(limit))
+    latest_ts = query_df("SELECT MAX(ts_ms) AS max_ts FROM decisions", db_path=db_path)
+    as_of_ts_ms = int(_int_or_none(safe_first(latest_ts, "max_ts", 0)) or 0)
+    if as_of_ts_ms <= 0:
+        as_of_ts_ms = _now_ms()
+
+    decisions = query_df(
+        f"""
+        SELECT
+          ts_ms,
+          'decision' AS row_type,
+          market AS market_slug,
+          token_id,
+          action,
+          reason_codes,
+          p_hat,
+          expected_edge,
+          expected_cost,
+          NULL AS price,
+          NULL AS size,
+          NULL AS status
+        FROM decisions
+        ORDER BY ts_ms DESC, COALESCE(decision_id, '') DESC
+        LIMIT {capped_limit}
+        """,
+        db_path=db_path,
+    )
+    orders = get_open_orders_latest(as_of_ts_ms=as_of_ts_ms, db_path=db_path)
+    if not orders.empty:
+        orders = orders.head(capped_limit).copy()
+        orders.insert(0, "row_type", "open_order")
+        if "market_slug" not in orders.columns:
+            orders["market_slug"] = None
+        for col in ["reason_codes", "p_hat", "expected_edge", "expected_cost"]:
+            if col not in orders.columns:
+                orders[col] = None
+        if "action" not in orders.columns:
+            orders["action"] = orders["side"]
+        orders = orders[
+            [
+                col
+                for col in [
+                    "ts_ms",
+                    "row_type",
+                    "market_slug",
+                    "token_id",
+                    "action",
+                    "reason_codes",
+                    "p_hat",
+                    "expected_edge",
+                    "expected_cost",
+                    "price",
+                    "size",
+                    "status",
+                ]
+                if col in orders.columns
+            ]
+        ]
+    combined = pd.concat([decisions, orders], ignore_index=True, sort=False) if not orders.empty else decisions
+    if combined.empty:
+        return combined
+    combined["market_label"] = combined["market_slug"].apply(lambda value: _friendly_symbol_from_market_slug(value) or _market_label_from_slug(value))
+    combined["why"] = combined.apply(
+        lambda row: str(row.get("reason_codes") or "").strip() or (
+            "resting order" if str(row.get("row_type")) == "open_order" else "no blocker"
+        ),
+        axis=1,
+    )
+    combined["ts"] = pd.to_datetime(combined["ts_ms"], unit="ms", utc=True, errors="coerce")
+    return combined.sort_values("ts_ms", ascending=False).head(capped_limit).reset_index(drop=True)
+
+
+def get_decision_explainer_rows(db_path: Optional[Path] = None, limit: int = 20) -> pd.DataFrame:
+    if not table_exists("decisions", db_path=db_path):
+        return pd.DataFrame()
+    df = query_df(
+        f"""
+        SELECT
+          ts_ms,
+          decision_id,
+          market,
+          token_id,
+          action,
+          reason_codes,
+          p_hat,
+          expected_edge,
+          expected_cost,
+          policy_json
+        FROM decisions
+        ORDER BY ts_ms DESC, COALESCE(decision_id, '') DESC
+        LIMIT {max(1, int(limit))}
+        """,
+        db_path=db_path,
+    )
+    if df.empty:
+        return df
+    out = adapt_decisions(df)
+    out["market_label"] = out["market"].apply(lambda value: _market_label_from_slug(str(value)))
+    out["symbol"] = out["market"].apply(lambda value: _friendly_symbol_from_market_slug(value))
+    out["decision_summary"] = out.apply(
+        lambda row: (
+            "Quote"
+            if str(row.get("action") or "").upper() == "QUOTE"
+            else ("Skip" if str(row.get("action") or "").upper() == "SKIP" else ("Freeze" if str(row.get("action") or "").upper() == "FREEZE" else str(row.get("action") or "").title()))
+        ),
+        axis=1,
+    )
+    out["plain_english"] = out.apply(
+        lambda row: (
+            "Trading now"
+            if str(row.get("gate_result") or "").upper() == "ALLOW"
+            else f"Waiting: {str(row.get('reason_codes') or 'policy gate')}"
+        ),
+        axis=1,
+    )
+    out["ts"] = pd.to_datetime(out["ts_ms"], unit="ms", utc=True, errors="coerce")
+    return out.sort_values("ts_ms", ascending=False).reset_index(drop=True)
+
+
 def _load_constitution_defaults() -> Dict[str, Any]:
     path = _REPO_ROOT / "config" / "constitution.yaml"
     if not path.exists():

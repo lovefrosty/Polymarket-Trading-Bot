@@ -64,12 +64,12 @@ class TestToCandidate:
 
     def test_filters_extreme_price_low(self):
         config = KalshiSelectorConfig(min_price=0.10)
-        c = _to_candidate(self._market(last_price=5), config, int(time.time()))
+        c = _to_candidate(self._market(yes_bid=5, yes_ask=6, last_price=5), config, int(time.time()))
         assert c is None
 
     def test_filters_extreme_price_high(self):
         config = KalshiSelectorConfig(max_price=0.90)
-        c = _to_candidate(self._market(last_price=95), config, int(time.time()))
+        c = _to_candidate(self._market(yes_bid=95, yes_ask=96, last_price=95), config, int(time.time()))
         assert c is None
 
     def test_filters_near_expiry(self):
@@ -93,6 +93,11 @@ class TestToCandidate:
     def test_missing_ticker_returns_none(self):
         config = KalshiSelectorConfig()
         c = _to_candidate({"ticker": ""}, config, int(time.time()))
+        assert c is None
+
+    def test_rejects_one_sided_active_market(self):
+        config = KalshiSelectorConfig()
+        c = _to_candidate(self._market(yes_ask=None), config, int(time.time()))
         assert c is None
 
     def test_score_based_on_volume(self):
@@ -137,6 +142,8 @@ class TestKalshiMarketSelector:
                         "ticker": "KXBTC-25MAR",
                         "status": "open",
                         "result": "",
+                        "yes_bid_dollars": "0.54",
+                        "yes_ask_dollars": "0.56",
                         "last_price": 55,
                         "volume": 1000,
                         "open_interest": 500,
@@ -159,6 +166,8 @@ class TestKalshiMarketSelector:
                         "ticker": f"TICK-{i}",
                         "status": "open",
                         "result": "",
+                        "yes_bid_dollars": "0.49",
+                        "yes_ask_dollars": "0.51",
                         "last_price": 50,
                         "volume": 1000 - i,
                         "open_interest": 100,
@@ -173,3 +182,39 @@ class TestKalshiMarketSelector:
         )
         candidates = selector.select_markets()
         assert len(candidates) == 5
+
+    def test_last_selection_report_includes_diagnostics(self):
+        class FakeClient:
+            def get_markets(self, **kwargs):
+                return [
+                    {
+                        "ticker": "KXBTC-25MAR-A",
+                        "status": "open",
+                        "result": "",
+                        "yes_bid_dollars": "0.48",
+                        "yes_ask_dollars": "0.50",
+                        "volume": 2000,
+                        "open_interest": 800,
+                        "expiration_time": int(time.time()) + 3600,
+                    },
+                    {
+                        "ticker": "KXBTC-25MAR-B",
+                        "status": "open",
+                        "result": "",
+                        "yes_bid_dollars": "0.00",
+                        "yes_ask_dollars": "0.10",
+                        "volume": 1,
+                        "open_interest": 1,
+                        "expiration_time": int(time.time()) + 3600,
+                    },
+                ]
+
+        selector = KalshiMarketSelector(client=FakeClient())
+        candidates = selector.select_markets()
+        report = selector.last_selection_report
+        assert candidates
+        assert report["selected_market"]["ticker"] == "KXBTC-25MAR-A"
+        assert report["accepted_count"] == 1
+        assert report["rejected_count"] == 1
+        assert report["accepted_candidates"][0]["ticker"] == "KXBTC-25MAR-A"
+        assert report["rejected_candidates"][0]["reason"] in {"one_sided_book", "spread_too_wide", "insufficient_volume", "insufficient_open_interest"}

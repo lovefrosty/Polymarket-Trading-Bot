@@ -520,6 +520,8 @@ class StandaloneTelemetry:
         per_token_quote_stats = runner.per_token_quote_stats if hasattr(runner, "per_token_quote_stats") else {}
         payload = {
             "runner": asdict(runner_status),
+            "selection": getattr(runner_status, "selection", {}),
+            "active_market_health": getattr(runner_status, "active_market_health", {}),
             "feed": dict(feed_status),
             "broker_stats": broker_stats,
             "merge_stats": merge_stats,

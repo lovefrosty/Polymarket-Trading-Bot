@@ -6,6 +6,7 @@ downstream code (runner, main_loop, telemetry) works unchanged.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -25,6 +26,8 @@ class KalshiSelectorConfig:
     # Price filter (avoid extreme outcomes)
     min_price: float = 0.10
     max_price: float = 0.90
+    # Reject books that are too wide to be quoteable.
+    max_spread: float = 0.10
     # Max markets to return
     max_results: int = 10
     # Exclude near-expiry (seconds)
@@ -47,6 +50,7 @@ class KalshiMarketSelector:
     ) -> None:
         self._client = client
         self.config = config or KalshiSelectorConfig()
+        self._last_selection_report: Dict[str, Any] = {}
 
     # Map user-facing symbols to Kalshi series tickers
     SYMBOL_TO_SERIES: Dict[str, str] = {
@@ -67,25 +71,59 @@ class KalshiMarketSelector:
         if series and series in self.SYMBOL_TO_SERIES:
             series = self.SYMBOL_TO_SERIES[series]
 
-        # Use paginated fetch to get more markets
+        # Use paginated fetch to get more markets.
         fetch = getattr(self._client, "get_markets_all", None) or self._client.get_markets
-        raw_markets = fetch(
-            status="open",
-            limit=200,
-            series_ticker=series,
-            event_ticker=self.config.event_ticker,
-        )
-        # Fallback: try Kalshi prefix, then unfiltered
+        fetch_attempts: List[Dict[str, Any]] = []
+        raw_markets: List[Dict[str, Any]] = []
+        request_params = {
+            "status": "open",
+            "limit": 200,
+            "series_ticker": series,
+            "event_ticker": self.config.event_ticker,
+        }
+        raw_markets = list(fetch(**request_params))
+        fetch_attempts.append({"params": dict(request_params), "count": len(raw_markets)})
+        # Fallback chain: series filter → unfiltered discovery.
         if not raw_markets and series:
-            raw_markets = fetch(status="open", limit=200, series_ticker=series)
+            raw_markets = list(fetch(status="open", limit=200, series_ticker=series))
+            fetch_attempts.append({"params": {"status": "open", "limit": 200, "series_ticker": series}, "count": len(raw_markets)})
         if not raw_markets and self.config.series_ticker:
-            raw_markets = fetch(status="open", limit=200)
+            raw_markets = list(fetch(status="open", limit=200))
+            fetch_attempts.append({"params": {"status": "open", "limit": 200}, "count": len(raw_markets)})
+
+        evaluations: List[Dict[str, Any]] = []
+        accepted: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
         candidates: List[MarketCandidate] = []
         for m in raw_markets:
-            candidate = _to_candidate(m, self.config, now_ts)
-            if candidate is not None:
-                candidates.append(candidate)
+            evaluation = _evaluate_market(m, self.config, now_ts)
+            if evaluation is None:
+                continue
+            evaluations.append(evaluation)
+            summary = evaluation["summary"]
+            if evaluation["accepted"] and evaluation["candidate"] is not None:
+                candidates.append(evaluation["candidate"])
+                accepted.append(summary)
+            else:
+                rejected.append(summary)
+
         candidates.sort(key=lambda c: c.score, reverse=True)
+        accepted.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        rejected.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        selected = accepted[0] if accepted else None
+        self._last_selection_report = {
+            "series_ticker": series,
+            "event_ticker": self.config.event_ticker,
+            "fetch_attempts": fetch_attempts,
+            "fetched_count": len(raw_markets),
+            "evaluated_count": len(evaluations),
+            "accepted_count": len(accepted),
+            "rejected_count": len(rejected),
+            "selected_market": selected,
+            "selected_reason": (selected or {}).get("reason") if selected else None,
+            "accepted_candidates": accepted[:5],
+            "rejected_candidates": rejected[:5],
+        }
         return candidates[: self.config.max_results]
 
     def select_from_events(
@@ -96,6 +134,10 @@ class KalshiMarketSelector:
         """Compatibility shim — Kalshi doesn't need pre-fetched events."""
         return self.select_markets(now_ts=now_ts)
 
+    @property
+    def last_selection_report(self) -> Dict[str, Any]:
+        return dict(self._last_selection_report)
+
 
 def _to_candidate(
     m: Dict[str, Any],
@@ -103,47 +145,62 @@ def _to_candidate(
     now_ts: int,
 ) -> Optional[MarketCandidate]:
     """Convert a Kalshi market dict to a MarketCandidate, or None if filtered."""
+    evaluation = _evaluate_market(m, config, now_ts)
+    if evaluation is None:
+        return None
+    if not evaluation["active"]:
+        return evaluation["candidate"]
+    if evaluation["accepted"]:
+        return evaluation["candidate"]
+    return None
+
+
+def _evaluate_market(
+    m: Dict[str, Any],
+    config: KalshiSelectorConfig,
+    now_ts: int,
+) -> Optional[Dict[str, Any]]:
+    """Evaluate a market and return a structured selection summary."""
     ticker = str(m.get("ticker") or "")
     if not ticker:
         return None
 
-    # Price checks — prefer dollar fields from production API
-    yes_bid_d = _coerce_float(m.get("yes_bid_dollars"))
-    yes_ask_d = _coerce_float(m.get("yes_ask_dollars"))
-    last_price_d = _coerce_float(m.get("last_price_dollars"))
-    # Fallback to cent fields (demo API)
-    if yes_bid_d is None:
-        raw = _coerce_float(m.get("last_price") or m.get("yes_bid"))
-        yes_price_dollars = (raw / 100.0 if raw and raw > 1.0 else raw)
-    else:
-        # Use mid of bid/ask if both available, else last price
-        if yes_bid_d is not None and yes_ask_d is not None and yes_bid_d > 0 and yes_ask_d > 0:
-            yes_price_dollars = (yes_bid_d + yes_ask_d) / 2.0
-        else:
-            yes_price_dollars = last_price_d or yes_bid_d
+    status = str(m.get("status") or "").lower()
+    result = str(m.get("result") or "").lower()
+    is_active = status in ("open", "active", "trading") and result == ""
 
-    if yes_price_dollars is not None:
-        if yes_price_dollars < config.min_price or yes_price_dollars > config.max_price:
-            return None
+    # Price checks — prefer dollar fields from production API.
+    yes_bid_d = _normalize_price(m.get("yes_bid_dollars"))
+    yes_ask_d = _normalize_price(m.get("yes_ask_dollars"))
+    if yes_bid_d is None:
+        yes_bid_d = _normalize_price(m.get("yes_bid"))
+    if yes_ask_d is None:
+        yes_ask_d = _normalize_price(m.get("yes_ask"))
+    last_price_d = _normalize_price(m.get("last_price_dollars"))
+    if last_price_d is None:
+        last_price_d = _normalize_price(m.get("last_price"))
+
+    quoteable_book = (
+        yes_bid_d is not None
+        and yes_ask_d is not None
+        and yes_bid_d > 0.0
+        and yes_ask_d > 0.0
+        and yes_ask_d > yes_bid_d
+    )
 
     # Expiry check
     expiration_ts = _parse_ts(m.get("expiration_time") or m.get("close_time"))
     end_ts_ms = int(expiration_ts * 1000) if expiration_ts else None
-    if expiration_ts and (expiration_ts - now_ts) < config.min_time_to_expiry_secs:
+    if is_active and expiration_ts and (expiration_ts - now_ts) < config.min_time_to_expiry_secs:
         return None
 
     # Volume / open interest — prefer _fp fields from production
     volume = _coerce_float(m.get("volume_fp") or m.get("volume") or m.get("volume_24h") or 0.0)
     open_interest = _coerce_float(m.get("open_interest_fp") or m.get("open_interest") or 0.0)
-    if volume < config.min_volume_24hr:
-        return None
-    if open_interest < config.min_open_interest:
-        return None
-
-    # Status
-    status = str(m.get("status") or "").lower()
-    result = str(m.get("result") or "").lower()
-    is_active = status in ("open", "active", "trading") and result == ""
+    if volume is None:
+        volume = 0.0
+    if open_interest is None:
+        open_interest = 0.0
 
     # Build virtual token IDs
     token_ids = (f"{ticker}:yes", f"{ticker}:no")
@@ -153,24 +210,45 @@ def _to_candidate(
     if tick_size >= 1.0:
         tick_size = tick_size / 100.0  # cents → dollars
 
-    # Spread from yes_bid/yes_ask — prefer dollar fields
-    spread = 0.0
-    mid = yes_price_dollars
-    if yes_bid_d is not None and yes_ask_d is not None and yes_bid_d > 0 and yes_ask_d > 0:
+    # Spread from bid/ask.
+    spread: Optional[float] = None
+    mid: Optional[float] = None
+    if quoteable_book:
+        assert yes_bid_d is not None and yes_ask_d is not None
         spread = max(0.0, yes_ask_d - yes_bid_d)
         mid = (yes_bid_d + yes_ask_d) / 2.0
-    else:
-        yes_bid = _coerce_float(m.get("yes_bid"))
-        yes_ask = _coerce_float(m.get("yes_ask"))
-        if yes_bid is not None and yes_ask is not None:
-            bid_d = yes_bid / 100.0 if yes_bid > 1.0 else yes_bid
-            ask_d = yes_ask / 100.0 if yes_ask > 1.0 else yes_ask
-            spread = max(0.0, ask_d - bid_d)
-            mid = (bid_d + ask_d) / 2.0 if bid_d > 0 and ask_d > 0 else mid
+    elif last_price_d is not None:
+        mid = last_price_d
 
-    # Score: favor OI (liquidity proxy) and penalize wide spreads
-    spread_penalty = max(0.0, 1.0 - spread * 10.0)  # 0.10 spread → 0.0 score mult
-    score = (float(volume) + float(open_interest) * 2.0) * spread_penalty
+    rejected_reason: Optional[str] = None
+    accepted = False
+    if is_active:
+        if not quoteable_book:
+            rejected_reason = "one_sided_book"
+        elif mid is None:
+            rejected_reason = "missing_mid"
+        elif mid < config.min_price or mid > config.max_price:
+            rejected_reason = "price_out_of_range"
+        elif spread is not None and spread > config.max_spread:
+            rejected_reason = "spread_too_wide"
+        elif volume < config.min_volume_24hr:
+            rejected_reason = "insufficient_volume"
+        elif open_interest < config.min_open_interest:
+            rejected_reason = "insufficient_open_interest"
+        else:
+            accepted = True
+    else:
+        rejected_reason = "inactive_market"
+
+    # Score: favor liquidity, tight spread, and mid-range pricing.
+    spread_penalty = 0.0
+    if spread is not None:
+        spread_penalty = max(0.05, 1.0 - min(spread / max(config.max_spread, 1e-9), 1.0))
+    midpoint_penalty = 1.0
+    if mid is not None:
+        midpoint_penalty = max(0.1, 1.0 - min(abs(mid - 0.5) * 2.0, 0.9))
+    liquidity_score = math.log1p(max(0.0, float(volume))) + (2.0 * math.log1p(max(0.0, float(open_interest))))
+    score = liquidity_score * spread_penalty * midpoint_penalty
 
     # Subtitle / outcomes
     yes_sub = str(m.get("yes_sub_title") or "Yes")
@@ -180,7 +258,7 @@ def _to_candidate(
     title = str(m.get("title") or m.get("event_ticker") or ticker)
     ref_symbol = _extract_symbol(title, ticker)
 
-    return MarketCandidate(
+    candidate = MarketCandidate(
         reference_symbol=ref_symbol,
         slug=ticker,
         condition_id=ticker,
@@ -199,11 +277,54 @@ def _to_candidate(
         end_ts_ms=end_ts_ms,
         end_ts_source="kalshi_expiration_time",
         active_now=is_active,
-        tradable=is_active,
+        tradable=bool(accepted),
         clob_candidate=True,
         score=score,
         raw=dict(m),
     )
+
+    return {
+        "ticker": ticker,
+        "title": title,
+        "reference_symbol": ref_symbol,
+        "status": status,
+        "result": result,
+        "active": is_active,
+        "accepted": accepted,
+        "reason": "quoteable_book" if accepted else rejected_reason,
+        "quoteability_state": "quoteable" if accepted else (rejected_reason or "rejected"),
+        "book_valid_both_sides": bool(quoteable_book),
+        "bid": yes_bid_d,
+        "ask": yes_ask_d,
+        "mid": mid,
+        "spread": spread,
+        "volume": float(volume),
+        "open_interest": float(open_interest),
+        "tick_size": float(tick_size),
+        "score": float(score),
+        "candidate": candidate,
+        "summary": {
+            "ticker": ticker,
+            "title": title,
+            "reference_symbol": ref_symbol,
+            "status": status,
+            "result": result,
+            "accepted": accepted,
+            "reason": "quoteable_book" if accepted else rejected_reason,
+            "quoteability_state": "quoteable" if accepted else (rejected_reason or "rejected"),
+            "book_valid_both_sides": bool(quoteable_book),
+            "bid": yes_bid_d,
+            "ask": yes_ask_d,
+            "mid": mid,
+            "spread": spread,
+            "volume": float(volume),
+            "open_interest": float(open_interest),
+            "tick_size": float(tick_size),
+            "score": float(score),
+            "active": is_active,
+            "tradable": bool(accepted),
+        },
+    }
 
 
 def _coerce_float(value: Any) -> Optional[float]:
@@ -213,6 +334,15 @@ def _coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_price(value: Any) -> Optional[float]:
+    raw = _coerce_float(value)
+    if raw is None:
+        return None
+    if raw > 1.0:
+        return raw / 100.0
+    return raw
 
 
 def _parse_ts(value: Any) -> Optional[float]:

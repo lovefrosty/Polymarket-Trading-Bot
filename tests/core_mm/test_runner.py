@@ -107,6 +107,9 @@ def test_runner_status_distinguishes_empty_books(selector: MarketSelector) -> No
     assert status.has_books is False
     assert status.book_diag["per_token"]["yes_old"]["state"] == "book_empty"
     assert status.book_diag["per_token"]["no_old"]["state"] == "book_ok"
+    assert status.selection["selected_reason"] == "current_market"
+    assert status.selection["selected_market"]["slug"] == "btc-updown-15m-old"
+    assert status.active_market_health["quoteability_state"] in {"book_blocked", "book_unavailable"}
 
 
 def test_runner_respects_market_dwell_before_switching(selector: MarketSelector) -> None:

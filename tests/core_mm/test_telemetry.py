@@ -102,6 +102,9 @@ def test_standalone_telemetry_writes_sqlite_and_jsonl(tmp_path: Path) -> None:
         fills_count = cx.execute("SELECT COUNT(*) FROM fills").fetchone()[0]
         pnl_rows = cx.execute("SELECT COUNT(*) FROM paper_pnl").fetchone()[0]
         eq_rows = cx.execute("SELECT COUNT(*) FROM execution_quality").fetchone()[0]
+        system_state_payload = json.loads(
+            cx.execute("SELECT payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1").fetchone()[0]
+        )
     finally:
         cx.close()
 
@@ -124,6 +127,10 @@ def test_standalone_telemetry_writes_sqlite_and_jsonl(tmp_path: Path) -> None:
     assert summary["phase0_acceptance"]["result"] in {"pass", "tunable_loss", "needs_review", "structural_blocker"}
     assert summary["phase0_acceptance"]["quoteable_cycles_present"] is True
     assert summary["phase0_acceptance"]["fills_present"] is True
+    assert "selection" in system_state_payload
+    assert "active_market_health" in system_state_payload
+    assert system_state_payload["runner"]["selection"] == system_state_payload["selection"]
+    assert system_state_payload["runner"]["active_market_health"] == system_state_payload["active_market_health"]
     assert (tmp_path / "tapes" / "decisions.jsonl").exists()
     assert (tmp_path / "tapes" / "fills.jsonl").exists()
 

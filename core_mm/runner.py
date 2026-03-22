@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -25,6 +26,8 @@ class RunnerStatus:
     token_ids: tuple[str, ...]
     has_books: bool
     book_diag: Dict[str, Any]
+    selection: Dict[str, Any]
+    active_market_health: Dict[str, Any]
 
 
 class CoreMMRunner:
@@ -125,6 +128,8 @@ class CoreMMRunner:
         self._total_merged_amount: float = 0.0
         # Per-token quote generation counts for asymmetry diagnosis
         self._per_token_quote_counts: Dict[str, Dict[str, int]] = {}
+        self._recent_book_states = deque(maxlen=200)
+        self._last_selection_report: Dict[str, Any] = {}
 
     @property
     def current_market(self) -> Optional[MarketCandidate]:
@@ -153,6 +158,7 @@ class CoreMMRunner:
             if events is not None
             else self.market_selector.select_markets(now_ts=int(active_now_ms / 1000))
         )
+        self._last_selection_report = dict(getattr(self.market_selector, "last_selection_report", {}) or {})
         old_ids = {m.condition_id for m in self.active_markets}
         if not candidates:
             changed = bool(self.active_markets)
@@ -364,6 +370,7 @@ class CoreMMRunner:
             sell_q = sum(1 for q in td.desired_quotes if q.side == "sell")
             counts["buy_quotes"] += buy_q
             counts["sell_quotes"] += sell_q
+            self._recent_book_states.append(str(td.book_diag.state))
             if td.book_diag.state != "book_ok":
                 counts["freeze_count"] += 1
             elif buy_q == 0 and sell_q == 0:
@@ -393,6 +400,25 @@ class CoreMMRunner:
         has_books = bool(token_ids) and all(
             token_diag[token_id]["state"] not in {"book_absent", "book_empty"} for token_id in token_diag
         )
+        selection_report = dict(self._last_selection_report)
+        if not selection_report and self.current_market is not None:
+            selection_report = {
+                "selected_market": {
+                    "slug": self.current_market.slug,
+                    "condition_id": self.current_market.condition_id,
+                    "reference_symbol": self.current_market.reference_symbol,
+                    "score": self.current_market.score,
+                    "spread": self.current_market.spread,
+                    "mid_price": self.current_market.mid_price,
+                    "accepted": True,
+                    "reason": "current_market",
+                },
+                "selected_reason": "current_market",
+                "accepted_candidates": [],
+                "rejected_candidates": [],
+                "fetch_attempts": [],
+            }
+        active_market_health = self._active_market_health(token_diag=token_diag, blocking_state_counts=blocking_state_counts)
         return RunnerStatus(
             mode=self.mode,
             market_id=(self.active_markets[0].slug if self.active_markets else None),
@@ -405,6 +431,8 @@ class CoreMMRunner:
                 "tokens_blocked": max(0, len(token_diag) - int(tokens_ok)),
                 "blocking_state_counts": blocking_state_counts,
             },
+            selection=selection_report,
+            active_market_health=active_market_health,
         )
 
     @property
@@ -421,6 +449,55 @@ class CoreMMRunner:
     @property
     def per_token_quote_stats(self) -> Dict[str, Any]:
         return dict(self._per_token_quote_counts)
+
+    def _active_market_health(
+        self,
+        *,
+        token_diag: Dict[str, Dict[str, Any]],
+        blocking_state_counts: Dict[str, int],
+    ) -> Dict[str, Any]:
+        market = self.current_market
+        token_ids = tuple(market.token_ids) if market is not None else tuple()
+        per_token = dict(token_diag)
+        tokens_ok = sum(1 for diag in per_token.values() if diag.get("state") == "book_ok")
+        book_valid_both_sides = bool(token_ids) and tokens_ok == len(token_ids)
+        if not token_ids:
+            quoteability_state = "no_active_market"
+        elif book_valid_both_sides:
+            quoteability_state = "quoteable"
+        elif any(state in {"book_absent", "book_empty"} for state in blocking_state_counts):
+            quoteability_state = "book_unavailable"
+        else:
+            quoteability_state = "book_blocked"
+
+        recent_state_counts = Counter(state for state in self._recent_book_states if state and state != "book_ok")
+        broker_stats = self.broker.stats() if hasattr(self.broker, "stats") else {}
+        fills = len(self.broker.fills()) if hasattr(self.broker, "fills") else 0
+        open_orders = 0
+        if hasattr(self.broker, "get_open_orders"):
+            try:
+                snapshot = self.broker.get_open_orders()
+                orders = snapshot.payload.get("orders") if getattr(snapshot, "success", False) else []
+                open_orders = len(orders or [])
+            except Exception:
+                open_orders = 0
+        fill_rate_snapshot = float(fills) / float(max(fills + open_orders, 1))
+        return {
+            "market_id": market.slug if market is not None else None,
+            "market_ids": tuple(m.slug for m in self.active_markets),
+            "token_ids": token_ids,
+            "book_valid_both_sides": bool(book_valid_both_sides),
+            "quoteability_state": quoteability_state,
+            "per_token": per_token,
+            "blocking_state_counts": dict(blocking_state_counts),
+            "freeze_reason_breakdown": dict(recent_state_counts),
+            "order_actions_snapshot": {
+                "open_orders": open_orders,
+                "fills": fills,
+                "fill_rate_snapshot": fill_rate_snapshot,
+            },
+            "broker_stats": broker_stats,
+        }
 
     def _existing_orders_by_quote_key(self, market_id: str) -> Dict[str, RestingOrder]:
         if self.broker is None or not hasattr(self.broker, "get_open_orders"):

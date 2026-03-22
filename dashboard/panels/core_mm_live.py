@@ -93,6 +93,80 @@ def _active_token_ids(sys_payload: Dict[str, Any]) -> List[str]:
     return [str(t) for t in (runner.get("token_ids") or [])]
 
 
+def _is_dev_mode(view_mode: Optional[Any]) -> bool:
+    return str(view_mode or "").lower() == "developer"
+
+
+def _fmt_money(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"${value:+,.2f}"
+
+
+def _fmt_bps(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.1f} bps"
+
+
+def _fmt_last_update(ts_ms: Optional[int]) -> str:
+    if ts_ms is None:
+        return "N/A"
+    age_s = max(0.0, (_time_mod.time() * 1000.0 - float(ts_ms)) / 1000.0)
+    return _duration_str(age_s * 1000.0) + " ago"
+
+
+def _status_value(snapshot: Dict[str, Any], key: str, default: Any = None) -> Any:
+    value = snapshot.get(key)
+    return default if value in (None, "") else value
+
+
+def _extract_regime(snapshot: Dict[str, Any]) -> str:
+    runner = snapshot.get("runner") or {}
+    selection = snapshot.get("selection") or {}
+    health = snapshot.get("active_market_health") or {}
+    for candidate in (
+        health.get("regime"),
+        health.get("market_regime"),
+        selection.get("regime"),
+        selection.get("market_regime"),
+        runner.get("regime"),
+        runner.get("regime_label"),
+        runner.get("phase"),
+        snapshot.get("state"),
+    ):
+        if candidate not in (None, ""):
+            return str(candidate)
+    return "unknown"
+
+
+def _render_glass_metric(label: str, value: str, accent: str = "#00f0ff") -> None:
+    assert st is not None
+    st.markdown(
+        f"""
+        <div style="padding:12px 14px;border:1px solid rgba(255,255,255,0.08);border-radius:16px;
+                    background:rgba(255,255,255,0.05);backdrop-filter:blur(14px);
+                    box-shadow:0 10px 30px rgba(0,0,0,0.20);min-height:88px;">
+          <div style="font-size:0.74em;letter-spacing:0.12em;text-transform:uppercase;color:#9aa4b2;">{label}</div>
+          <div style="margin-top:6px;font-size:1.15em;font-weight:700;color:{accent};font-family:Orbitron,monospace;">{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _display_runtime_table(df: pd.DataFrame, columns: List[str]) -> None:
+    assert st is not None
+    if df.empty:
+        st.caption("No rows yet.")
+        return
+    show = df.copy()
+    for col in columns:
+        if col not in show.columns:
+            show[col] = None
+    st.dataframe(show[columns], use_container_width=True, hide_index=True)
+
+
 # ── Enhancement A: Market Expiry Countdown ───────────────────────────────────
 
 
@@ -1865,60 +1939,129 @@ def _render_markets_grid(db_path: Path, sys_payload: Dict[str, Any]) -> None:
                 )
 
 
-def render_market_making_tab(db_path: Path) -> None:
-    """Tab 1: Unified cockpit — all markets, bot thinking, charts, PnL, risk, inventory, fills."""
+def render_market_making_tab(db_path: Path, view_mode: Optional[Any] = None) -> None:
+    """Strategy drilldown: current market, selection rationale, market table, operations, fills."""
     assert st is not None
 
     summary, pnl, sys_payload, curve, eq_df = _load_core_data(db_path)
+    runtime_snapshot = da.get_runtime_status_snapshot(db_path=db_path)
+    market_summary = da.get_strategy_market_summary(db_path=db_path)
+    operations = da.get_strategy_operation_rows(db_path=db_path, limit=40)
+    explainer = da.get_decision_explainer_rows(db_path=db_path, limit=12)
 
-    if not summary and not pnl:
+    if not summary and not pnl and not runtime_snapshot.get("status"):
         st.markdown(
             '<div class="warn">No run data found — start <code>scripts/run_core_mm.py</code> to begin.</div>',
             unsafe_allow_html=True,
         )
         return
 
-    # ── Health Banner ──────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="font-family:Orbitron,monospace;font-size:1.15em;color:#00f0ff;'
+        'letter-spacing:0.08em;margin-bottom:10px;">STRATEGY DRILLDOWN</div>',
+        unsafe_allow_html=True,
+    )
+
     _render_health_banner(summary, pnl, sys_payload)
+    cols = st.columns(4)
+    with cols[0]:
+        _render_glass_metric("Strategy", str(runtime_snapshot.get("strategy_name") or summary.get("run_name") or "Unknown"))
+    with cols[1]:
+        _render_glass_metric("Market", str(runtime_snapshot.get("market") or sys_payload.get("runner", {}).get("market_id") or "N/A"))
+    with cols[2]:
+        _render_glass_metric("State", str(runtime_snapshot.get("state") or runtime_snapshot.get("book_health") or "unknown"), accent="#05ffa1" if runtime_snapshot.get("quoteable") else "#fcee0a")
+    with cols[3]:
+        _render_glass_metric("PnL", _fmt_money(runtime_snapshot.get("total_pnl") or pnl.get("total_pnl") or 0.0), accent="#05ffa1" if float(runtime_snapshot.get("total_pnl") or 0.0) >= 0 else "#ff3b5c")
 
-    phase0 = summary.get("phase0_acceptance") or {}
-    if phase0:
-        _phase0_badge(phase0)
+    st.markdown("### Why it is trading or freezing")
+    explainer_rows = explainer.copy()
+    if not explainer_rows.empty:
+        keep_cols = [col for col in ["ts", "market_label", "decision_summary", "plain_english", "ev", "reason_codes"] if col in explainer_rows.columns]
+        if not _is_dev_mode(view_mode) and "reason_codes" in keep_cols:
+            keep_cols.remove("reason_codes")
+        _display_runtime_table(explainer_rows, keep_cols)
+    else:
+        st.caption("No decision history yet.")
 
-    # ── All Markets Grid ──────────────────────────────────────────────────
-    _render_markets_grid(db_path, sys_payload)
+    st.markdown("### Selection and market health")
+    selection = runtime_snapshot.get("selection") if isinstance(runtime_snapshot.get("selection"), dict) else {}
+    health = runtime_snapshot.get("active_market_health") if isinstance(runtime_snapshot.get("active_market_health"), dict) else {}
+    a, b, c = st.columns(3)
+    with a:
+        _render_glass_metric("Selected reason", str(runtime_snapshot.get("selected_reason") or selection.get("selected_reason") or "N/A"), accent="#fcee0a")
+    with b:
+        _render_glass_metric("Quoteable", "YES" if bool(runtime_snapshot.get("quoteable")) else "NO", accent="#05ffa1" if runtime_snapshot.get("quoteable") else "#ff3b5c")
+    with c:
+        _render_glass_metric("Spread", _fmt_bps(runtime_snapshot.get("spread_bps")))
+
+    if health or selection:
+        detail_cols = st.columns(2)
+        with detail_cols[0]:
+            st.markdown("**Selection**")
+            st.write({
+                "selected_market": selection.get("selected_market") or selection.get("market") or runtime_snapshot.get("market"),
+                "selected_score": selection.get("selected_score"),
+                "selected_reason": selection.get("selected_reason") or runtime_snapshot.get("selected_reason"),
+                "freeze_reasons": selection.get("freeze_reasons") or runtime_snapshot.get("freeze_reasons"),
+            })
+        with detail_cols[1]:
+            st.markdown("**Book health**")
+            st.write({
+                "state": health.get("state") or runtime_snapshot.get("state"),
+                "quoteable": health.get("quoteable", runtime_snapshot.get("quoteable")),
+                "book_valid_both_sides": health.get("book_valid_both_sides", runtime_snapshot.get("book_valid_both_sides")),
+                "spread_bps": health.get("spread_bps") or runtime_snapshot.get("spread_bps"),
+                "book_health": health.get("book_health") or runtime_snapshot.get("book_health"),
+            })
 
     st.divider()
-
-    # ── Bot Thinking (per token — current market) ─────────────────────────
-    _render_bot_thinking(sys_payload, db_path)
-
-    # ── Charts (per active token) ─────────────────────────────────────────
-    active_tids = _active_token_ids(sys_payload)
-    yn_map = _resolve_yes_no_tokens(sys_payload)
-    if active_tids:
-        sorted_tids = sorted(active_tids, key=lambda t: (0 if yn_map.get(str(t)) == "YES" else 1))
-        chart_cols = st.columns(len(sorted_tids))
-        for col, tid in zip(chart_cols, sorted_tids):
-            label = yn_map.get(str(tid), _token_label(str(tid)))
-            with col:
-                _spread_band_chart(str(tid), db_path, label=label)
-                _depth_chart(str(tid), db_path, label=label)
+    st.markdown("### Tracked markets")
+    if market_summary.empty:
+        st.caption("No tracked markets yet.")
+    else:
+        market_rows = market_summary.copy()
+        market_rows["last_update"] = market_rows.get("last_update_ms", pd.Series(dtype="float64")).apply(lambda ts: _short_time(int(ts)) if pd.notna(ts) and float(ts) > 0 else "N/A")
+        market_rows["spread"] = market_rows.get("current_spread_bps")
+        market_rows["profitability"] = market_rows.get("profitability_usd")
+        cols_to_show = [
+            col
+            for col in [
+                "market_slug",
+                "symbol",
+                "market",
+                "state",
+                "decisions",
+                "active_orders",
+                "fills",
+                "spread",
+                "profitability",
+                "last_update",
+            ]
+            if col in market_rows.columns or col in {"spread", "profitability", "last_update"}
+        ]
+        if not _is_dev_mode(view_mode):
+            cols_to_show = [col for col in cols_to_show if col != "market_slug"]
+        _display_runtime_table(market_rows, cols_to_show)
 
     st.divider()
+    st.markdown("### Live operations")
+    ops = operations.copy()
+    if not ops.empty:
+        ops["ts"] = pd.to_datetime(ops["ts_ms"], unit="ms", utc=True, errors="coerce")
+        ops["when"] = ops["ts"].dt.strftime("%H:%M:%S")
+        op_cols = [col for col in ["when", "row_type", "market_label", "action", "why", "price", "size", "status"] if col in ops.columns]
+        if _is_dev_mode(view_mode):
+            op_cols = [col for col in ["when", "row_type", "market_slug", "token_id", "action", "why", "price", "size", "status"] if col in ops.columns]
+        _display_runtime_table(ops, op_cols)
+    else:
+        st.caption("No recent operations.")
 
-    # ── Performance + Risk ────────────────────────────────────────────────
+    st.divider()
+    if runtime_snapshot.get("stage") == "running":
+        st.markdown("**Below the fold: fills, exposure, and charts**")
     _render_performance_risk(pnl, summary, sys_payload, curve, eq_df, db_path)
-
-    st.divider()
-
-    # ── Inventory ─────────────────────────────────────────────────────────
     _render_inventory_strip(sys_payload, db_path)
-
-    st.divider()
-
-    # ── Live Fills ────────────────────────────────────────────────────────
-    st.markdown("**Live Fills**")
+    st.markdown("**Live fills**")
     _render_fills_table(db_path, sys_payload)
     _fill_timeline_sparkline(db_path, sys_payload)
 
@@ -1939,81 +2082,148 @@ def render_alpha_overlay_tab(db_path: Path) -> None:
     _render_memory_layer(db_path)
 
 
-def render_portfolio_tab(db_path: Path) -> None:
-    """Tab 3: Portfolio stats, PnL, risk, fills, execution quality."""
+def render_portfolio_tab(db_path: Path, view_mode: Optional[Any] = None) -> None:
+    """Portfolio-first landing built from runtime discovery."""
     assert st is not None
 
     summary, pnl, sys_payload, curve, eq_df = _load_core_data(db_path)
+    runtimes = da.discover_core_mm_runtimes()
+    if runtimes.empty:
+        runtimes = pd.DataFrame([da.get_runtime_status_snapshot(db_path=db_path)])
+    portfolio_curve = da.get_portfolio_curve_from_runtimes(runtimes=runtimes)
+    current_snapshot = da.get_runtime_status_snapshot(db_path=db_path)
 
-    if not summary and not pnl:
+    if runtimes.empty and not summary and not pnl:
         st.markdown(
             '<div class="warn">No portfolio data — start a paper run first.</div>',
             unsafe_allow_html=True,
         )
         return
 
-    # ── PnL Chart + Compact Metrics Sidebar ───────────────────────────────
-    updated_at = summary.get("updated_at_ms") or pnl.get("latest_ts_ms")
-    col_chart, col_stats = st.columns([3, 1])
-    with col_chart:
-        _pnl_drawdown_chart(curve)
-    with col_stats:
-        _render_metrics_sidebar(pnl, summary, sys_payload, updated_at, curve, eq_df, db_path=db_path)
+    st.markdown(
+        '<div style="font-family:Orbitron,monospace;font-size:1.15em;color:#05ffa1;'
+        'letter-spacing:0.08em;margin-bottom:10px;">PORTFOLIO</div>',
+        unsafe_allow_html=True,
+    )
+
+    top_metrics = st.columns(5)
+    portfolio_total = float(portfolio_curve["total_pnl"].iloc[-1]) if not portfolio_curve.empty and "total_pnl" in portfolio_curve.columns else float(pnl.get("total_pnl") or 0.0)
+    active_runs = int((runtimes["stage"].astype(str) == "running").sum()) if "stage" in runtimes.columns else 0
+    quoteable_runs = int((runtimes["quoteable"].fillna(False)).sum()) if "quoteable" in runtimes.columns else 0
+    fills_total = int(pd.to_numeric(runtimes.get("fills", pd.Series(dtype="float64")), errors="coerce").fillna(0).sum()) if "fills" in runtimes.columns else int(summary.get("fills") or 0)
+    selected_market = str(current_snapshot.get("market") or summary.get("market") or "N/A")
+    with top_metrics[0]:
+        _render_glass_metric("Portfolio PnL", _fmt_money(portfolio_total), accent="#05ffa1" if portfolio_total >= 0 else "#ff3b5c")
+    with top_metrics[1]:
+        _render_glass_metric("Runtimes", str(len(runtimes)))
+    with top_metrics[2]:
+        _render_glass_metric("Active", str(active_runs), accent="#05ffa1")
+    with top_metrics[3]:
+        _render_glass_metric("Quoteable", str(quoteable_runs))
+    with top_metrics[4]:
+        _render_glass_metric("Selected", selected_market[:28])
+
+    chart_col, summary_col = st.columns([7, 3])
+    with chart_col:
+        if portfolio_curve.empty:
+            st.info("No portfolio curve available yet.")
+        elif alt is None:
+            st.info("Portfolio curve available, but Altair is not installed.")
+        else:
+            curve_plot = portfolio_curve.copy()
+            curve_plot["ts"] = pd.to_datetime(curve_plot["ts_ms"], unit="ms", utc=True, errors="coerce")
+            chart = alt.Chart(curve_plot).mark_line(color="#05ffa1").encode(
+                x=alt.X("ts:T", title="Time"),
+                y=alt.Y("total_pnl:Q", title="Portfolio PnL"),
+                tooltip=["ts:T", "total_pnl:Q", "realized_net_pnl:Q", "unrealized_pnl:Q"],
+            ).properties(height=320)
+            st.altair_chart(chart, use_container_width=True)
+    with summary_col:
+        selected_row = runtimes.iloc[0].to_dict() if not runtimes.empty else {}
+        if not runtimes.empty and "db_path" in runtimes.columns:
+            match = runtimes[runtimes["db_path"].astype(str) == str(db_path.resolve())]
+            if not match.empty:
+                selected_row = match.iloc[0].to_dict()
+        st.markdown("### Selected strategy")
+        st.write({
+            "strategy": selected_row.get("strategy_name"),
+            "exchange": selected_row.get("exchange"),
+            "mode": selected_row.get("mode"),
+            "stage": selected_row.get("stage"),
+            "market": selected_row.get("market_label") or selected_row.get("market"),
+            "health": selected_row.get("book_health"),
+            "quoteable": selected_row.get("quoteable"),
+            "pnl": selected_row.get("total_pnl"),
+            "fills": selected_row.get("fills"),
+        })
+        st.markdown("**Portfolio health**")
+        st.write({
+            "fills_total": fills_total,
+            "active_runs": active_runs,
+            "quoteable_runs": quoteable_runs,
+            "selected_reason": current_snapshot.get("selected_reason"),
+        })
 
     st.divider()
-
-    # ── Market History ─────────────────────────────────────────────────────
-    _render_market_history(db_path)
-
-    # ── Risk Summary + Fill Breakdown ─────────────────────────────────────
-    col_risk, col_fills = st.columns([1, 2])
-    with col_risk:
-        _render_risk_summary(sys_payload, db_path)
-    with col_fills:
-        _fill_breakdown_chart(db_path, sys_payload)
+    st.markdown("### Strategy registry")
+    runtime_rows = runtimes.copy()
+    if not runtime_rows.empty:
+        runtime_rows["selected"] = runtime_rows["db_path"].astype(str) == str(db_path.resolve()) if "db_path" in runtime_rows.columns else False
+        runtime_rows["last_update"] = runtime_rows.apply(
+            lambda row: _fmt_last_update(
+                int(
+                    ((row.get("snapshot") or {}).get("updated_at_ms") if isinstance(row.get("snapshot"), dict) else row.get("updated_at_ms"))
+                    or 0
+                )
+            ),
+            axis=1,
+        )
+        runtime_rows["selected_reason"] = runtime_rows.get("selected_reason", pd.Series(dtype=object)).fillna("")
+        show_cols = [
+            col for col in [
+                "selected",
+                "label",
+                "exchange",
+                "mode",
+                "stage",
+                "market_label",
+                "decisions",
+                "fills",
+                "total_pnl",
+                "quoteable",
+                "book_health",
+                "spread_bps",
+                "selected_reason",
+                "last_update",
+            ]
+            if col in runtime_rows.columns
+        ]
+        if _is_dev_mode(view_mode):
+            show_cols = [col for col in ["selected", "label", "runtime_root", "db_path", "exchange", "mode", "stage", "market", "market_label", "decisions", "fills", "total_pnl", "quoteable", "book_health", "spread_bps", "selected_reason", "last_update"] if col in runtime_rows.columns]
+        _display_runtime_table(runtime_rows, show_cols)
+    else:
+        st.caption("No discovered runtimes yet.")
 
     st.divider()
+    st.markdown("### Strategy summary")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        _render_glass_metric("Selected market", selected_market)
+    with col_b:
+        _render_glass_metric("Current state", str(current_snapshot.get("state") or current_snapshot.get("book_health") or "unknown"))
+    with col_c:
+        _render_glass_metric("Reason", str(current_snapshot.get("selected_reason") or "N/A"), accent="#fcee0a")
 
-    # ── Fills Table + Timeline ─────────────────────────────────────────────
-    st.markdown("**Recent fills (last 20)**")
-    _render_fills_table(db_path, sys_payload)
-    _fill_timeline_sparkline(db_path, sys_payload)
-
-    # ── Alert Feed ─────────────────────────────────────────────────────────
-    _render_alert_feed(sys_payload)
-
-    # ── Advanced Telemetry (collapsed) ─────────────────────────────────────
-    with st.expander("Advanced Telemetry", expanded=False):
-        if not eq_df.empty:
-            _markout_chart(eq_df)
-
-        col_wr, col_inv = st.columns(2)
-        with col_wr:
+    if _is_dev_mode(view_mode):
+        with st.expander("Advanced telemetry", expanded=False):
+            if not eq_df.empty:
+                _markout_chart(eq_df)
             _fill_rate_chart(curve)
-        with col_inv:
             _render_inventory_section(db_path, sys_payload)
-
-        per_token_qs = sys_payload.get("per_token_quote_stats") or {}
-        if per_token_qs:
-            st.markdown("**Per-token quote stats**")
-            yn_map = _resolve_yes_no_tokens(sys_payload)
-            rows_qs = []
-            for tid, counts in per_token_qs.items():
-                rows_qs.append({
-                    "Token": yn_map.get(str(tid), _token_label(str(tid))),
-                    "Buy Q": counts.get("buy_quotes", 0),
-                    "Sell Q": counts.get("sell_quotes", 0),
-                    "Skip": counts.get("skip_count", 0),
-                    "Freeze": counts.get("freeze_count", 0),
-                    "Emergency": counts.get("emergency_count", 0),
-                })
-            st.dataframe(pd.DataFrame(rows_qs), use_container_width=True, hide_index=True)
-
-        feed = sys_payload.get("feed") or {}
-        if feed:
-            msgs = int(feed.get("received_messages") or 0)
-            updates = int(feed.get("applied_book_updates") or 0)
-            st.caption(f"Feed: {msgs:,} messages, {updates:,} book updates")
+            _render_market_history(db_path)
+            _render_risk_summary(sys_payload, db_path)
+            _fill_breakdown_chart(db_path, sys_payload)
+            _render_alert_feed(sys_payload)
 
 
 # Backward-compatible alias

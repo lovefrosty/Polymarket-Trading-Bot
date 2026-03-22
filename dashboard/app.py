@@ -1216,30 +1216,35 @@ def _render_selected_run_status(view_mode: ViewMode) -> None:
     runtime_root = _current_runtime_root()
     status = da.get_run_status(runtime_root=runtime_root, db_path=db_path)
     summary = da.get_run_summary(runtime_root=runtime_root, db_path=db_path)
+    snapshot = da.get_runtime_status_snapshot(runtime_root=runtime_root, db_path=db_path)
     pnl_summary = da.get_paper_pnl_summary(db_path=db_path)
     if not status and not summary:
         st.caption(f"runtime_db={db_path}")
         return
 
-    stage = str(status.get("stage") or "unknown")
-    mode = str(status.get("mode") or "N/A").upper()
-    market = str(status.get("market") or "unknown")
-    updated_at_ms = status.get("updated_at_ms")
+    stage = str(snapshot.get("stage") or status.get("stage") or "unknown")
+    mode = str(snapshot.get("mode") or status.get("mode") or "N/A").upper()
+    market = str(snapshot.get("market") or status.get("market") or "unknown")
     age_s = None
+    updated_at_ms = snapshot.get("updated_at_ms") or status.get("updated_at_ms")
     if updated_at_ms is not None:
         try:
             age_s = max(0.0, datetime.now(timezone.utc).timestamp() - float(updated_at_ms) / 1000.0)
         except (TypeError, ValueError):
             age_s = None
     last_error = status.get("last_error")
+    selection_reason = str(snapshot.get("selected_reason") or "n/a")
+    quoteable = "yes" if snapshot.get("quoteable") else "no"
+    book_health = str(snapshot.get("book_health") or "unknown")
     st.caption(
         f"core_mm runtime={runtime_root.name} mode={mode} stage={stage} market={market} "
-        f"age={_fmt_age_s(age_s)} last_error={last_error or 'none'}"
+        f"age={_fmt_age_s(age_s)} quoteable={quoteable} book_health={book_health} "
+        f"selected_reason={selection_reason} last_error={last_error or 'none'}"
     )
     cols = st.columns(4)
-    cols[0].metric("Decisions", int(status.get("decisions") or summary.get("decisions") or 0))
-    cols[1].metric("Fills", int(status.get("fills") or summary.get("fills") or 0))
-    cols[2].metric("Total PnL", f"${float(pnl_summary.get('total_pnl') or 0.0):.2f}")
+    cols[0].metric("Decisions", int(snapshot.get("decisions") or status.get("decisions") or summary.get("decisions") or 0))
+    cols[1].metric("Fills", int(snapshot.get("fills") or status.get("fills") or summary.get("fills") or 0))
+    cols[2].metric("Total PnL", f"${float(snapshot.get('total_pnl') or pnl_summary.get('total_pnl') or 0.0):.2f}")
     dd_value = pnl_summary.get("max_drawdown_abs")
     cols[3].metric("Max drawdown", f"${float(dd_value):.2f}" if dd_value is not None else "N/A")
     if is_developer_mode(view_mode):
@@ -2490,34 +2495,15 @@ def render_dashboard() -> None:
         start_ts, end_ts = _time_filter(filters.window_minutes)
         db = _current_db_path()
 
-        tab_mm, tab_alpha, tab_portfolio = st.tabs(
-            ["MARKET MAKING", "ALPHA OVERLAY", "PORTFOLIO"]
+        tab_portfolio, tab_mm, tab_alpha = st.tabs(
+            ["PORTFOLIO", "STRATEGY", "ALPHA OVERLAY"]
         )
-
-        with tab_mm:
-            _render_panel(
-                "market_making",
-                lambda: render_market_making_tab(db),
-                budget_ms=600,
-            )
-
-        with tab_alpha:
-            _render_panel(
-                "alpha_overlay",
-                lambda: render_alpha_overlay_tab(db),
-                budget_ms=400,
-            )
 
         with tab_portfolio:
             _render_panel(
-                "portfolio_summary",
-                lambda: render_portfolio_summary_panel(filters, end_ts_ms=end_ts, view_mode=view_mode, compact=True),
-                budget_ms=250,
-            )
-            _render_panel(
                 "portfolio_core",
-                lambda: render_portfolio_tab(db),
-                budget_ms=600,
+                lambda: render_portfolio_tab(db, view_mode=view_mode),
+                budget_ms=700,
             )
             if is_developer_mode(view_mode):
                 with st.expander("Developer Tools", expanded=False):
@@ -2589,6 +2575,20 @@ def render_dashboard() -> None:
                         lambda: render_export_panel(filters, start_ts, end_ts, drillthrough_context),
                         budget_ms=250,
                     )
+
+        with tab_mm:
+            _render_panel(
+                "market_making",
+                lambda: render_market_making_tab(db, view_mode=view_mode),
+                budget_ms=800,
+            )
+
+        with tab_alpha:
+            _render_panel(
+                "alpha_overlay",
+                lambda: render_alpha_overlay_tab(db),
+                budget_ms=400,
+            )
 
     if use_fragment:
         refresh_seconds = max(1, int(round(policy.topbar_refresh_ms / 1000.0)))
