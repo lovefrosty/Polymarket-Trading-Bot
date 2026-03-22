@@ -107,12 +107,20 @@ def _to_candidate(
     if not ticker:
         return None
 
-    # Price checks (last YES price or yes_bid/yes_ask)
-    yes_price = _coerce_float(m.get("last_price") or m.get("yes_bid"))
-    if yes_price is not None:
-        yes_price_dollars = yes_price / 100.0 if yes_price > 1.0 else yes_price
+    # Price checks — prefer dollar fields from production API
+    yes_bid_d = _coerce_float(m.get("yes_bid_dollars"))
+    yes_ask_d = _coerce_float(m.get("yes_ask_dollars"))
+    last_price_d = _coerce_float(m.get("last_price_dollars"))
+    # Fallback to cent fields (demo API)
+    if yes_bid_d is None:
+        raw = _coerce_float(m.get("last_price") or m.get("yes_bid"))
+        yes_price_dollars = (raw / 100.0 if raw and raw > 1.0 else raw)
     else:
-        yes_price_dollars = None
+        # Use mid of bid/ask if both available, else last price
+        if yes_bid_d is not None and yes_ask_d is not None and yes_bid_d > 0 and yes_ask_d > 0:
+            yes_price_dollars = (yes_bid_d + yes_ask_d) / 2.0
+        else:
+            yes_price_dollars = last_price_d or yes_bid_d
 
     if yes_price_dollars is not None:
         if yes_price_dollars < config.min_price or yes_price_dollars > config.max_price:
@@ -124,9 +132,9 @@ def _to_candidate(
     if expiration_ts and (expiration_ts - now_ts) < config.min_time_to_expiry_secs:
         return None
 
-    # Volume / open interest
-    volume = _coerce_float(m.get("volume") or m.get("volume_24h") or 0.0)
-    open_interest = _coerce_float(m.get("open_interest") or 0.0)
+    # Volume / open interest — prefer _fp fields from production
+    volume = _coerce_float(m.get("volume_fp") or m.get("volume") or m.get("volume_24h") or 0.0)
+    open_interest = _coerce_float(m.get("open_interest_fp") or m.get("open_interest") or 0.0)
     if volume < config.min_volume_24hr:
         return None
     if open_interest < config.min_open_interest:
@@ -137,9 +145,6 @@ def _to_candidate(
     result = str(m.get("result") or "").lower()
     is_active = status in ("open", "active", "trading") and result == ""
 
-    # Score: simple volume-based for now
-    score = float(volume) + float(open_interest) * 0.5
-
     # Build virtual token IDs
     token_ids = (f"{ticker}:yes", f"{ticker}:no")
 
@@ -148,16 +153,24 @@ def _to_candidate(
     if tick_size >= 1.0:
         tick_size = tick_size / 100.0  # cents → dollars
 
-    # Spread from yes_bid/yes_ask if available
-    yes_bid = _coerce_float(m.get("yes_bid"))
-    yes_ask = _coerce_float(m.get("yes_ask"))
+    # Spread from yes_bid/yes_ask — prefer dollar fields
     spread = 0.0
     mid = yes_price_dollars
-    if yes_bid is not None and yes_ask is not None:
-        bid_d = yes_bid / 100.0 if yes_bid > 1.0 else yes_bid
-        ask_d = yes_ask / 100.0 if yes_ask > 1.0 else yes_ask
-        spread = max(0.0, ask_d - bid_d)
-        mid = (bid_d + ask_d) / 2.0 if bid_d > 0 and ask_d > 0 else mid
+    if yes_bid_d is not None and yes_ask_d is not None and yes_bid_d > 0 and yes_ask_d > 0:
+        spread = max(0.0, yes_ask_d - yes_bid_d)
+        mid = (yes_bid_d + yes_ask_d) / 2.0
+    else:
+        yes_bid = _coerce_float(m.get("yes_bid"))
+        yes_ask = _coerce_float(m.get("yes_ask"))
+        if yes_bid is not None and yes_ask is not None:
+            bid_d = yes_bid / 100.0 if yes_bid > 1.0 else yes_bid
+            ask_d = yes_ask / 100.0 if yes_ask > 1.0 else yes_ask
+            spread = max(0.0, ask_d - bid_d)
+            mid = (bid_d + ask_d) / 2.0 if bid_d > 0 and ask_d > 0 else mid
+
+    # Score: favor OI (liquidity proxy) and penalize wide spreads
+    spread_penalty = max(0.0, 1.0 - spread * 10.0)  # 0.10 spread → 0.0 score mult
+    score = (float(volume) + float(open_interest) * 2.0) * spread_penalty
 
     # Subtitle / outcomes
     yes_sub = str(m.get("yes_sub_title") or "Yes")

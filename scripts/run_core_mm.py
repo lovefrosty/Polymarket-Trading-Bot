@@ -138,8 +138,8 @@ async def _main() -> None:
             client=kalshi_client,
             config=KalshiSelectorConfig(
                 series_ticker=primary_symbol if primary_symbol else None,
-                min_price=0.05,
-                max_price=0.95,
+                min_price=0.10,
+                max_price=0.90,
             ),
         )
         if args.mode == "LIVE":
