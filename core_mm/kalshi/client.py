@@ -145,7 +145,11 @@ class KalshiClient:
         series_ticker: Optional[str] = None,
         event_ticker: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """GET /trade-api/v2/markets → list of market dicts."""
+        """GET /trade-api/v2/markets → list of market dicts.
+
+        Returns a single page of results.  Use ``get_markets_all`` for
+        automatic cursor-based pagination across all pages.
+        """
         params: Dict[str, Any] = {"limit": limit, "status": status}
         if cursor:
             params["cursor"] = cursor
@@ -155,6 +159,36 @@ class KalshiClient:
             params["event_ticker"] = event_ticker
         data = self._request("GET", "/trade-api/v2/markets", params=params, auth=True)
         return data.get("markets") or []
+
+    def get_markets_all(
+        self,
+        *,
+        status: str = "open",
+        limit: int = 200,
+        series_ticker: Optional[str] = None,
+        event_ticker: Optional[str] = None,
+        max_pages: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Paginate through all markets using cursor-based pagination."""
+        all_markets: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            params: Dict[str, Any] = {"limit": limit, "status": status}
+            if cursor:
+                params["cursor"] = cursor
+            if series_ticker:
+                params["series_ticker"] = series_ticker
+            if event_ticker:
+                params["event_ticker"] = event_ticker
+            data = self._request("GET", "/trade-api/v2/markets", params=params, auth=True)
+            page = data.get("markets") or []
+            all_markets.extend(page)
+            cursor = data.get("cursor")
+            if not cursor or not page:
+                break
+            import time as _time
+            _time.sleep(0.05)
+        return all_markets
 
     def get_market(self, ticker: str) -> Dict[str, Any]:
         """GET /trade-api/v2/markets/{ticker} → single market dict."""

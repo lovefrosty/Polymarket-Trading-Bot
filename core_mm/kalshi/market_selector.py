@@ -48,21 +48,38 @@ class KalshiMarketSelector:
         self._client = client
         self.config = config or KalshiSelectorConfig()
 
+    # Map user-facing symbols to Kalshi series tickers
+    SYMBOL_TO_SERIES: Dict[str, str] = {
+        "BTC": "KXBTC",
+        "ETH": "KXETH",
+        "SOL": "KXSOL",
+        "SPX": "KXINX",
+        "GDP": "KXGDP",
+        "FED": "KXFEDRATE",
+        "NASDAQ": "KXNDX",
+    }
+
     def select_markets(self, now_ts: Optional[int] = None) -> List[MarketCandidate]:
         """Fetch open markets from Kalshi and return scored candidates."""
         now_ts = now_ts or int(time.time())
-        # Try with series filter first; fall back to unfiltered if nothing found
-        raw_markets = self._client.get_markets(
+        # Translate user symbol (e.g. "BTC") to Kalshi series (e.g. "KXBTC")
+        series = self.config.series_ticker
+        if series and series in self.SYMBOL_TO_SERIES:
+            series = self.SYMBOL_TO_SERIES[series]
+
+        # Use paginated fetch to get more markets
+        fetch = getattr(self._client, "get_markets_all", None) or self._client.get_markets
+        raw_markets = fetch(
             status="open",
-            limit=100,
-            series_ticker=self.config.series_ticker,
+            limit=200,
+            series_ticker=series,
             event_ticker=self.config.event_ticker,
         )
+        # Fallback: try Kalshi prefix, then unfiltered
+        if not raw_markets and series:
+            raw_markets = fetch(status="open", limit=200, series_ticker=series)
         if not raw_markets and self.config.series_ticker:
-            raw_markets = self._client.get_markets(
-                status="open",
-                limit=100,
-            )
+            raw_markets = fetch(status="open", limit=200)
         candidates: List[MarketCandidate] = []
         for m in raw_markets:
             candidate = _to_candidate(m, self.config, now_ts)
