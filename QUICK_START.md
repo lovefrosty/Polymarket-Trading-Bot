@@ -14,10 +14,10 @@
 - [ ] `POLYMARKET_PRIVATE_KEY`
 
 ### For Kalshi
-- [ ] RSA private key generated in local-only folder: `mkdir -p secrets && openssl genrsa -out secrets/kalshi-private-key.pem 4096`
-- [ ] Public key uploaded to Kalshi dashboard
+- [ ] API key created in the Kalshi production dashboard
+- [ ] Private key file downloaded into a local-only folder such as `./secrets/kalshi-api.key`
 - [ ] `KALSHI_API_KEY_ID` (from dashboard)
-- [ ] `KALSHI_PRIVATE_KEY_PATH=./secrets/kalshi-private-key.pem`
+- [ ] `KALSHI_PRIVATE_KEY_PATH=./secrets/kalshi-api.key`
 - [ ] `KALSHI_BASE_URL=https://api.elections.kalshi.com` (or demo URL)
 
 ---
