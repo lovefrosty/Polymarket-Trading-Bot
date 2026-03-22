@@ -264,6 +264,29 @@ async def _main() -> None:
                 },
             )
             raise RuntimeError(f"startup_reconciliation_blocked: {startup_reconciliation.get('reason') or 'unknown'}")
+        _write_status(
+            meta_dir,
+            {
+                "mode": args.mode,
+                "stage": "startup_reconciled",
+                "run_name": args.run_name,
+                "market": None,
+                "token_ids": [],
+                "feed": {"connected": False, "subscribed_token_ids": [], "received_messages": 0, "applied_book_updates": 0},
+                "runner": {"mode": args.mode, "market_id": None, "token_ids": [], "has_books": False, "selection": {}, "active_market_health": {}},
+                "selection": {},
+                "active_market_health": {},
+                "decisions": 0,
+                "order_actions": 0,
+                "fills": 0,
+                "fill_rate_snapshot": 0.0,
+                "last_error": None,
+                "startup_reconciliation": startup_reconciliation,
+                "kill_switch_validation": kill_switch_validation,
+                "symbols": list(symbols),
+                "updated_at_ms": int(time.time() * 1000),
+            },
+        )
 
     complement_arb_config = ComplementArbConfig(
         enabled=args.complement_arb,
