@@ -1,0 +1,59 @@
+{
+  "activity": {
+    "cycles_total": 15,
+    "freeze_cycles": 15,
+    "freeze_reason_counts": {
+      "book_absent": 2,
+      "book_empty": 28
+    },
+    "inactive_ratio": 1.0,
+    "no_quote_cycles": 0,
+    "no_quote_reason_counts": {},
+    "quoteable_cycles": 0,
+    "quoteable_ratio": 0.0
+  },
+  "economics": {
+    "realized_net_pnl": 0.0,
+    "total_fees": 0.0,
+    "total_pnl": 0.0,
+    "turnover": 0.0,
+    "unrealized_pnl": 0.0
+  },
+  "execution_quality": {
+    "avg_fee_bps": null,
+    "avg_markout_1s_bps": null,
+    "avg_markout_5s_bps": null,
+    "avg_net_edge_bps": null,
+    "avg_realized_spread_bps": null,
+    "negative_markout_1s_rate": 0.0,
+    "negative_markout_5s_rate": 0.0,
+    "negative_net_edge_rate": 0.0
+  },
+  "fills": {
+    "canceled_orders": 0,
+    "fill_rate": 0.0,
+    "fills": 0,
+    "placed_orders": 0
+  },
+  "market": "btc-updown-15m-1773612000",
+  "mode": "PAPER",
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": false,
+    "fills_present": false,
+    "loss_source_hints": [
+      "no_quoteable_cycles",
+      "selection_or_feed_gating_dominates_runtime"
+    ],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": true,
+    "quoteable_cycles_present": false,
+    "rationale": "architectural_or_feed_blocker_detected",
+    "result": "structural_blocker",
+    "structural_blocker_detected": true
+  },
+  "recommendation": "fix_architecture_before_expansion",
+  "runtime_root": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/phase0-smoke-20260315T221309Z",
+  "symbols": [
+    "BTC"
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "canceled_orders": 35,
+  "cycle_summary": {
+    "cycles_total": 569,
+    "estimated_inactive_time_ms": 230736,
+    "estimated_quoteable_time_ms": 345092,
+    "freeze_cycles": 1,
+    "freeze_reason_counts": {
+      "book_absent": 2
+    },
+    "inactive_ratio": 0.4007029876977153,
+    "inferred_cycle_interval_ms": 1012,
+    "no_quote_cycles": 227,
+    "no_quote_reason_counts": {
+      "ask_fallback_skew_inversion": 66,
+      "ask_fallback_skew_inversion_avg_cost_floor": 201,
+      "ask_fallback_top_ask": 23,
+      "ask_improve": 5,
+      "ask_improve_avg_cost_floor": 111,
+      "ask_improve_skewed_avg_cost_floor": 5,
+      "ask_join": 1,
+      "ask_join_avg_cost_floor": 38,
+      "ask_join_skewed": 1,
+      "ask_join_skewed_avg_cost_floor": 3,
+      "bid_fallback_skew_inversion": 267,
+      "bid_fallback_top_bid": 26,
+      "bid_improve": 110,
+      "bid_improve_skewed": 4,
+      "bid_join": 42,
+      "bid_join_skewed": 5,
+      "flow_blocks_buy": 203,
+      "flow_blocks_sell": 154,
+      "stop_loss": 45,
+      "take_profit": 263
+    },
+    "quoteable_cycles": 341,
+    "quoteable_ratio": 0.5992970123022847
+  },
+  "decisions": 1138,
+  "execution_quality": {
+    "avg_fee_bps": 25.0,
+    "avg_markout_1s_bps": 165.29298392159416,
+    "avg_markout_5s_bps": 257.6955275664315,
+    "avg_net_edge_bps": 110.73052540719577,
+    "avg_realized_spread_bps": 135.73052540719576,
+    "fills_measured": 945,
+    "negative_markout_1s_rate": 0.33015873015873015,
+    "negative_markout_5s_rate": 0.3746031746031746,
+    "negative_net_edge_rate": 0.4
+  },
+  "fill_rate": 0.6494845360824743,
+  "fills": 315,
+  "final": true,
+  "per_token": {
+    "111238789751398389801107810927194276265576917464051979143099959404417687473847": {
+      "cumulative_fees": 0.23950075245284166,
+      "realized_net_pnl": 58.63011662224067,
+      "turnover": 1806.978422167621,
+      "unrealized_pnl": 2.05248215341424
+    },
+    "91749751924101995353244302754971937607476536598767621525044855237340633687081": {
+      "cumulative_fees": 0.23950075245284166,
+      "realized_net_pnl": 58.63011662224067,
+      "turnover": 1806.978422167621,
+      "unrealized_pnl": -2.6999999999999997
+    }
+  },
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": true,
+    "fills_present": true,
+    "loss_source_hints": [],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": true,
+    "quoteable_cycles_present": true,
+    "rationale": "economics_non_negative",
+    "result": "pass",
+    "structural_blocker_detected": false
+  },
+  "placed_orders": 485,
+  "realized_gross_pnl": 58.86961737469352,
+  "realized_net_pnl": 58.63011662224067,
+  "runtime_db_path": "tmp/core_mm_runs/multi-mkt/runtime.db",
+  "total_fees": 0.23950075245284166,
+  "total_pnl": 57.982598775654914,
+  "turnover": 1806.978422167621,
+  "unrealized_pnl": -0.6475178465857598,
+  "updated_at_ms": 1774141804900
+}

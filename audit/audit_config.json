@@ -1,0 +1,7 @@
+{
+  "compatibility_modules": [
+    "core.model_fit",
+    "scripts.train_model",
+    "src.replay.replay_harness"
+  ]
+}

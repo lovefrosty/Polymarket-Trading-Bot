@@ -1,0 +1,54 @@
+{
+  "canceled_orders": 0,
+  "cycle_summary": {
+    "cycles_total": 0,
+    "estimated_inactive_time_ms": 0,
+    "estimated_quoteable_time_ms": 0,
+    "freeze_cycles": 0,
+    "freeze_reason_counts": {},
+    "inactive_ratio": 0.0,
+    "inferred_cycle_interval_ms": 0,
+    "no_quote_cycles": 0,
+    "no_quote_reason_counts": {},
+    "quoteable_cycles": 0,
+    "quoteable_ratio": 0.0
+  },
+  "decisions": 0,
+  "execution_quality": {
+    "avg_fee_bps": null,
+    "avg_markout_1s_bps": null,
+    "avg_markout_5s_bps": null,
+    "avg_net_edge_bps": null,
+    "avg_realized_spread_bps": null,
+    "fills_measured": 0,
+    "negative_markout_1s_rate": 0.0,
+    "negative_markout_5s_rate": 0.0,
+    "negative_net_edge_rate": 0.0
+  },
+  "fill_rate": 0.0,
+  "fills": 0,
+  "final": true,
+  "per_token": {},
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": false,
+    "fills_present": false,
+    "loss_source_hints": [
+      "no_quoteable_cycles"
+    ],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": true,
+    "quoteable_cycles_present": false,
+    "rationale": "architectural_or_feed_blocker_detected",
+    "result": "structural_blocker",
+    "structural_blocker_detected": true
+  },
+  "placed_orders": 0,
+  "realized_gross_pnl": 0.0,
+  "realized_net_pnl": 0.0,
+  "runtime_db_path": "tmp/core_mm_runs/cockpit-test/runtime.db",
+  "total_fees": 0.0,
+  "total_pnl": 0.0,
+  "turnover": 0.0,
+  "unrealized_pnl": 0.0,
+  "updated_at_ms": 1774137215926
+}

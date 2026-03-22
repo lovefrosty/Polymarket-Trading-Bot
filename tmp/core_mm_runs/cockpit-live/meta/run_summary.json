@@ -1,0 +1,95 @@
+{
+  "canceled_orders": 43,
+  "cycle_summary": {
+    "cycles_total": 590,
+    "estimated_inactive_time_ms": 304010,
+    "estimated_quoteable_time_ms": 291890,
+    "freeze_cycles": 65,
+    "freeze_reason_counts": {
+      "book_absent": 2,
+      "book_below_meaningful_size": 2,
+      "book_empty": 126
+    },
+    "inactive_ratio": 0.5101694915254237,
+    "inferred_cycle_interval_ms": 1010,
+    "no_quote_cycles": 236,
+    "no_quote_reason_counts": {
+      "ask_fallback_skew_inversion": 149,
+      "ask_fallback_skew_inversion_avg_cost_floor": 81,
+      "ask_fallback_skew_inversion_avg_cost_floor_rush": 39,
+      "ask_fallback_top_ask": 6,
+      "ask_improve": 9,
+      "ask_improve_avg_cost_floor": 28,
+      "ask_improve_skewed": 49,
+      "ask_improve_skewed_avg_cost_floor": 28,
+      "ask_improve_skewed_avg_cost_floor_rush": 3,
+      "ask_join": 2,
+      "ask_join_avg_cost_floor": 24,
+      "ask_join_skewed": 19,
+      "ask_join_skewed_avg_cost_floor": 35,
+      "bid_fallback_skew_inversion": 231,
+      "bid_fallback_skew_inversion_rush": 38,
+      "bid_fallback_top_bid": 8,
+      "bid_improve": 37,
+      "bid_improve_skewed": 80,
+      "bid_improve_skewed_rush": 3,
+      "bid_join": 25,
+      "bid_join_skewed": 50,
+      "flow_blocks_buy": 234,
+      "flow_blocks_sell": 204,
+      "stop_loss": 5,
+      "take_profit": 204
+    },
+    "quoteable_cycles": 289,
+    "quoteable_ratio": 0.48983050847457626
+  },
+  "decisions": 1180,
+  "execution_quality": {
+    "avg_fee_bps": 25.0,
+    "avg_markout_1s_bps": 862.3502345405565,
+    "avg_markout_5s_bps": 1027.8563795363036,
+    "avg_net_edge_bps": 655.3761256919871,
+    "avg_realized_spread_bps": 680.3761256919871,
+    "fills_measured": 642,
+    "negative_markout_1s_rate": 0.26635514018691586,
+    "negative_markout_5s_rate": 0.35046728971962615,
+    "negative_net_edge_rate": 0.3411214953271028
+  },
+  "fill_rate": 0.5363408521303258,
+  "fills": 214,
+  "final": true,
+  "per_token": {
+    "59920976226788975829278641059430295323204895025568027326399522941856188378710": {
+      "cumulative_fees": 0.10771698146772228,
+      "realized_net_pnl": 26.860336028770437,
+      "turnover": 1120.4080321042698,
+      "unrealized_pnl": 0.0
+    },
+    "94379791900915737276503116434021045525020936730820937865304463617457270802355": {
+      "cumulative_fees": 0.10771698146772228,
+      "realized_net_pnl": 26.860336028770437,
+      "turnover": 1120.4080321042698,
+      "unrealized_pnl": 0.0
+    }
+  },
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": true,
+    "fills_present": true,
+    "loss_source_hints": [],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": true,
+    "quoteable_cycles_present": true,
+    "rationale": "economics_non_negative",
+    "result": "pass",
+    "structural_blocker_detected": false
+  },
+  "placed_orders": 399,
+  "realized_gross_pnl": 26.968053010238165,
+  "realized_net_pnl": 26.860336028770437,
+  "runtime_db_path": "tmp/core_mm_runs/cockpit-live/runtime.db",
+  "total_fees": 0.10771698146772228,
+  "total_pnl": 26.860336028770437,
+  "turnover": 1120.4080321042698,
+  "unrealized_pnl": 0.0,
+  "updated_at_ms": 1774140341171
+}

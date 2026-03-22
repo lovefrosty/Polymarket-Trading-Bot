@@ -1,0 +1,79 @@
+{
+  "canceled_orders": 25,
+  "cycle_summary": {
+    "cycles_total": 296,
+    "estimated_inactive_time_ms": 66528,
+    "estimated_quoteable_time_ms": 231840,
+    "freeze_cycles": 1,
+    "freeze_reason_counts": {
+      "book_absent": 2
+    },
+    "inactive_ratio": 0.22297297297297297,
+    "inferred_cycle_interval_ms": 1008,
+    "no_quote_cycles": 65,
+    "no_quote_reason_counts": {
+      "ask_fallback_skew_inversion_avg_cost_floor": 2,
+      "ask_fallback_top_ask": 31,
+      "ask_improve_avg_cost_floor": 87,
+      "ask_join_avg_cost_floor": 10,
+      "bid_fallback_skew_inversion": 2,
+      "bid_fallback_top_bid": 118,
+      "bid_join": 10,
+      "flow_blocks_buy": 29,
+      "flow_blocks_sell": 29,
+      "stop_loss": 99,
+      "take_profit": 26
+    },
+    "quoteable_cycles": 230,
+    "quoteable_ratio": 0.777027027027027
+  },
+  "decisions": 592,
+  "execution_quality": {
+    "avg_fee_bps": 25.0,
+    "avg_markout_1s_bps": 69.42577978629735,
+    "avg_markout_5s_bps": 40.65162151126367,
+    "avg_net_edge_bps": 17.724396816455577,
+    "avg_realized_spread_bps": 42.72439681645558,
+    "fills_measured": 177,
+    "negative_markout_1s_rate": 0.22033898305084745,
+    "negative_markout_5s_rate": 0.423728813559322,
+    "negative_net_edge_rate": 0.3050847457627119
+  },
+  "fill_rate": 0.38562091503267976,
+  "fills": 59,
+  "final": true,
+  "per_token": {
+    "37395244404247491083976890856737354000241415507697711190087797622030873105239": {
+      "cumulative_fees": 0.032130375,
+      "realized_net_pnl": 3.123318478566001,
+      "turnover": 327.9619067192871,
+      "unrealized_pnl": 1.0323555171859935
+    },
+    "89929583613343787918222946568384902489389202987354480580039537756181027720367": {
+      "cumulative_fees": 0.032130375,
+      "realized_net_pnl": 3.123318478566001,
+      "turnover": 327.9619067192871,
+      "unrealized_pnl": -9.504976766496448
+    }
+  },
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": false,
+    "fills_present": true,
+    "loss_source_hints": [],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": false,
+    "quoteable_cycles_present": true,
+    "rationale": "more_runtime_or_manual_review_required",
+    "result": "needs_review",
+    "structural_blocker_detected": false
+  },
+  "placed_orders": 153,
+  "realized_gross_pnl": 3.1554488535660012,
+  "realized_net_pnl": 3.123318478566001,
+  "runtime_db_path": "tmp/core_mm_runs/dash-overhaul/runtime.db",
+  "total_fees": 0.032130375,
+  "total_pnl": -5.349302770744453,
+  "turnover": 327.9619067192871,
+  "unrealized_pnl": -8.472621249310453,
+  "updated_at_ms": 1774117363533
+}

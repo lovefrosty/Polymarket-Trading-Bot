@@ -1,0 +1,100 @@
+{
+  "canceled_orders": 570,
+  "cycle_summary": {
+    "cycles_total": 666,
+    "estimated_inactive_time_ms": 266220,
+    "estimated_quoteable_time_ms": 413100,
+    "freeze_cycles": 4,
+    "freeze_reason_counts": {
+      "book_absent": 8
+    },
+    "inactive_ratio": 0.3918918918918919,
+    "inferred_cycle_interval_ms": 1020,
+    "no_quote_cycles": 257,
+    "no_quote_reason_counts": {
+      "ask_fallback_skew_inversion": 122,
+      "ask_fallback_skew_inversion_avg_cost_floor": 113,
+      "ask_fallback_skew_inversion_avg_cost_floor_rush": 12,
+      "ask_fallback_top_ask": 132,
+      "ask_improve": 33,
+      "ask_improve_avg_cost_floor": 80,
+      "ask_join": 9,
+      "ask_join_avg_cost_floor": 13,
+      "bid_fallback_skew_inversion": 233,
+      "bid_fallback_skew_inversion_rush": 14,
+      "bid_fallback_top_bid": 157,
+      "bid_improve": 90,
+      "bid_join": 20,
+      "flow_blocks_buy": 171,
+      "flow_blocks_sell": 119,
+      "stop_loss": 73,
+      "take_profit": 205
+    },
+    "quoteable_cycles": 405,
+    "quoteable_ratio": 0.6081081081081081
+  },
+  "decisions": 1332,
+  "execution_quality": {
+    "avg_fee_bps": 25.0,
+    "avg_markout_1s_bps": -6.719263788918316,
+    "avg_markout_5s_bps": -16.06225043467929,
+    "avg_net_edge_bps": -7.938277087219828,
+    "avg_realized_spread_bps": 17.061722912780173,
+    "fills_measured": 150,
+    "negative_markout_1s_rate": 0.6,
+    "negative_markout_5s_rate": 0.5,
+    "negative_net_edge_rate": 0.56
+  },
+  "fill_rate": 0.08051529790660225,
+  "fills": 50,
+  "final": true,
+  "per_token": {
+    "107441315267165760137932687670822627981262921879434634762603863416762099128802": {
+      "cumulative_fees": 0.06129825000000002,
+      "realized_net_pnl": 21.727227867251244,
+      "turnover": 685.2519776009473,
+      "unrealized_pnl": -0.21251791632520584
+    },
+    "15084887866957938395445564670457696477553279738408929073844301924613723125364": {
+      "cumulative_fees": 0.06129825000000002,
+      "realized_net_pnl": 21.727227867251244,
+      "turnover": 685.2519776009473,
+      "unrealized_pnl": 0.1654452682583064
+    },
+    "53461080577874589116998904083660541118617225829367059135598903930356626903283": {
+      "cumulative_fees": 0.06129825000000002,
+      "realized_net_pnl": 21.727227867251244,
+      "turnover": 685.2519776009473,
+      "unrealized_pnl": 0.5900000000000001
+    },
+    "54835015580764704174829117339087812181231507914352800724834248308698032656596": {
+      "cumulative_fees": 0.06129825000000002,
+      "realized_net_pnl": 21.727227867251244,
+      "turnover": 685.2519776009473,
+      "unrealized_pnl": -1.4249999999999996
+    }
+  },
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": true,
+    "fills_present": true,
+    "loss_source_hints": [
+      "adverse_selection_after_5s",
+      "fees_or_quote_width_overwhelm_spread_capture"
+    ],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": true,
+    "quoteable_cycles_present": true,
+    "rationale": "economics_non_negative",
+    "result": "pass",
+    "structural_blocker_detected": false
+  },
+  "placed_orders": 621,
+  "realized_gross_pnl": 21.78852611725124,
+  "realized_net_pnl": 21.727227867251244,
+  "runtime_db_path": "tmp/core_mm_runs/kelly-20260321T000000Z/runtime.db",
+  "total_fees": 0.06129825000000002,
+  "total_pnl": 20.845155219184345,
+  "turnover": 685.2519776009473,
+  "unrealized_pnl": -0.882072648066899,
+  "updated_at_ms": 1774153258445
+}

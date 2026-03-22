@@ -1,0 +1,8 @@
+{
+  "status": "FAIL",
+  "errors": [
+    "Missing book_stale",
+    "Missing book_stale",
+    "No discovery_summary found"
+  ]
+}

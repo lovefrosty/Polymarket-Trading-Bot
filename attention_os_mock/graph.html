@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Attention OS Mock - Map</title>
+    <link rel="icon" href="data:," />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-page="graph">
+    <div class="page-glow"></div>
+    <div class="shell">
+      <aside id="appSidebar" class="sidebar"></aside>
+      <main class="workspace">
+        <header id="appTopbar" class="topbar panel"></header>
+        <div id="pageMount" class="page-mount"></div>
+      </main>
+    </div>
+
+    <dialog id="lineageDialog" class="lineage-dialog">
+      <div class="dialog-shell">
+        <div class="dialog-head">
+          <div>
+            <p class="section-label">Lineage</p>
+            <h2 id="dialogTitle">Why this insight?</h2>
+          </div>
+          <button id="dialogClose" class="ghost-btn" type="button">Close</button>
+        </div>
+        <div id="dialogBody"></div>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script src="./data.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

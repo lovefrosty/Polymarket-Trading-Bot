@@ -1,0 +1,52 @@
+{
+  "mode": "PAPER",
+  "run_name": "kelly test",
+  "market": null,
+  "markets": [],
+  "token_ids": [],
+  "feed": {
+    "connected": false,
+    "subscribed_token_ids": [],
+    "received_messages": 0,
+    "applied_book_updates": 0
+  },
+  "runner": {
+    "mode": "PAPER",
+    "market_id": null,
+    "market_ids": [],
+    "token_ids": [],
+    "has_books": false,
+    "book_diag": {
+      "per_token": {},
+      "tokens_ok": 0,
+      "tokens_blocked": 0,
+      "blocking_state_counts": {}
+    }
+  },
+  "decisions": 0,
+  "order_actions": 0,
+  "fills": 0,
+  "last_error": null,
+  "symbols": [
+    "BTC"
+  ],
+  "runtime_db_path": "tmp/core_mm_runs/kelly-test-1774152742/runtime.db",
+  "run_summary_path": "tmp/core_mm_runs/kelly-test-1774152742/meta/run_summary.json",
+  "updated_at_ms": 1774152930770,
+  "config": {
+    "symbols": [
+      "BTC"
+    ],
+    "min_size": 10.0,
+    "fallback_size": 2.0,
+    "within_pct": 0.06,
+    "trade_size": 12.0,
+    "max_size": 150.0,
+    "reverse_position_min_size": 2.0,
+    "min_order_size": null,
+    "market_dwell_secs": 900.0,
+    "fee_bps": 25.0,
+    "fee_mode": "taker"
+  },
+  "stage": "awaiting_market"
+}

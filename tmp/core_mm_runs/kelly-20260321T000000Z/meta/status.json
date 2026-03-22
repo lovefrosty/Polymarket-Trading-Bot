@@ -1,0 +1,128 @@
+{
+  "mode": "PAPER",
+  "run_name": "kelly test",
+  "market": "eth-updown-15m-1774152900",
+  "markets": [
+    "eth-updown-15m-1774152900",
+    "btc-updown-15m-1774152900"
+  ],
+  "token_ids": [
+    "54835015580764704174829117339087812181231507914352800724834248308698032656596",
+    "53461080577874589116998904083660541118617225829367059135598903930356626903283",
+    "107441315267165760137932687670822627981262921879434634762603863416762099128802",
+    "15084887866957938395445564670457696477553279738408929073844301924613723125364"
+  ],
+  "feed": {
+    "connected": true,
+    "subscribed_token_ids": [
+      "107441315267165760137932687670822627981262921879434634762603863416762099128802",
+      "15084887866957938395445564670457696477553279738408929073844301924613723125364",
+      "53461080577874589116998904083660541118617225829367059135598903930356626903283",
+      "54835015580764704174829117339087812181231507914352800724834248308698032656596"
+    ],
+    "received_messages": 96452,
+    "applied_book_updates": 185084
+  },
+  "runner": {
+    "mode": "PAPER",
+    "market_id": "eth-updown-15m-1774152900",
+    "market_ids": [
+      "eth-updown-15m-1774152900",
+      "btc-updown-15m-1774152900"
+    ],
+    "token_ids": [
+      "54835015580764704174829117339087812181231507914352800724834248308698032656596",
+      "53461080577874589116998904083660541118617225829367059135598903930356626903283",
+      "107441315267165760137932687670822627981262921879434634762603863416762099128802",
+      "15084887866957938395445564670457696477553279738408929073844301924613723125364"
+    ],
+    "has_books": true,
+    "book_diag": {
+      "per_token": {
+        "54835015580764704174829117339087812181231507914352800724834248308698032656596": {
+          "state": "book_ok",
+          "bid_levels": 48,
+          "ask_levels": 51,
+          "best_bid": 0.48,
+          "best_ask": 0.49,
+          "best_bid_size": 644.0,
+          "best_ask_size": 40.0,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1774153257317,
+          "book_age_ms": null
+        },
+        "53461080577874589116998904083660541118617225829367059135598903930356626903283": {
+          "state": "book_ok",
+          "bid_levels": 51,
+          "ask_levels": 48,
+          "best_bid": 0.51,
+          "best_ask": 0.52,
+          "best_bid_size": 40.0,
+          "best_ask_size": 644.0,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1774153257317,
+          "book_age_ms": null
+        },
+        "107441315267165760137932687670822627981262921879434634762603863416762099128802": {
+          "state": "book_ok",
+          "bid_levels": 28,
+          "ask_levels": 71,
+          "best_bid": 0.28,
+          "best_ask": 0.29,
+          "best_bid_size": 13.0,
+          "best_ask_size": 467.32,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1774153257178,
+          "book_age_ms": null
+        },
+        "15084887866957938395445564670457696477553279738408929073844301924613723125364": {
+          "state": "book_ok",
+          "bid_levels": 71,
+          "ask_levels": 28,
+          "best_bid": 0.71,
+          "best_ask": 0.72,
+          "best_bid_size": 467.32,
+          "best_ask_size": 13.0,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1774153257178,
+          "book_age_ms": null
+        }
+      },
+      "tokens_ok": 4,
+      "tokens_blocked": 0,
+      "blocking_state_counts": {}
+    }
+  },
+  "decisions": 666,
+  "order_actions": 1191,
+  "fills": 50,
+  "last_error": null,
+  "symbols": [
+    "BTC",
+    "ETH"
+  ],
+  "runtime_db_path": "tmp/core_mm_runs/kelly-20260321T000000Z/runtime.db",
+  "run_summary_path": "tmp/core_mm_runs/kelly-20260321T000000Z/meta/run_summary.json",
+  "updated_at_ms": 1774153257395,
+  "config": {
+    "symbols": [
+      "BTC",
+      "ETH"
+    ],
+    "min_size": 10.0,
+    "fallback_size": 2.0,
+    "within_pct": 0.06,
+    "trade_size": 12.0,
+    "max_size": 150.0,
+    "reverse_position_min_size": 2.0,
+    "min_order_size": null,
+    "market_dwell_secs": 900.0,
+    "fee_bps": 25.0,
+    "fee_mode": "taker"
+  },
+  "stage": "running"
+}

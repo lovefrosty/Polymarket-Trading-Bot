@@ -1,0 +1,201 @@
+﻿,Market,Direction,EV,Suggested price,Confidence,Tradeable,Why blocked,Action hint
+0,BTC 15m Up/Down,Quote,0,0.815->0.815,Low,YES,,Eligible - monitor entry window
+1,BTC 15m Up/Down,Hold,0,0.185->0.185,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+2,BTC 15m Up/Down,Quote,0,0.835->0.835,Low,YES,,Eligible - monitor entry window
+3,BTC 15m Up/Down,Hold,0,0.165->0.165,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+4,BTC 15m Up/Down,Hold,0,0.820->0.820,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+5,BTC 15m Up/Down,Hold,0,0.180->0.180,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+6,BTC 15m Up/Down,Quote,0,0.835->0.835,Low,YES,,Eligible - monitor entry window
+7,BTC 15m Up/Down,Hold,0,0.165->0.165,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+8,BTC 15m Up/Down,Quote,0,0.835->0.835,Low,YES,,Eligible - monitor entry window
+9,BTC 15m Up/Down,Hold,0,0.165->0.165,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+10,BTC 15m Up/Down,Quote,0,0.855->0.855,Low,YES,,Eligible - monitor entry window
+11,BTC 15m Up/Down,Hold,0,0.145->0.145,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+12,BTC 15m Up/Down,Quote,0,0.865->0.865,Low,YES,,Eligible - monitor entry window
+13,BTC 15m Up/Down,Hold,0,0.135->0.135,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+15,BTC 15m Up/Down,Hold,0,0.155->0.155,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+14,BTC 15m Up/Down,Quote,0,0.845->0.845,Low,YES,,Eligible - monitor entry window
+16,BTC 15m Up/Down,Quote,0,0.845->0.845,Low,YES,,Eligible - monitor entry window
+17,BTC 15m Up/Down,Hold,0,0.155->0.155,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+18,BTC 15m Up/Down,Quote,0,0.815->0.815,Low,YES,,Eligible - monitor entry window
+19,BTC 15m Up/Down,Hold,0,0.185->0.185,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+20,BTC 15m Up/Down,Quote,0,0.815->0.815,Low,YES,,Eligible - monitor entry window
+21,BTC 15m Up/Down,Hold,0,0.185->0.185,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+22,BTC 15m Up/Down,Quote,0,0.815->0.815,Low,YES,,Eligible - monitor entry window
+23,BTC 15m Up/Down,Hold,0,0.185->0.185,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+24,BTC 15m Up/Down,Quote,0,0.815->0.815,Low,YES,,Eligible - monitor entry window
+25,BTC 15m Up/Down,Hold,0,0.185->0.185,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+27,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+26,BTC 15m Up/Down,Hold,0,0.795->0.795,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+28,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+29,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+30,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+31,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+32,BTC 15m Up/Down,Hold,0,0.795->0.795,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+33,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+34,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+35,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+36,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+37,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+39,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+38,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+40,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+41,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+42,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+43,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+44,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+45,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+46,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+47,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+48,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+49,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+51,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+50,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+53,BTC 15m Up/Down,Hold,0,0.215->0.215,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+52,BTC 15m Up/Down,Quote,0,0.785->0.785,Low,YES,,Eligible - monitor entry window
+54,BTC 15m Up/Down,Quote,0,0.785->0.785,Low,YES,,Eligible - monitor entry window
+55,BTC 15m Up/Down,Hold,0,0.215->0.215,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+56,BTC 15m Up/Down,Quote,0,0.785->0.785,Low,YES,,Eligible - monitor entry window
+57,BTC 15m Up/Down,Hold,0,0.215->0.215,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+58,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+59,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+60,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+61,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+62,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+63,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+65,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+64,BTC 15m Up/Down,Hold,0,0.775->0.775,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+66,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+67,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+68,BTC 15m Up/Down,Hold,0,0.775->0.775,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+69,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+70,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+71,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+72,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+73,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+74,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+75,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+77,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+76,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+78,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+79,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+80,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+81,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+82,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+83,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+84,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+85,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+86,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+87,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+89,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+88,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+90,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+91,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+92,BTC 15m Up/Down,Hold,0,0.790->0.790,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+93,BTC 15m Up/Down,Hold,0,0.210->0.210,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+94,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+95,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+96,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+97,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+98,BTC 15m Up/Down,Quote,0,0.755->0.755,Low,YES,,Eligible - monitor entry window
+99,BTC 15m Up/Down,Hold,0,0.245->0.245,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+101,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+100,BTC 15m Up/Down,Hold,0,0.775->0.775,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+102,BTC 15m Up/Down,Quote,0,0.775->0.775,Low,YES,,Eligible - monitor entry window
+103,BTC 15m Up/Down,Hold,0,0.225->0.225,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+104,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+105,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+106,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+107,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+108,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+109,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+110,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+111,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+112,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+113,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+115,BTC 15m Up/Down,Hold,0,0.245->0.245,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+114,BTC 15m Up/Down,Quote,0,0.755->0.755,Low,YES,,Eligible - monitor entry window
+116,BTC 15m Up/Down,Hold,0,0.690->0.690,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+117,BTC 15m Up/Down,Hold,0,0.310->0.310,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+118,BTC 15m Up/Down,Hold,0,0.660->0.660,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+119,BTC 15m Up/Down,Hold,0,0.340->0.340,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+120,BTC 15m Up/Down,Quote,0,0.675->0.675,Low,YES,,Eligible - monitor entry window
+121,BTC 15m Up/Down,Hold,0,0.325->0.325,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+122,BTC 15m Up/Down,Quote,0,0.705->0.705,Low,YES,,Eligible - monitor entry window
+123,BTC 15m Up/Down,Hold,0,0.295->0.295,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+124,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+125,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+127,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+126,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+128,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+129,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+130,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+131,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+132,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+133,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+134,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+135,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+136,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+137,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+139,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+138,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+140,BTC 15m Up/Down,Hold,0,0.735->0.735,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+141,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+142,BTC 15m Up/Down,Quote,0,0.735->0.735,Low,YES,,Eligible - monitor entry window
+143,BTC 15m Up/Down,Hold,0,0.265->0.265,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+144,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+145,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+146,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+147,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+148,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+149,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+151,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+150,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+153,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+152,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+154,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+155,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+156,BTC 15m Up/Down,Quote,0,0.765->0.765,Low,YES,,Eligible - monitor entry window
+157,BTC 15m Up/Down,Hold,0,0.235->0.235,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+158,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+159,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+160,BTC 15m Up/Down,Hold,0,0.805->0.805,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+161,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+163,BTC 15m Up/Down,Hold,0,0.215->0.215,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+162,BTC 15m Up/Down,Quote,0,0.785->0.785,Low,YES,,Eligible - monitor entry window
+164,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+165,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+166,BTC 15m Up/Down,Quote,0,0.795->0.795,Low,YES,,Eligible - monitor entry window
+167,BTC 15m Up/Down,Hold,0,0.205->0.205,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+168,BTC 15m Up/Down,Hold,0,0.800->0.800,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+169,BTC 15m Up/Down,Hold,0,0.200->0.200,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+170,BTC 15m Up/Down,Quote,0,0.785->0.785,Low,YES,,Eligible - monitor entry window
+171,BTC 15m Up/Down,Hold,0,0.215->0.215,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+172,BTC 15m Up/Down,Quote,0,0.835->0.835,Low,YES,,Eligible - monitor entry window
+173,BTC 15m Up/Down,Hold,0,0.165->0.165,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+175,BTC 15m Up/Down,Hold,0,0.155->0.155,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+174,BTC 15m Up/Down,Quote,0,0.845->0.845,Low,YES,,Eligible - monitor entry window
+176,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+177,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+178,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+179,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+180,BTC 15m Up/Down,Hold,0,0.805->0.805,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+181,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+182,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+183,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+184,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+185,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+187,BTC 15m Up/Down,Hold,0,0.175->0.175,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+186,BTC 15m Up/Down,Quote,0,0.825->0.825,Low,YES,,Eligible - monitor entry window
+188,BTC 15m Up/Down,Hold,0,0.805->0.805,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+189,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Price feed invalid,WAIT for spread < 150 bps
+190,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+191,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+192,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+193,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+194,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+195,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+196,BTC 15m Up/Down,Quote,0,0.805->0.805,Low,YES,,Eligible - monitor entry window
+197,BTC 15m Up/Down,Hold,0,0.195->0.195,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps
+198,BTC 15m Up/Down,Quote,0,0.755->0.755,Low,YES,,Eligible - monitor entry window
+199,BTC 15m Up/Down,Hold,0,0.245->0.245,Low,WAIT,Slippage risk high,WAIT for spread < 150 bps

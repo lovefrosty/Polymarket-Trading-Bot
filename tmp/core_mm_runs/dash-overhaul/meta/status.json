@@ -1,0 +1,92 @@
+{
+  "mode": "PAPER",
+  "run_name": "paper BTC Mar21-1817",
+  "market": "btc-updown-15m-1774116900",
+  "markets": [
+    "btc-updown-15m-1774116900"
+  ],
+  "token_ids": [
+    "37395244404247491083976890856737354000241415507697711190087797622030873105239",
+    "89929583613343787918222946568384902489389202987354480580039537756181027720367"
+  ],
+  "feed": {
+    "connected": true,
+    "subscribed_token_ids": [
+      "37395244404247491083976890856737354000241415507697711190087797622030873105239",
+      "89929583613343787918222946568384902489389202987354480580039537756181027720367"
+    ],
+    "received_messages": 35876,
+    "applied_book_updates": 67692
+  },
+  "runner": {
+    "mode": "PAPER",
+    "market_id": "btc-updown-15m-1774116900",
+    "market_ids": [
+      "btc-updown-15m-1774116900"
+    ],
+    "token_ids": [
+      "37395244404247491083976890856737354000241415507697711190087797622030873105239",
+      "89929583613343787918222946568384902489389202987354480580039537756181027720367"
+    ],
+    "has_books": true,
+    "book_diag": {
+      "per_token": {
+        "37395244404247491083976890856737354000241415507697711190087797622030873105239": {
+          "state": "book_ok",
+          "bid_levels": 81,
+          "ask_levels": 18,
+          "best_bid": 0.81,
+          "best_ask": 0.82,
+          "best_bid_size": 62.0,
+          "best_ask_size": 83.22,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1774117362370,
+          "book_age_ms": null
+        },
+        "89929583613343787918222946568384902489389202987354480580039537756181027720367": {
+          "state": "book_ok",
+          "bid_levels": 18,
+          "ask_levels": 81,
+          "best_bid": 0.18,
+          "best_ask": 0.19,
+          "best_bid_size": 83.22,
+          "best_ask_size": 62.0,
+          "min_size": 10.0,
+          "fallback_size": 2.0,
+          "last_update_ms": 1774117362370,
+          "book_age_ms": null
+        }
+      },
+      "tokens_ok": 2,
+      "tokens_blocked": 0,
+      "blocking_state_counts": {}
+    }
+  },
+  "decisions": 296,
+  "order_actions": 584,
+  "fills": 59,
+  "last_error": null,
+  "symbols": [
+    "BTC"
+  ],
+  "runtime_db_path": "tmp/core_mm_runs/dash-overhaul/runtime.db",
+  "run_summary_path": "tmp/core_mm_runs/dash-overhaul/meta/run_summary.json",
+  "updated_at_ms": 1774117362518,
+  "config": {
+    "symbols": [
+      "BTC"
+    ],
+    "min_size": 10.0,
+    "fallback_size": 2.0,
+    "within_pct": 0.06,
+    "trade_size": 12.0,
+    "max_size": 150.0,
+    "reverse_position_min_size": 2.0,
+    "min_order_size": null,
+    "market_dwell_secs": 900.0,
+    "fee_bps": 25.0,
+    "fee_mode": "taker"
+  },
+  "stage": "running"
+}

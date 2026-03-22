@@ -1,0 +1,32 @@
+{
+  "urls": {},
+  "forbidden_activity": [],
+  "requests": {},
+  "memory_leak_top_5": [
+    {
+      "file": "<frozen importlib._bootstrap_external>",
+      "line": 780,
+      "size_diff": 4632961
+    },
+    {
+      "file": "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/json/decoder.py",
+      "line": 360,
+      "size_diff": 2441514
+    },
+    {
+      "file": "/Users/padraigjudge/Desktop/Polymarket Bot/core/market_discovery.py",
+      "line": 295,
+      "size_diff": 962912
+    },
+    {
+      "file": "<frozen importlib._bootstrap>",
+      "line": 488,
+      "size_diff": 521749
+    },
+    {
+      "file": "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/dataclasses.py",
+      "line": 498,
+      "size_diff": 287408
+    }
+  ]
+}

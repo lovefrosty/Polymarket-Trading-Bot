@@ -1,0 +1,26 @@
+{
+  "decisions": 30,
+  "fills": 23,
+  "final": false,
+  "per_token": {
+    "33353687849911013304404774439714356651095918083320857231367025139929342619330": {
+      "cumulative_fees": 0.6723,
+      "realized_net_pnl": 0.40769999999998896,
+      "turnover": 268.9199999999999,
+      "unrealized_pnl": 0.7800000000000007
+    },
+    "7300408910832822626435720677033647936833152425609984771190924103744584742788": {
+      "cumulative_fees": 0.6723,
+      "realized_net_pnl": 0.40769999999998896,
+      "turnover": 268.9199999999999,
+      "unrealized_pnl": 0.0
+    }
+  },
+  "realized_gross_pnl": 1.079999999999989,
+  "realized_net_pnl": 0.524399999999989,
+  "runtime_db_path": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/paper-smoke-bookdiag-20260315T212319Z/runtime.db",
+  "total_fees": 0.6723,
+  "turnover": 268.9199999999999,
+  "unrealized_pnl": 0.7800000000000007,
+  "updated_at_ms": 1773609926723
+}

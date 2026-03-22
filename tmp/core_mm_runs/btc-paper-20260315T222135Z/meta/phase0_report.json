@@ -1,0 +1,69 @@
+{
+  "activity": {
+    "cycles_total": 1433,
+    "freeze_cycles": 14,
+    "freeze_reason_counts": {
+      "book_absent": 28
+    },
+    "inactive_ratio": 0.8046057222609909,
+    "no_quote_cycles": 1139,
+    "no_quote_reason_counts": {
+      "ask_fallback_top_ask": 1463,
+      "ask_improve": 301,
+      "ask_improve_avg_cost_floor": 440,
+      "ask_join": 57,
+      "ask_join_avg_cost_floor": 17,
+      "bid_fallback_top_bid": 1856,
+      "bid_improve": 348,
+      "bid_join": 74,
+      "flow_blocks_buy": 1268,
+      "flow_blocks_sell": 1070,
+      "sleep_active": 1814,
+      "stop_loss": 116,
+      "take_profit": 61
+    },
+    "quoteable_cycles": 280,
+    "quoteable_ratio": 0.19539427773900908
+  },
+  "economics": {
+    "realized_net_pnl": 23.932249999999982,
+    "total_fees": 3.3277500000000013,
+    "total_pnl": 17.11424999999998,
+    "turnover": 1331.099999999999,
+    "unrealized_pnl": -6.818000000000001
+  },
+  "execution_quality": {
+    "avg_fee_bps": 25.0,
+    "avg_markout_1s_bps": 181.9322989773283,
+    "avg_markout_5s_bps": 95.09074328651808,
+    "avg_net_edge_bps": 118.27132173186294,
+    "avg_realized_spread_bps": 143.27132173186294,
+    "negative_markout_1s_rate": 0.21808510638297873,
+    "negative_markout_5s_rate": 0.4095744680851064,
+    "negative_net_edge_rate": 0.18085106382978725
+  },
+  "fills": {
+    "canceled_orders": 81,
+    "fill_rate": 0.6886446886446886,
+    "fills": 188,
+    "placed_orders": 273
+  },
+  "market": "btc-updown-15m-1773614700",
+  "mode": "PAPER",
+  "phase0_acceptance": {
+    "economics_ready_for_phase1": true,
+    "fills_present": true,
+    "loss_source_hints": [],
+    "manual_tuning_review_required": false,
+    "net_pnl_non_negative": true,
+    "quoteable_cycles_present": true,
+    "rationale": "economics_non_negative",
+    "result": "pass",
+    "structural_blocker_detected": false
+  },
+  "recommendation": "phase0_passed_ready_for_breadth",
+  "runtime_root": "/Users/padraigjudge/Desktop/Polymarket Bot/tmp/core_mm_runs/btc-paper-20260315T222135Z",
+  "symbols": [
+    "BTC"
+  ]
+}

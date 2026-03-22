@@ -1,0 +1,9 @@
+# Portfolio risk constraints for scientific_method backtests.
+max_gross_delta: 1.0
+max_net_delta: 0.3
+max_position_fraction: 0.15
+max_asset_fraction: 0.25
+max_drawdown_pct: 0.10
+drawdown_lookback_days: 7
+min_liquidity_ratio: 5.0
+max_open_positions: 5

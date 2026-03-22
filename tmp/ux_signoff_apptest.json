@@ -1,0 +1,147 @@
+{
+  "trader": {
+    "mode": "Trader",
+    "dataframe_count": 20,
+    "id_leaks": [],
+    "has_reason_column": true,
+    "tab_labels": [
+      "Overview",
+      "Health (A-E)",
+      "Signals",
+      "Inventory & Quotes",
+      "Microstructure",
+      "Logs"
+    ]
+  },
+  "developer": {
+    "mode": "Developer",
+    "dataframe_count": 29,
+    "id_leaks": [
+      {
+        "index": 8,
+        "columns": [
+          "ts_ms",
+          "decision_id",
+          "market",
+          "token_id",
+          "max_feature_ts_ms",
+          "decision_ts_event_ms",
+          "violation",
+          "ts"
+        ]
+      },
+      {
+        "index": 9,
+        "columns": [
+          "ts_ms",
+          "token_id",
+          "book_health_state",
+          "book_age_p50_ms",
+          "book_age_p95_ms",
+          "ws_recv_rate_msgs_min",
+          "ts"
+        ]
+      },
+      {
+        "index": 14,
+        "columns": [
+          "ts_ms",
+          "token_id",
+          "sample_count",
+          "p50_realized_spread_bps",
+          "p95_realized_spread_bps",
+          "p50_markout_5s_bps",
+          "p95_markout_5s_bps",
+          "p50_net_edge_bps",
+          "p95_net_edge_bps"
+        ]
+      },
+      {
+        "index": 15,
+        "columns": [
+          "ts_ms",
+          "token_id",
+          "post_only_reject_rate",
+          "cancel_to_fill_ratio",
+          "time_to_first_fill_p50_s",
+          "time_to_first_fill_p95_s",
+          "partial_fill_count",
+          "orders_per_min",
+          "cancels_per_min",
+          "fills_per_min",
+          "ts"
+        ]
+      },
+      {
+        "index": 17,
+        "columns": [
+          "ts_ms",
+          "recovery_action",
+          "token_id",
+          "side",
+          "order_id"
+        ]
+      },
+      {
+        "index": 21,
+        "columns": [
+          "ts_ms",
+          "token_id",
+          "book_health_state",
+          "book_age_p95_ms"
+        ]
+      },
+      {
+        "index": 23,
+        "columns": [
+          "ts_ms",
+          "token_id",
+          "yes_qty",
+          "no_qty",
+          "usdc",
+          "source",
+          "net_qty",
+          "ts"
+        ]
+      },
+      {
+        "index": 24,
+        "columns": [
+          "token_id",
+          "avg_bid",
+          "avg_ask",
+          "mid",
+          "bid_offset",
+          "ask_offset"
+        ]
+      },
+      {
+        "index": 25,
+        "columns": [
+          "as_of_ts",
+          "token_id",
+          "market_slug",
+          "symbol",
+          "yes_qty",
+          "no_qty",
+          "net_shares",
+          "avg_entry",
+          "mark_source",
+          "mark",
+          "unrealized_pnl"
+        ]
+      }
+    ],
+    "has_reason_column": true,
+    "tab_labels": [
+      "Overview",
+      "Rollover",
+      "Health (A-E)",
+      "Signals",
+      "Inventory & Quotes",
+      "Portfolio",
+      "Microstructure",
+      "Logs"
+    ]
+  }
+}
