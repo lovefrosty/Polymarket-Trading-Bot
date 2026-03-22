@@ -245,7 +245,7 @@ async def _main() -> None:
     on_applied_update = runner.broker.sweep_fills if hasattr(runner.broker, "sweep_fills") else None
     if is_kalshi:
         from core_mm.kalshi.market_feed import KalshiMarketFeed
-        feed = KalshiMarketFeed(client=kalshi_client, book_manager=runner.book_manager, tickers=(), on_applied_update=on_applied_update)
+        feed = KalshiMarketFeed(client=kalshi_client, book_manager=runner.book_manager, tickers=(), on_applied_update=on_applied_update, poll_interval_secs=0.5)
     else:
         feed = PolymarketMarketFeed(book_manager=runner.book_manager, token_ids=(), on_applied_update=on_applied_update)
 
