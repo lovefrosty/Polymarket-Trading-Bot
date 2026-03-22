@@ -2446,16 +2446,16 @@ def render_dashboard() -> None:
     if st is None:
         raise RuntimeError("streamlit_not_installed")
 
-    st.set_page_config(page_title="POLYMARKET TERMINAL", layout="wide", page_icon="")
+    st.set_page_config(page_title="TRADING SPACESTATION", layout="wide", page_icon="")
     st.markdown(TERMINAL_CSS, unsafe_allow_html=True)
     st.markdown(
         '<h1 style="font-family:Orbitron,monospace;font-size:1.6em;margin-bottom:0;'
         'background:linear-gradient(90deg,#00f0ff,#05ffa1);-webkit-background-clip:text;'
         '-webkit-text-fill-color:transparent;text-shadow:none;">'
-        'POLYMARKET TERMINAL</h1>',
+        'TRADING SPACESTATION</h1>',
         unsafe_allow_html=True,
     )
-    st.caption("Autonomous market-making engine // Live runtime")
+    st.caption("Autonomous market-making engine across Polymarket & Kalshi")
 
     if _runtime_schema_missing():
         st.markdown(
