@@ -51,12 +51,18 @@ class KalshiMarketSelector:
     def select_markets(self, now_ts: Optional[int] = None) -> List[MarketCandidate]:
         """Fetch open markets from Kalshi and return scored candidates."""
         now_ts = now_ts or int(time.time())
+        # Try with series filter first; fall back to unfiltered if nothing found
         raw_markets = self._client.get_markets(
             status="open",
             limit=100,
             series_ticker=self.config.series_ticker,
             event_ticker=self.config.event_ticker,
         )
+        if not raw_markets and self.config.series_ticker:
+            raw_markets = self._client.get_markets(
+                status="open",
+                limit=100,
+            )
         candidates: List[MarketCandidate] = []
         for m in raw_markets:
             candidate = _to_candidate(m, self.config, now_ts)

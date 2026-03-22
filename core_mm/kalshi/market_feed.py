@@ -126,12 +126,23 @@ def _apply_kalshi_book(book_manager: BookManager, ticker: str, ob: object) -> in
     if not isinstance(ob, dict):
         return 0
 
-    yes_levels = ob.get("yes") or []
-    no_levels = ob.get("no") or []
+    # Handle both formats:
+    # Legacy/test: {"yes": [[cents, qty], ...], "no": [...]}
+    # Live API:    {"orderbook_fp": {"yes_dollars": [["0.45", "100"], ...], "no_dollars": [...]}}
+    inner = ob.get("orderbook_fp") or ob.get("orderbook") or ob
+    yes_dollars = inner.get("yes_dollars")
+    no_dollars = inner.get("no_dollars")
 
-    # Parse raw levels: [[price_cents, qty], ...]
-    yes_parsed = _parse_cent_levels(yes_levels)
-    no_parsed = _parse_cent_levels(no_levels)
+    if yes_dollars is not None or no_dollars is not None:
+        # Dollar-string format from live API: [["0.45", "100.00"], ...]
+        yes_parsed = _parse_dollar_levels(yes_dollars or [])
+        no_parsed = _parse_dollar_levels(no_dollars or [])
+    else:
+        # Cent format from tests: [[45, 100], ...]
+        yes_levels = inner.get("yes") or []
+        no_levels = inner.get("no") or []
+        yes_parsed = _parse_cent_levels(yes_levels)
+        no_parsed = _parse_cent_levels(no_levels)
 
     applied = 0
 
@@ -168,6 +179,30 @@ def _parse_cent_levels(raw: object) -> List[Level]:
         if qty <= 0 or price_cents <= 0:
             continue
         parsed.append((price_cents / 100.0, qty))
+    return parsed
+
+
+def _parse_dollar_levels(raw: object) -> List[Level]:
+    """Parse [["0.45", "100.00"], ...] → [(0.45, 100.0), ...].
+
+    Kalshi's live API returns ``orderbook_fp.yes_dollars`` and
+    ``orderbook_fp.no_dollars`` as lists of string pairs already in
+    dollar denomination.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    parsed: List[Level] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            price = float(item[0])
+            qty = float(item[1])
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0 or price <= 0:
+            continue
+        parsed.append((price, qty))
     return parsed
 
 
