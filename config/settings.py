@@ -6,6 +6,12 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 @dataclass(frozen=True)
 class AutoDiscoverSpec:
