@@ -182,6 +182,51 @@ def test_get_open_orders_delegates() -> None:
     mock_exec.get_open_orders.assert_called_once()
 
 
+def test_startup_reconcile_passes_when_flat_and_no_orders() -> None:
+    broker = _broker()
+    report = broker.startup_reconcile()
+    assert report["ok"] is True
+    assert report["status"] == "reconciled"
+    assert report["open_order_count"] == 0
+    assert report["position_count"] == 0
+
+
+def test_startup_reconcile_blocks_on_resting_orders() -> None:
+    mock_exec = _mock_exec()
+    mock_exec.get_open_orders.return_value = ExecutionResult(
+        True,
+        {"orders": [{"order_id": "live-1", "token_id": "t1", "side": "buy", "price": 0.25, "size": 1.0}]},
+    )
+    broker = _broker(execution_adapter=mock_exec)
+    report = broker.startup_reconcile()
+    assert report["ok"] is False
+    assert report["reason"] == "resting_orders_present"
+    assert report["open_order_count"] == 1
+
+
+def test_startup_reconcile_blocks_on_nonflat_positions() -> None:
+    mock_exec = _mock_exec()
+    mock_exec.get_positions.return_value = ExecutionResult(
+        True,
+        {"positions": [{"token_id": "t1", "size": 2.0}]},
+    )
+    broker = _broker(execution_adapter=mock_exec)
+    report = broker.startup_reconcile()
+    assert report["ok"] is False
+    assert report["reason"] == "nonflat_positions_present"
+    assert report["position_count"] == 1
+
+
+def test_startup_reconcile_blocks_on_position_fetch_error() -> None:
+    mock_exec = _mock_exec()
+    mock_exec.get_positions.return_value = ExecutionResult(False, {}, error="boom")
+    broker = _broker(execution_adapter=mock_exec)
+    report = broker.startup_reconcile()
+    assert report["ok"] is False
+    assert report["status"] == "blocked"
+    assert "positions_fetch_failed" in str(report["reason"])
+
+
 def test_sweep_fills_is_noop() -> None:
     broker = _broker()
     assert broker.sweep_fills() == []

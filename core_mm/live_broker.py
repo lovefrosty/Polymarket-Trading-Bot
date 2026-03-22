@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 import time
 from typing import Any, Dict, List, Optional
 
 from core_mm.execution import ExecutionAdapter, ExecutionResult
 from core_mm.positions import PositionTracker
+
+
+@dataclass(frozen=True)
+class StartupReconciliationReport:
+    ok: bool
+    status: str
+    reason: Optional[str]
+    checked_at_ms: int
+    open_order_count: int
+    position_count: int
+    open_orders: List[Dict[str, Any]]
+    positions: List[Dict[str, Any]]
 
 
 class LiveBroker:
@@ -45,6 +58,7 @@ class LiveBroker:
         self._fifo_entries: Dict[str, List[List[float]]] = defaultdict(list)
         self._duration_total_weighted_ms: float = 0.0
         self._duration_total_closed_qty: float = 0.0
+        self._last_startup_reconciliation: Dict[str, Any] = {}
 
     @property
     def position_tracker(self) -> PositionTracker:
@@ -113,6 +127,81 @@ class LiveBroker:
 
     def get_positions(self) -> ExecutionResult:
         return self._exec.get_positions()
+
+    @property
+    def last_startup_reconciliation(self) -> Dict[str, Any]:
+        return dict(self._last_startup_reconciliation)
+
+    def startup_reconcile(self) -> Dict[str, Any]:
+        checked_at_ms = _now_ms()
+        orders_result = self.get_open_orders()
+        if not orders_result.success:
+            report = StartupReconciliationReport(
+                ok=False,
+                status="blocked",
+                reason=f"open_orders_fetch_failed: {orders_result.error or 'unknown_error'}",
+                checked_at_ms=checked_at_ms,
+                open_order_count=-1,
+                position_count=-1,
+                open_orders=[],
+                positions=[],
+            )
+            self._last_startup_reconciliation = _reconciliation_to_dict(report)
+            return self.last_startup_reconciliation
+
+        positions_result = self.get_positions()
+        if not positions_result.success:
+            report = StartupReconciliationReport(
+                ok=False,
+                status="blocked",
+                reason=f"positions_fetch_failed: {positions_result.error or 'unknown_error'}",
+                checked_at_ms=checked_at_ms,
+                open_order_count=len(_extract_orders(orders_result.payload)),
+                position_count=-1,
+                open_orders=_extract_orders(orders_result.payload),
+                positions=[],
+            )
+            self._last_startup_reconciliation = _reconciliation_to_dict(report)
+            return self.last_startup_reconciliation
+
+        open_orders = _extract_orders(orders_result.payload)
+        positions = _extract_positions(positions_result.payload)
+        nonflat_positions = [position for position in positions if _position_is_nonflat(position)]
+        if open_orders:
+            report = StartupReconciliationReport(
+                ok=False,
+                status="blocked",
+                reason="resting_orders_present",
+                checked_at_ms=checked_at_ms,
+                open_order_count=len(open_orders),
+                position_count=len(nonflat_positions),
+                open_orders=open_orders,
+                positions=nonflat_positions,
+            )
+        elif nonflat_positions:
+            report = StartupReconciliationReport(
+                ok=False,
+                status="blocked",
+                reason="nonflat_positions_present",
+                checked_at_ms=checked_at_ms,
+                open_order_count=0,
+                position_count=len(nonflat_positions),
+                open_orders=[],
+                positions=nonflat_positions,
+            )
+        else:
+            report = StartupReconciliationReport(
+                ok=True,
+                status="reconciled",
+                reason=None,
+                checked_at_ms=checked_at_ms,
+                open_order_count=0,
+                position_count=0,
+                open_orders=[],
+                positions=[],
+            )
+        self._last_startup_reconciliation = _reconciliation_to_dict(report)
+        return self.last_startup_reconciliation
 
     # ── Fill tracking (fed from user WebSocket) ──────────────────────
 
@@ -225,3 +314,57 @@ class LiveBroker:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _extract_orders(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    orders = payload.get("orders") if isinstance(payload, dict) else []
+    if not isinstance(orders, list):
+        return []
+    return [order for order in orders if isinstance(order, dict)]
+
+
+def _extract_positions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    positions = payload.get("positions") if isinstance(payload, dict) else []
+    if not isinstance(positions, list):
+        return []
+    return [position for position in positions if isinstance(position, dict)]
+
+
+def _position_is_nonflat(position: Dict[str, Any]) -> bool:
+    numeric_keys = (
+        "size",
+        "count",
+        "position",
+        "quantity",
+        "remaining_count",
+        "yes_count",
+        "no_count",
+        "net_position",
+    )
+    observed = False
+    for key in numeric_keys:
+        value = position.get(key)
+        if value in (None, ""):
+            continue
+        observed = True
+        try:
+            if abs(float(value)) > 1e-9:
+                return True
+        except (TypeError, ValueError):
+            return True
+    if not observed:
+        return bool(position)
+    return False
+
+
+def _reconciliation_to_dict(report: StartupReconciliationReport) -> Dict[str, Any]:
+    return {
+        "ok": bool(report.ok),
+        "status": report.status,
+        "reason": report.reason,
+        "checked_at_ms": int(report.checked_at_ms),
+        "open_order_count": int(report.open_order_count),
+        "position_count": int(report.position_count),
+        "open_orders": list(report.open_orders),
+        "positions": list(report.positions),
+    }

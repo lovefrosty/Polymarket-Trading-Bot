@@ -29,6 +29,19 @@ def _write_status(meta_dir: Path, payload: Dict[str, Any]) -> None:
     (meta_dir / "status.json").write_text(json.dumps(payload, indent=2))
 
 
+def _read_optional_json(path_str: str | None) -> Dict[str, Any]:
+    if not path_str:
+        return {}
+    path = Path(path_str)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _parse_args() -> argparse.Namespace:
     settings = load_settings()
     parser = argparse.ArgumentParser(description="Standalone core_mm runner")
@@ -71,6 +84,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-order-notional", type=float, default=5.0, help="Max notional per order in LIVE mode (USD)")
     parser.add_argument("--max-position-notional", type=float, default=10.0, help="Max position notional per token in LIVE mode (USD)")
     parser.add_argument("--max-daily-loss", type=float, default=3.0, help="Max daily loss before LIVE mode shuts down (USD)")
+    parser.add_argument("--kill-switch-report", default=None, help="Optional JSON report path from scripts/test_kill_switch.py")
     return parser.parse_args()
 
 
@@ -89,6 +103,8 @@ async def _main() -> None:
     runtime_root = Path(args.runtime_root)
     meta_dir = runtime_root / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
+    startup_reconciliation: Dict[str, Any] = {"status": "not_applicable", "ok": args.mode != "LIVE"}
+    kill_switch_validation = _read_optional_json(args.kill_switch_report) or {"status": "not_run"}
     _write_status(
         meta_dir,
         {
@@ -106,6 +122,8 @@ async def _main() -> None:
             "fills": 0,
             "fill_rate_snapshot": 0.0,
             "last_error": None,
+            "startup_reconciliation": startup_reconciliation,
+            "kill_switch_validation": kill_switch_validation,
             "symbols": list(symbols),
             "updated_at_ms": int(time.time() * 1000),
         },
@@ -211,6 +229,41 @@ async def _main() -> None:
                 api_passphrase=settings.polymarket_passphrase,
             )
             print(f"[LIVE] Broker ready. Risk limits: order=${args.max_order_notional}, pos=${args.max_position_notional}, daily_loss=${args.max_daily_loss}")
+
+    if args.mode == "LIVE" and live_broker is not None:
+        startup_reconciliation = live_broker.startup_reconcile()
+        print(
+            "[LIVE] Startup reconciliation: "
+            f"status={startup_reconciliation.get('status')} "
+            f"ok={startup_reconciliation.get('ok')} "
+            f"open_orders={startup_reconciliation.get('open_order_count')} "
+            f"positions={startup_reconciliation.get('position_count')}"
+        )
+        if not startup_reconciliation.get("ok"):
+            _write_status(
+                meta_dir,
+                {
+                    "mode": args.mode,
+                    "stage": "startup_reconciliation_blocked",
+                    "run_name": args.run_name,
+                    "market": None,
+                    "token_ids": [],
+                    "feed": {"connected": False, "subscribed_token_ids": [], "received_messages": 0, "applied_book_updates": 0},
+                    "runner": {"mode": args.mode, "market_id": None, "token_ids": [], "has_books": False, "selection": {}, "active_market_health": {}},
+                    "selection": {},
+                    "active_market_health": {},
+                    "decisions": 0,
+                    "order_actions": 0,
+                    "fills": 0,
+                    "fill_rate_snapshot": 0.0,
+                    "last_error": f"startup_reconciliation_blocked: {startup_reconciliation.get('reason') or 'unknown'}",
+                    "startup_reconciliation": startup_reconciliation,
+                    "kill_switch_validation": kill_switch_validation,
+                    "symbols": list(symbols),
+                    "updated_at_ms": int(time.time() * 1000),
+                },
+            )
+            raise RuntimeError(f"startup_reconciliation_blocked: {startup_reconciliation.get('reason') or 'unknown'}")
 
     complement_arb_config = ComplementArbConfig(
         enabled=args.complement_arb,
@@ -413,6 +466,8 @@ async def _main() -> None:
                 "fills": fills_count,
                 "fill_rate_snapshot": float(fills_count / max(orders, 1)),
                 "last_error": last_error,
+                "startup_reconciliation": startup_reconciliation,
+                "kill_switch_validation": kill_switch_validation,
                 "symbols": list(symbols),
                 "runtime_db_path": telemetry.db_path.as_posix(),
                 "run_summary_path": (telemetry.meta_dir / "run_summary.json").as_posix(),

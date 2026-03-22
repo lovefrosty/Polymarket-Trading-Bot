@@ -25,9 +25,9 @@ The bot requires two types of information:
 | `POLYMARKET_PRIVATE_KEY` | LIVE mode signing | Polymarket dashboard (hex format) |
 | `KALSHI_API_KEY_ID` | Kalshi trading | Kalshi dashboard → API Keys |
 | `KALSHI_PRIVATE_KEY_PATH` | Kalshi request signing | Generate locally, upload public key to Kalshi |
-| `KALSHI_BASE_URL` | Kalshi connectivity | Demo: `https://demo-api.kalshi.co` or Prod: `https://trading-api.kalshi.com` |
+| `KALSHI_BASE_URL` | Kalshi connectivity | Demo: `https://demo-api.kalshi.co` or Prod: `https://api.elections.kalshi.com` |
 
-**Security note:** All credentials are in `.env`, which is in `.gitignore` and will never be committed.
+**Security note:** Keep `.env` local-only and keep PEM files under `./secrets/`. Do not push until `git ls-files '*.pem'` is empty.
 
 ### 2. Market & Strategy Parameters (CLI args)
 
@@ -140,7 +140,7 @@ python3 scripts/run_core_mm.py \
 
 **Kalshi example (production):**
 ```bash
-KALSHI_BASE_URL=https://trading-api.kalshi.com python3 scripts/run_core_mm.py \
+KALSHI_BASE_URL=https://api.elections.kalshi.com python3 scripts/run_core_mm.py \
   --exchange kalshi \
   --mode LIVE \
   --runtime-root tmp/runs/kalshi-live-001 \
@@ -273,7 +273,7 @@ python3 scripts/run_dashboard.py
 
 ### RSA signature errors (Kalshi only)
 - **Private key path incorrect** — Check `KALSHI_PRIVATE_KEY_PATH` in `.env`
-- **Private key file not readable** — Verify `chmod +r kalshi-private-key.pem`
+- **Private key file not readable** — Verify `chmod +r secrets/kalshi-private-key.pem`
 - **Public key not uploaded** — Upload the `.pem` to Kalshi dashboard
 
 ---

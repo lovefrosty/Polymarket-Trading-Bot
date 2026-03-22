@@ -149,12 +149,16 @@ cache_gamma_markets.json
 cache_gamma_slug_markets.json
 *.sqlite
 node_modules/
+*.pem
+secrets/
 
 # Runtime artifacts (never commit)
 runtime.db
 runtime.db-*
 *.db-wal
 *.db-shm
+tmp/core_mm_runs/
+tmp/test-run/
 tmp/smoke_*/
 tmp/smoke_fix_*/
 tmp/smoke_fix2_*/

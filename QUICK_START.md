@@ -14,11 +14,11 @@
 - [ ] `POLYMARKET_PRIVATE_KEY`
 
 ### For Kalshi
-- [ ] RSA private key generated: `openssl genrsa -out kalshi-private-key.pem 4096`
+- [ ] RSA private key generated in local-only folder: `mkdir -p secrets && openssl genrsa -out secrets/kalshi-private-key.pem 4096`
 - [ ] Public key uploaded to Kalshi dashboard
 - [ ] `KALSHI_API_KEY_ID` (from dashboard)
-- [ ] `KALSHI_PRIVATE_KEY_PATH=./kalshi-private-key.pem`
-- [ ] `KALSHI_BASE_URL=https://demo-api.kalshi.co` (or production URL)
+- [ ] `KALSHI_PRIVATE_KEY_PATH=./secrets/kalshi-private-key.pem`
+- [ ] `KALSHI_BASE_URL=https://api.elections.kalshi.com` (or demo URL)
 
 ---
 
@@ -46,12 +46,12 @@ python3 scripts/run_core_mm.py --exchange kalshi --mode PAPER --runtime-root tmp
 
 ### Kalshi — Paper Trade (Production)
 ```bash
-KALSHI_BASE_URL=https://trading-api.kalshi.com python3 scripts/run_core_mm.py --exchange kalshi --mode PAPER --runtime-root tmp/runs/kalshi-paper-prod
+KALSHI_BASE_URL=https://api.elections.kalshi.com python3 scripts/run_core_mm.py --exchange kalshi --mode PAPER --runtime-root tmp/runs/kalshi-paper-prod
 ```
 
 ### Kalshi — Live (Production, Small Limits)
 ```bash
-KALSHI_BASE_URL=https://trading-api.kalshi.com python3 scripts/run_core_mm.py --exchange kalshi --mode LIVE --runtime-root tmp/runs/kalshi-live-001 --max-order-notional 5.0 --max-position-notional 10.0 --max-daily-loss 3.0
+KALSHI_BASE_URL=https://api.elections.kalshi.com python3 scripts/run_core_mm.py --exchange kalshi --mode LIVE --runtime-root tmp/runs/kalshi-live-001 --max-order-notional 5.0 --max-position-notional 10.0 --max-daily-loss 3.0
 ```
 
 ### Both Exchanges (Side-by-Side)
@@ -105,11 +105,11 @@ python3 scripts/run_dashboard.py  # then open http://localhost:8501
 # Check what changed
 git status
 
-# Commit changes
-git add -A
+# Commit only code/docs/tests
+git add <intended files>
 git commit -m "Update strategy params"
 
-# Push to GitHub
+# Push to a private remote first
 git push origin main
 
 # Create a feature branch
@@ -131,6 +131,7 @@ git push origin main
 
 ### "Kalshi credentials missing"
 → Check `.env` has `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH`
+→ Keep PEMs under `./secrets/`, not repo root
 
 ### "No markets found"
 → Check symbol matches available markets on the exchange
@@ -154,6 +155,7 @@ python3 -m pytest tests/core_mm/ -v
 ## Files to Know
 
 - **`.env`** — Your credentials (create from `.env.template`, don't commit)
+- **`docs/REPO_HYGIENE.md`** — Safe local secrets + private Git workflow
 - **`SETUP.md`** — Full setup guide
 - **`QUICK_START.md`** — This file
 - **`core_mm/kalshi/`** — Kalshi adapter code

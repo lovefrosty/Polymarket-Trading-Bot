@@ -72,31 +72,32 @@ POLYMARKET_API_KEY=... python3 scripts/run_core_mm.py \
 
 ### Step 2: Generate RSA Keypair
 ```bash
-# Generate 4096-bit RSA key pair
-openssl genrsa -out kalshi-private-key.pem 4096
+# Generate 4096-bit RSA key pair in a local-only folder
+mkdir -p secrets
+openssl genrsa -out secrets/kalshi-private-key.pem 4096
 
 # Extract public key
-openssl rsa -in kalshi-private-key.pem -pubout -out kalshi-public-key.pem
+openssl rsa -in secrets/kalshi-private-key.pem -pubout -out secrets/kalshi-public-key.pem
 
 # View the public key (you'll upload this)
-cat kalshi-public-key.pem
+cat secrets/kalshi-public-key.pem
 ```
 
 ### Step 3: Upload to Kalshi & Get API Key
 1. Log into Kalshi dashboard
 2. Settings → API Keys → Create New Key
-3. Upload your `kalshi-public-key.pem` content
+3. Upload your `secrets/kalshi-public-key.pem` content
 4. Copy the **API Key ID** (looks like `kalshi_aK9xyz...`)
 5. Save it securely
 
 ### Step 4: Update `.env`
 ```bash
 KALSHI_API_KEY_ID=kalshi_aK9xyz...
-KALSHI_PRIVATE_KEY_PATH=./kalshi-private-key.pem
-KALSHI_BASE_URL=https://demo-api.kalshi.co
+KALSHI_PRIVATE_KEY_PATH=./secrets/kalshi-private-key.pem
+KALSHI_BASE_URL=https://api.elections.kalshi.com
 ```
 
-**Important:** The private key (`kalshi-private-key.pem`) is in `.gitignore` and will never be committed.
+**Important:** Keep the private key under `./secrets/`. It is ignored by Git and should never be committed.
 
 ---
 
