@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from core.classic_signals import ClassicSignalConfig, ClassicSignalState
 from core.decision_tape import DecisionRecord, DecisionTape, TimeMapper
 from core.entry_exit_rules import EntryExitParams, PositionState, entry_gate, exit_gate
 from core.execution_model import FeeModel
@@ -60,6 +61,11 @@ class DecisionEngineConfig:
     pf_z_clip: float = 4.0
     pf_vol_dampen_enabled: bool = True
     pf_vol_floor: float = 0.6
+    classic_signals_enabled: bool = True
+    classic_signals_skew_enabled: bool = False
+    classic_signals_max_skew_bps: float = 0.0
+    classic_signals_inventory_regime_enabled: bool = False
+    classic_signal_config: ClassicSignalConfig = field(default_factory=ClassicSignalConfig)
 
 
 class DecisionEngine:
@@ -91,6 +97,7 @@ class DecisionEngine:
         self._market_meta = market_meta or {}
         self._reference_aggregator = reference_aggregator
         self._signal_states: Dict[str, ReferenceSignalState] = {}
+        self._classic_signal_states: Dict[str, ClassicSignalState] = {}
         self._positions: Dict[str, PositionState] = {}
         self._feature_states: Dict[str, ReferenceFeatureState] = {}
         self._feature_config = default_feature_config()
@@ -358,6 +365,38 @@ class DecisionEngine:
                     except FeatureBuildError as exc:
                         model_blockers.append(exc.code)
 
+        p_fair_model_value = p_fair_value
+        classic_snapshot = None
+        classic_snapshot_payload = None
+        if self.config.classic_signals_enabled:
+            classic_state = self._classic_signal_states.setdefault(
+                asset_id,
+                ClassicSignalState(config=self.config.classic_signal_config),
+            )
+            classic_snapshot = classic_state.update(
+                as_of_ts_ms=wall_ms,
+                market_as_of_ts_ms=book.last_event_ts_ms,
+                fair_as_of_ts_ms=_classic_fair_asof_ts_ms(ref_result),
+                p_fair=p_fair_value,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                best_bid_size=best_bid_size,
+                best_ask_size=best_ask_size,
+            )
+            classic_snapshot_payload = classic_snapshot.as_dict()
+            signals["trend_score"] = classic_snapshot.trend_score
+            signals["momentum_score"] = classic_snapshot.momentum_score
+            signals["residual_zscore"] = classic_snapshot.residual_zscore
+            signals["mean_reversion_score"] = classic_snapshot.mean_reversion_score
+        classic_overlay = _classic_signal_overlay(
+            classic_snapshot=classic_snapshot,
+            skew_enabled=self.config.classic_signals_skew_enabled,
+            max_skew_bps=self.config.classic_signals_max_skew_bps,
+            inventory_regime_enabled=self.config.classic_signals_inventory_regime_enabled,
+        )
+        classic_overlay["p_fair_model"] = p_fair_model_value
+        p_fair_value = _apply_classic_signal_overlay(p_fair_model_value, classic_overlay)
+        classic_overlay["p_fair_adjusted"] = p_fair_value
         signals["p_fair"] = p_fair_value
 
         fee_mode = _fee_mode_from_execution(self.config.execution_mode)
@@ -528,7 +567,9 @@ class DecisionEngine:
             edge_net_sell=edge_net_sell,
             p_star=p_star_payload,
             labels=None,
-            features_raw=None,
+            features_raw={
+                "classic_signals": None if classic_snapshot_payload is None else dict(classic_snapshot_payload)
+            },
             features_ortho=None,
             whitening=None,
             gates={"allow": ok, "reasons": reasons},
@@ -583,6 +624,8 @@ class DecisionEngine:
                     "blockers": dpds_result.blockers,
                 },
                 "signals": signals,
+                "classic_signals": classic_snapshot_payload,
+                "classic_signal_overlay": classic_overlay,
                 "onchain_signals": onchain_signals,
                 "chosen_action": chosen_action,
                 "entry_gate": {
@@ -718,7 +761,66 @@ def _default_signals() -> Dict[str, Optional[float]]:
         "tox_10s": None,
         "z_revert": None,
         "vol_ewma": None,
+        "trend_score": None,
+        "momentum_score": None,
+        "mean_reversion_score": None,
+        "residual_zscore": None,
     }
+
+
+def _classic_fair_asof_ts_ms(result: Optional[ReferencePriceResult]) -> Optional[int]:
+    if result is None:
+        return None
+    if result.price is not None and result.price.ts_event_ms is not None:
+        return int(result.price.ts_event_ms)
+    if result.pstar_asof_wall_ms is not None:
+        return int(result.pstar_asof_wall_ms)
+    return None
+
+
+def _classic_signal_overlay(
+    *,
+    classic_snapshot,
+    skew_enabled: bool,
+    max_skew_bps: float,
+    inventory_regime_enabled: bool,
+) -> Dict[str, Any]:
+    valid = bool(classic_snapshot is not None and classic_snapshot.valid)
+    overlay_score = None if classic_snapshot is None else _classic_overlay_score(classic_snapshot)
+    enabled = bool(valid and skew_enabled and max_skew_bps > 0.0 and overlay_score is not None)
+    skew_bps = 0.0 if not enabled or overlay_score is None else float(overlay_score) * float(max_skew_bps)
+    return {
+        "enabled": enabled,
+        "valid": valid,
+        "overlay_score": overlay_score,
+        "skew_bps": skew_bps,
+        "max_skew_bps": float(max_skew_bps),
+        "inventory_regime_enabled": bool(inventory_regime_enabled),
+        "inventory_regime": None
+        if not (inventory_regime_enabled and valid and classic_snapshot is not None)
+        else classic_snapshot.composite_regime,
+    }
+
+
+def _classic_overlay_score(classic_snapshot) -> float:
+    score = (
+        0.5 * float(classic_snapshot.trend_score)
+        + 0.3 * float(classic_snapshot.momentum_score)
+        + 0.2 * float(classic_snapshot.mean_reversion_score)
+    )
+    return max(-1.0, min(1.0, score))
+
+
+def _apply_classic_signal_overlay(
+    p_fair_value: Optional[float],
+    overlay: Dict[str, Any],
+) -> Optional[float]:
+    if p_fair_value is None:
+        return None
+    adjusted = float(p_fair_value)
+    if overlay.get("enabled"):
+        adjusted += float(overlay.get("skew_bps") or 0.0) / 10000.0
+    return max(0.0, min(1.0, adjusted))
 
 
 def _time_remaining_sec(slug: Optional[object], wall_ms: int) -> Optional[float]:

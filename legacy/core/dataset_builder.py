@@ -136,6 +136,7 @@ def build_microstructure_dataset_from_decisions(
             book = record.get("book") or {}
             exec_cost = record.get("exec_cost") or {}
             signals = notes.get("signals") or {}
+            classic_signals = notes.get("classic_signals") or {}
             entry_gate = notes.get("entry_gate") or {}
 
             row = {
@@ -164,6 +165,13 @@ def build_microstructure_dataset_from_decisions(
                 "z_mom": signals.get("z_mom"),
                 "z_rev": signals.get("z_revert") or signals.get("z_rev"),
                 "ewma_vol": signals.get("vol_ewma"),
+                "classic_trend_score": classic_signals.get("trend_score"),
+                "classic_momentum_score": classic_signals.get("momentum_score"),
+                "classic_mean_reversion_score": classic_signals.get("mean_reversion_score"),
+                "classic_residual_zscore": classic_signals.get("residual_zscore"),
+                "classic_valid": classic_signals.get("valid"),
+                "classic_invalid_reason": classic_signals.get("invalid_reason"),
+                "classic_composite_regime": classic_signals.get("composite_regime"),
                 "label_up": label,
             }
             if feature_contract:

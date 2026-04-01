@@ -14,6 +14,7 @@ from core.model_artifact import ModelArtifact
 from core.onchain_signals import OnchainSignalState
 from core.reference_price import ReferencePriceAggregator, parse_reference_event
 from core.reference_store import ReferenceStore
+from core.trade_tape_replayer import TradeTapeReplayResult, TradeTapeReplayer
 from core.validators import OrderConstraints
 from data.polymarket_ws import MarketWSClient, WSConfig
 
@@ -77,11 +78,15 @@ class ReplayRunner:
         self._policy_settings = policy_settings or {}
         self._onchain_whales = onchain_whales or set()
         self._onchain_window_secs = onchain_window_secs
+        self._trade_tape_replayer = TradeTapeReplayer()
+        self.trade_replay_result: Optional[TradeTapeReplayResult] = None
 
-    def run(self, event_files: Iterable[str]) -> None:
+    def run(self, event_files: Iterable[str], trade_tape_files: Optional[Iterable[str]] = None) -> Optional[TradeTapeReplayResult]:
         events = self._load_events(event_files)
         if not events:
-            return
+            if trade_tape_files:
+                self.trade_replay_result = self._trade_tape_replayer.replay(trade_tape_files)
+            return self.trade_replay_result
         first = events[0]
         wall_ms = _parse_wall_ms(first.get("t_recv_wall_iso"))
         mono_ns = int(first.get("t_recv_mono_ns", 0))
@@ -175,6 +180,13 @@ class ReplayRunner:
 
                 asyncio.set_event_loop(None)
                 loop.close()
+        if trade_tape_files:
+            self.trade_replay_result = self._trade_tape_replayer.replay(trade_tape_files)
+        return self.trade_replay_result
+
+    def replay_trade_tape(self, trade_tape_files: Iterable[str]) -> TradeTapeReplayResult:
+        self.trade_replay_result = self._trade_tape_replayer.replay(trade_tape_files)
+        return self.trade_replay_result
 
     def _load_events(self, event_files: Iterable[str]) -> List[Dict[str, object]]:
         records: List[Tuple[int, int, Dict[str, object]]] = []

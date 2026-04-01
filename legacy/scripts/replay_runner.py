@@ -19,6 +19,8 @@ from scripts.walkforward_report import generate_report, write_report
 
 def main() -> None:
     args = _parse_args()
+    if args.cli_exec:
+        raise ValueError("replay_cli_exec_forbidden")
     settings = load_settings()
     log_dir = args.log_dir or settings.log_dir
     markets_path = args.markets or settings.track_markets_yaml
@@ -106,7 +108,10 @@ def main() -> None:
             "pf_vol_floor": settings.pf_vol_floor,
         },
     )
-    runner.run(_resolve_inputs(args.inputs))
+    runner.run(
+        _resolve_inputs(args.inputs),
+        trade_tape_files=_resolve_trade_tape_inputs(args.trade_tape),
+    )
     decision_tape.close()
     if args.walkforward:
         decision_paths = sorted(Path(log_dir).glob("decision_*.jsonl"))
@@ -156,6 +161,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--walkforward-slippage-bps-shift", type=float, default=0.0)
     parser.add_argument("--walkforward-latency-threshold-ms", type=int, default=2000)
     parser.add_argument("--walkforward-latency-shift-ms", type=int, default=0)
+    parser.add_argument("--sim_exec", action="store_true", help="Replay compatibility flag; no execution side effects")
+    parser.add_argument("--cli_exec", action="store_true", help="Forbidden in replay mode")
+    parser.add_argument(
+        "--trade-tape",
+        action="append",
+        default=[],
+        help="Optional trade_tape.jsonl path or directory containing trade_tape.jsonl. Replay reads this instead of invoking any broker.",
+    )
     return parser.parse_args()
 
 
@@ -169,6 +182,19 @@ def _resolve_resolved_markets(resolved_arg: Optional[str], log_dir: str) -> Opti
         return None
     candidates.sort(key=lambda path: path.stat().st_mtime)
     return candidates[-1]
+
+
+def _resolve_trade_tape_inputs(inputs: list[str]) -> list[str]:
+    paths: list[str] = []
+    for entry in inputs:
+        path = Path(entry)
+        if path.is_dir():
+            candidate = path / "trade_tape.jsonl"
+            if candidate.exists():
+                paths.append(str(candidate))
+        elif path.exists():
+            paths.append(str(path))
+    return paths
 
 
 def resolve_replay_markets(

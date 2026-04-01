@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import glob
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +14,7 @@ class TestTradeTapeDeterminism(unittest.TestCase):
             {
                 "schema_version": "trade_v1",
                 "run_id": "run",
-                "event_id": 1,
+                "event_id": "evt-1",
                 "parent_event_id": None,
                 "event_type": "order_intent",
                 "order_id": "o1",
@@ -35,8 +34,8 @@ class TestTradeTapeDeterminism(unittest.TestCase):
             {
                 "schema_version": "trade_v1",
                 "run_id": "run",
-                "event_id": 2,
-                "parent_event_id": 1,
+                "event_id": "evt-2",
+                "parent_event_id": "evt-1",
                 "event_type": "order_reject",
                 "order_id": "o1",
                 "t_event_wall_ms": 1000,
@@ -47,12 +46,31 @@ class TestTradeTapeDeterminism(unittest.TestCase):
             }
         )
         tape.close()
-        files = sorted(glob.glob(str(log_dir / "trade_*.jsonl")))
-        self.assertTrue(files)
-        return Path(files[0]).read_text(encoding="utf-8")
+        path = log_dir / "trade_tape.jsonl"
+        self.assertTrue(path.exists())
+        return path.read_text(encoding="utf-8")
 
     def test_trade_tape_determinism(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             first = self._write_events(Path(tmpdir) / "first")
             second = self._write_events(Path(tmpdir) / "second")
             self.assertEqual(first, second)
+
+    def test_deterministic_event_id_helper(self) -> None:
+        first = TradeTape.deterministic_event_id(
+            run_id="run",
+            order_id="o1",
+            event_type="order_fill",
+            parent_event_id="evt-1",
+            event_seq_within_order=2,
+            raw_subset={"fill_price": 0.5, "fill_size": 1.0},
+        )
+        second = TradeTape.deterministic_event_id(
+            run_id="run",
+            order_id="o1",
+            event_type="order_fill",
+            parent_event_id="evt-1",
+            event_seq_within_order=2,
+            raw_subset={"fill_size": 1.0, "fill_price": 0.5},
+        )
+        self.assertEqual(first, second)
