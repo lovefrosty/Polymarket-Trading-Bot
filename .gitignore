@@ -149,12 +149,27 @@ cache_gamma_markets.json
 cache_gamma_slug_markets.json
 *.sqlite
 node_modules/
+*.pem
+secrets/
 
 # Runtime artifacts (never commit)
 runtime.db
 runtime.db-*
 *.db-wal
 *.db-shm
+tmp/core_mm_runs/
+tmp/calibration_sweeps/
+tmp/calibration_snapshots_*/
+tmp/meta_agent_dispatch/
+tmp/kill_switch_report.json
+tmp/test-run/
 tmp/smoke_*/
 tmp/smoke_fix_*/
 tmp/smoke_fix2_*/
+tmp/hedge_overfire_sweeps/
+tmp/kalshi-cleanup-sweep-*/
+tmp/kalshi-paper-6h-sess-*/
+
+# Local desktop UI build artifacts
+operator_app/node_modules/
+operator_app/dist/
