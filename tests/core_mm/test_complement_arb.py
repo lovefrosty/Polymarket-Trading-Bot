@@ -74,6 +74,20 @@ class TestComplementArbScanner:
         assert signal.taker_edge_bps < 0
         assert signal.taker_arb_active is False
 
+    def test_taker_edge_uses_kalshi_fee_model_when_enabled(self) -> None:
+        scanner = ComplementArbScanner(
+            ComplementArbConfig(
+                enabled=True,
+                min_taker_edge_bps=10.0,
+                fee_model_exchange="kalshi",
+                fee_type="quadratic",
+                fee_multiplier=1.0,
+            )
+        )
+        signal = scanner.evaluate(yes_bid=0.46, yes_ask=0.47, no_bid=0.46, no_ask=0.47)
+        assert signal.taker_edge_bps == pytest.approx(200.0)
+        assert signal.taker_arb_active is True
+
     def test_stats_tracking(self) -> None:
         scanner = ComplementArbScanner(ComplementArbConfig(
             enabled=True, min_maker_edge_bps=300.0,

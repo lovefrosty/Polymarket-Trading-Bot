@@ -333,6 +333,104 @@ class TestMainLoop(unittest.IsolatedAsyncioTestCase):
             if isinstance(quote.metadata, dict):
                 self.assertEqual(quote.metadata.get("inventory_skew_ticks"), 1)
 
+    async def test_stop_loss_uses_risk_exit_price_and_size(self) -> None:
+        self.books.apply_snapshot("stop_yes", bids=[(0.45, 150)], asks=[(0.46, 160)], ts_ms=1_000)
+        stop_market = MarketConfig(
+            market_id="m_stop",
+            token_ids=("stop_yes",),
+            tick_size=0.01,
+            min_size=100,
+            fallback_size=20,
+            within_pct=0.05,
+            trade_size=50,
+            max_size=100,
+        )
+        loop = TradingMainLoop(
+            book_manager=self.books,
+            order_manager=SmartOrderManager(),
+            risk_manager=RiskManager(),
+            mode="OBSERVE",
+        )
+        result = await loop.run_market_cycle(
+            market=stop_market,
+            token_states=(TokenState(token_id="stop_yes", position=40, avg_cost=0.60, net_position=40, usdc_balance=1000),),
+            existing_orders={},
+            now_ms=2_000,
+        )
+        sell_quote = next(q for q in result.desired_quotes.values() if q.side == "sell")
+        self.assertEqual(sell_quote.price, 0.46)
+        self.assertEqual(sell_quote.size, 40.0)
+        self.assertEqual(sell_quote.metadata.get("quote_mode"), "risk_exit_stop_loss_maker")
+        self.assertEqual(sell_quote.metadata.get("exit_mode"), "maker")
+
+    async def test_sell_fill_blocks_buy_reentry_during_cooldown(self) -> None:
+        loop = TradingMainLoop(
+            book_manager=self.books,
+            order_manager=SmartOrderManager(),
+            risk_manager=RiskManager(),
+            mode="OBSERVE",
+            post_fill_reentry_cooldown_ms=60_000,
+        )
+        loop.record_fill(token_id="yes", side="sell", price=0.52, mid_at_fill=0.50, ts_ms=2_000)
+        result = await loop.run_market_cycle(
+            market=self.market,
+            token_states=(TokenState(token_id="yes", position=0, avg_cost=0.0, net_position=0, usdc_balance=1000),),
+            existing_orders={},
+            now_ms=10_000,
+        )
+        self.assertFalse(any(q.side == "buy" for q in result.desired_quotes.values()))
+
+    async def test_equity_risk_caps_clip_buy_size(self) -> None:
+        loop = TradingMainLoop(
+            book_manager=self.books,
+            order_manager=SmartOrderManager(),
+            risk_manager=RiskManager(),
+            mode="OBSERVE",
+        )
+        result = await loop.run_market_cycle(
+            market=self.market,
+            token_states=(
+                TokenState(
+                    token_id="yes",
+                    position=0,
+                    avg_cost=0.0,
+                    net_position=0,
+                    usdc_balance=1000,
+                    current_equity=1000.0,
+                    reference_equity=1000.0,
+                ),
+            ),
+            existing_orders={},
+            now_ms=2_000,
+        )
+        buy_quote = next(q for q in result.desired_quotes.values() if q.side == "buy")
+        self.assertLessEqual(buy_quote.size, 10.5)
+
+    async def test_buy_is_suppressed_when_risk_clip_falls_below_min_order(self) -> None:
+        loop = TradingMainLoop(
+            book_manager=self.books,
+            order_manager=SmartOrderManager(),
+            risk_manager=RiskManager(),
+            mode="OBSERVE",
+        )
+        result = await loop.run_market_cycle(
+            market=self.market,
+            token_states=(
+                TokenState(
+                    token_id="yes",
+                    position=0,
+                    avg_cost=0.0,
+                    net_position=0,
+                    usdc_balance=1000,
+                    current_equity=50.0,
+                    reference_equity=50.0,
+                ),
+            ),
+            existing_orders={},
+            now_ms=2_000,
+        )
+        self.assertFalse(any(q.side == "buy" for q in result.desired_quotes.values()))
+
 
 if __name__ == "__main__":
     unittest.main()

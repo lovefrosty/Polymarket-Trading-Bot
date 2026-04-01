@@ -7,6 +7,7 @@ import pytest
 from core_mm.execution import ExecutionResult
 from core_mm.live_broker import LiveBroker
 from core_mm.positions import PositionTracker
+from core_mm.risk_manager import RiskConfig
 
 
 def _mock_exec() -> MagicMock:
@@ -97,6 +98,22 @@ def test_risk_allows_sells_without_checks() -> None:
     assert result.success
 
 
+def test_dynamic_risk_limits_override_static_thresholds() -> None:
+    broker = _broker(max_order_notional=50.0, max_position_notional=50.0, max_daily_loss=50.0)
+    broker.configure_dynamic_risk_limits(
+        current_equity=200.0,
+        reference_equity=200.0,
+        risk_config=RiskConfig(
+            max_order_notional_pct=0.005,
+            max_market_exposure_pct=0.03,
+            per_day_loss_pct=0.10,
+        ),
+    )
+    result = broker.place_order(token_id="t1", side="buy", price=0.50, size=5.0)
+    assert not result.success
+    assert "order_notional_exceeded" in (result.error or "")
+
+
 def test_place_order_delegates_to_execution_adapter() -> None:
     mock_exec = _mock_exec()
     broker = _broker(execution_adapter=mock_exec)
@@ -131,6 +148,42 @@ def test_record_fill_computes_pnl_on_sell() -> None:
     # Net PnL = $1.00 - fees
     assert stats["realized_net_pnl"] < 1.0
     assert stats["realized_net_pnl"] > 0
+
+
+def test_record_fill_prefers_exchange_reported_kalshi_fee() -> None:
+    broker = _broker(fee_bps=25.0)
+    broker.record_fill(
+        {
+            "token_id": "KXBTC-26MAR2203-B69150:yes",
+            "side": "buy",
+            "price": 0.50,
+            "size": 10.0,
+            "exchange": "kalshi",
+            "fee_cost": "0.07",
+        }
+    )
+    fill = broker.fills()[0]
+    assert fill["fee_usdc"] == pytest.approx(0.07)
+    assert fill["fee_source"] == "exchange_reported"
+    assert fill["fee_bps"] == pytest.approx((0.07 / 5.0) * 10_000.0)
+
+
+def test_record_fill_uses_kalshi_model_fallback_without_reported_fee() -> None:
+    broker = _broker(fee_bps=25.0)
+    broker.record_fill(
+        {
+            "token_id": "KXBTC-26MAR2203-B69150:yes",
+            "side": "buy",
+            "price": 0.50,
+            "size": 10.0,
+            "exchange": "kalshi",
+            "fee_type": "quadratic",
+            "fee_multiplier": 1.0,
+        }
+    )
+    fill = broker.fills()[0]
+    assert fill["fee_usdc"] == pytest.approx(0.18)
+    assert fill["fee_source"] == "live_kalshi_model_fallback"
 
 
 def test_fills_returns_all_fills() -> None:

@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from core_mm.kalshi.fees import KalshiFeeSpec, calculate_kalshi_fee
+
 
 @dataclass(frozen=True)
 class ComplementArbConfig:
@@ -31,6 +33,10 @@ class ComplementArbConfig:
     min_taker_edge_bps: float = 30.0
     # Fee per side in bps (for taker edge calculation).
     fee_bps: float = 25.0
+    # Optional exchange-specific fee modeling for taker arb checks.
+    fee_model_exchange: Optional[str] = None
+    fee_type: Optional[str] = None
+    fee_multiplier: float = 1.0
     # Trade-size multiplier when maker arb is active.
     maker_size_multiplier: float = 2.0
 
@@ -87,9 +93,8 @@ class ComplementArbScanner:
         # Maker edge: accumulate both via passive bids, merge for $1.
         maker_edge_bps = (1.0 - sum_bid) * 10_000.0
 
-        # Taker edge: cross both asks, merge for $1 (each side pays fee).
-        fee_mult = 1.0 + self.config.fee_bps / 10_000.0
-        taker_cost = sum_ask * fee_mult
+        # Taker edge: cross both asks, merge for $1.
+        taker_cost = sum_ask + self._taker_fee_cost(yes_ask=float(yes_ask), no_ask=float(no_ask))
         taker_edge_bps = (1.0 - taker_cost) * 10_000.0
 
         maker_active = maker_edge_bps >= self.config.min_maker_edge_bps
@@ -119,3 +124,27 @@ class ComplementArbScanner:
             "total_maker_signals": self._total_maker_signals,
             "total_taker_signals": self._total_taker_signals,
         }
+
+    def _taker_fee_cost(self, *, yes_ask: float, no_ask: float) -> float:
+        if str(self.config.fee_model_exchange or "").strip().lower() == "kalshi":
+            fee_spec = KalshiFeeSpec(
+                fee_type=str(self.config.fee_type or "quadratic"),
+                fee_multiplier=float(self.config.fee_multiplier or 1.0),
+            )
+            yes_fee = calculate_kalshi_fee(
+                price=float(yes_ask),
+                contracts=1.0,
+                fee_spec=fee_spec,
+                is_taker=True,
+                fee_source="complement_arb_model",
+            ).fee_usdc
+            no_fee = calculate_kalshi_fee(
+                price=float(no_ask),
+                contracts=1.0,
+                fee_spec=fee_spec,
+                is_taker=True,
+                fee_source="complement_arb_model",
+            ).fee_usdc
+            return float(yes_fee) + float(no_fee)
+        fee_mult = 1.0 + float(self.config.fee_bps) / 10_000.0
+        return (float(yes_ask) + float(no_ask)) * (fee_mult - 1.0)

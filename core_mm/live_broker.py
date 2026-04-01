@@ -6,7 +6,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 from core_mm.execution import ExecutionAdapter, ExecutionResult
+from core_mm.kalshi.fees import calculate_kalshi_fee, infer_fee_spec, reported_kalshi_fee
 from core_mm.positions import PositionTracker
+from core_mm.risk_manager import RiskConfig
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,9 @@ class LiveBroker:
         self._duration_total_weighted_ms: float = 0.0
         self._duration_total_closed_qty: float = 0.0
         self._last_startup_reconciliation: Dict[str, Any] = {}
+        self._dynamic_order_notional_limit: Optional[float] = None
+        self._dynamic_position_notional_limit: Optional[float] = None
+        self._dynamic_daily_loss_limit: Optional[float] = None
 
     @property
     def position_tracker(self) -> PositionTracker:
@@ -73,16 +78,44 @@ class LiveBroker:
         if size < 1:
             return f"size_too_small: {size}"
         notional = price * size
-        if notional > self._max_order_notional:
-            return f"order_notional_exceeded: ${notional:.2f} > ${self._max_order_notional:.2f}"
+        effective_order_limit = _effective_limit(self._dynamic_order_notional_limit, self._max_order_notional)
+        if effective_order_limit is not None and notional > effective_order_limit:
+            return f"order_notional_exceeded: ${notional:.2f} > ${effective_order_limit:.2f}"
         current_pos = self._positions.get_position(str(token_id))
         projected_notional = (current_pos.size + size) * price
-        if projected_notional > self._max_position_notional:
-            return f"position_notional_exceeded: ${projected_notional:.2f} > ${self._max_position_notional:.2f}"
+        effective_position_limit = _effective_limit(self._dynamic_position_notional_limit, self._max_position_notional)
+        if effective_position_limit is not None and projected_notional > effective_position_limit:
+            return f"position_notional_exceeded: ${projected_notional:.2f} > ${effective_position_limit:.2f}"
         net_pnl = self._stats["realized_net_pnl"]
-        if net_pnl <= -abs(self._max_daily_loss):
-            return f"daily_loss_exceeded: ${net_pnl:.2f} <= -${self._max_daily_loss:.2f}"
+        effective_daily_loss = _effective_limit(self._dynamic_daily_loss_limit, self._max_daily_loss)
+        if effective_daily_loss is not None and net_pnl <= -abs(effective_daily_loss):
+            return f"daily_loss_exceeded: ${net_pnl:.2f} <= -${effective_daily_loss:.2f}"
         return None
+
+    def configure_dynamic_risk_limits(
+        self,
+        *,
+        current_equity: float,
+        reference_equity: float,
+        risk_config: RiskConfig,
+    ) -> None:
+        equity_now = max(0.0, float(current_equity))
+        equity_ref = max(0.0, float(reference_equity))
+        self._dynamic_order_notional_limit = (
+            equity_now * float(risk_config.max_order_notional_pct)
+            if equity_now > 0.0 and float(risk_config.max_order_notional_pct) > 0.0
+            else None
+        )
+        self._dynamic_position_notional_limit = (
+            equity_now * float(risk_config.max_market_exposure_pct)
+            if equity_now > 0.0 and float(risk_config.max_market_exposure_pct) > 0.0
+            else None
+        )
+        self._dynamic_daily_loss_limit = (
+            equity_ref * float(risk_config.per_day_loss_pct)
+            if equity_ref > 0.0 and float(risk_config.per_day_loss_pct) > 0.0
+            else None
+        )
 
     # ── Order interface (matches PaperBroker) ────────────────────────
 
@@ -226,7 +259,8 @@ class LiveBroker:
             realized_gross_pnl = (price - prior.avg_price) * closed_qty
 
         gross_notional = size * price
-        fee_usdc = gross_notional * self._fee_bps / 10_000.0
+        fee_details = _live_fee_details(fill_event=fill_event, price=price, size=size, default_fee_bps=self._fee_bps)
+        fee_usdc = float(fee_details["fee_usdc"])
         realized_net_pnl = realized_gross_pnl - fee_usdc
 
         # Update position
@@ -240,8 +274,11 @@ class LiveBroker:
             "price": price,
             "ts_ms": ts_ms,
             "gross_notional": gross_notional,
-            "fee_bps": self._fee_bps,
+            "fee_bps": fee_details["fee_bps"],
             "fee_usdc": fee_usdc,
+            "fee_source": fee_details["fee_source"],
+            "fee_type": fee_details["fee_type"],
+            "fee_multiplier": fee_details["fee_multiplier"],
             "net_notional": gross_notional - fee_usdc,
             "realized_gross_pnl_delta": realized_gross_pnl,
             "realized_net_pnl_delta": realized_net_pnl,
@@ -250,6 +287,9 @@ class LiveBroker:
                 "avg_price": updated.avg_price,
             },
             "mid_at_fill": float(fill_event.get("mid_at_fill") or price),
+            "exchange": fill_event.get("exchange"),
+            "raw_kalshi": fill_event.get("raw_kalshi"),
+            "placement_metadata": dict(fill_event.get("placement_metadata") or {}),
         }
         self._stats["realized_gross_pnl"] += realized_gross_pnl
         self._stats["realized_net_pnl"] += realized_net_pnl
@@ -280,6 +320,12 @@ class LiveBroker:
     def stats(self) -> Dict[str, float]:
         result = dict(self._stats)
         result["avg_duration_ms"] = self.avg_duration_ms
+        if self._dynamic_order_notional_limit is not None:
+            result["dynamic_order_notional_limit"] = float(self._dynamic_order_notional_limit)
+        if self._dynamic_position_notional_limit is not None:
+            result["dynamic_position_notional_limit"] = float(self._dynamic_position_notional_limit)
+        if self._dynamic_daily_loss_limit is not None:
+            result["dynamic_daily_loss_limit"] = float(self._dynamic_daily_loss_limit)
         return result
 
     def sweep_fills(self, token_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -316,6 +362,13 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _effective_limit(dynamic_limit: Optional[float], static_limit: Optional[float]) -> Optional[float]:
+    limits = [float(value) for value in (dynamic_limit, static_limit) if value is not None and float(value) > 0.0]
+    if not limits:
+        return None
+    return min(limits)
+
+
 def _extract_orders(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     orders = payload.get("orders") if isinstance(payload, dict) else []
     if not isinstance(orders, list):
@@ -335,11 +388,14 @@ def _position_is_nonflat(position: Dict[str, Any]) -> bool:
         "size",
         "count",
         "position",
+        "position_fp",
         "quantity",
         "remaining_count",
         "yes_count",
         "no_count",
         "net_position",
+        "market_exposure_dollars",
+        "total_traded_dollars",
     )
     observed = False
     for key in numeric_keys:
@@ -368,3 +424,53 @@ def _reconciliation_to_dict(report: StartupReconciliationReport) -> Dict[str, An
         "open_orders": list(report.open_orders),
         "positions": list(report.positions),
     }
+
+
+def _live_fee_details(
+    *,
+    fill_event: Dict[str, Any],
+    price: float,
+    size: float,
+    default_fee_bps: float,
+) -> Dict[str, Any]:
+    if _is_kalshi_fill(fill_event):
+        reported = reported_kalshi_fee(fill_event, price=float(price), contracts=float(size))
+        if reported is not None:
+            return {
+                "fee_usdc": float(reported.fee_usdc),
+                "fee_bps": float(reported.fee_bps),
+                "fee_source": reported.fee_source,
+                "fee_type": reported.fee_type,
+                "fee_multiplier": reported.fee_multiplier,
+            }
+        fee_spec = infer_fee_spec(fill_event)
+        modeled = calculate_kalshi_fee(
+            price=float(price),
+            contracts=float(size),
+            fee_spec=fee_spec,
+            is_taker=True,
+            fee_source="live_kalshi_model_fallback",
+        )
+        return {
+            "fee_usdc": float(modeled.fee_usdc),
+            "fee_bps": float(modeled.fee_bps),
+            "fee_source": modeled.fee_source,
+            "fee_type": modeled.fee_type,
+            "fee_multiplier": modeled.fee_multiplier,
+        }
+    gross_notional = float(price) * float(size)
+    fee_usdc = gross_notional * float(default_fee_bps) / 10_000.0
+    return {
+        "fee_usdc": float(fee_usdc),
+        "fee_bps": float(default_fee_bps if fee_usdc > 0.0 else 0.0),
+        "fee_source": "flat_bps",
+        "fee_type": None,
+        "fee_multiplier": None,
+    }
+
+
+def _is_kalshi_fill(fill_event: Dict[str, Any]) -> bool:
+    if str(fill_event.get("exchange") or "").strip().lower() == "kalshi":
+        return True
+    token_id = str(fill_event.get("token_id") or fill_event.get("asset_id") or "").upper()
+    return token_id.startswith("KX")

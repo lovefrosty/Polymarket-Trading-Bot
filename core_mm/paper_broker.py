@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from core_mm.book_manager import BookManager
 from core_mm.execution import ExecutionResult
+from core_mm.kalshi.fees import calculate_kalshi_fee, infer_fee_spec
 from core_mm.positions import PositionTracker
 
 
@@ -308,11 +309,16 @@ class PaperBroker:
             closed_qty = min(fill_size, float(prior_position.size))
             realized_gross_pnl = (float(fill_price) - float(prior_position.avg_price)) * closed_qty
         gross_notional = fill_size * float(fill_price)
-        # Maker fills (touch) get zero fees on Polymarket; taker fills pay fee_bps
-        if liquidity_mode == "maker" or (fill_trigger == "touch" and self._fee_mode != "always"):
-            fee_usdc = 0.0
-        else:
-            fee_usdc = gross_notional * self._fee_bps / 10_000.0
+        fee_details = _paper_fee_details(
+            placement_metadata=order.metadata,
+            price=float(fill_price),
+            size=float(fill_size),
+            fill_trigger=str(fill_trigger),
+            fee_bps=self._fee_bps,
+            fee_mode=self._fee_mode,
+            liquidity_mode=str(liquidity_mode),
+        )
+        fee_usdc = float(fee_details["fee_usdc"])
         realized_net_pnl = realized_gross_pnl - fee_usdc
         updated_position = self._positions.apply_fill(token_id=order.token_id, side=order.side, size=fill_size, price=fill_price)
         fill_ts_ms = _now_ms()
@@ -332,8 +338,11 @@ class PaperBroker:
             "client_order_id": order.client_order_id,
             "quote_group_id": order.quote_group_id,
             "gross_notional": gross_notional,
-            "fee_bps": self._fee_bps,
+            "fee_bps": fee_details["fee_bps"],
             "fee_usdc": fee_usdc,
+            "fee_source": fee_details["fee_source"],
+            "fee_type": fee_details["fee_type"],
+            "fee_multiplier": fee_details["fee_multiplier"],
             "net_notional": gross_notional - fee_usdc,
             "liquidity_mode": liquidity_mode,
             "fill_trigger": fill_trigger,
@@ -397,3 +406,45 @@ def _level_size_at_price(book: Any, *, side: str, price: float) -> Optional[floa
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _paper_fee_details(
+    *,
+    placement_metadata: Optional[Dict[str, Any]],
+    price: float,
+    size: float,
+    fill_trigger: str,
+    fee_bps: float,
+    fee_mode: str,
+    liquidity_mode: str,
+) -> Dict[str, Any]:
+    metadata = dict(placement_metadata or {})
+    fee_model_exchange = str(metadata.get("fee_model_exchange") or metadata.get("exchange") or "").strip().lower()
+    if fee_model_exchange == "kalshi":
+        fee_spec = infer_fee_spec(metadata)
+        fee_result = calculate_kalshi_fee(
+            price=float(price),
+            contracts=float(size),
+            fee_spec=fee_spec,
+            is_taker=str(fill_trigger).lower() == "cross",
+            fee_source="paper_kalshi_model",
+        )
+        return {
+            "fee_usdc": float(fee_result.fee_usdc),
+            "fee_bps": float(fee_result.fee_bps),
+            "fee_source": fee_result.fee_source,
+            "fee_type": fee_result.fee_type,
+            "fee_multiplier": fee_result.fee_multiplier,
+        }
+    gross_notional = float(size) * float(price)
+    if liquidity_mode == "maker" or (str(fill_trigger).lower() == "touch" and str(fee_mode).lower() != "always"):
+        fee_usdc = 0.0
+    else:
+        fee_usdc = gross_notional * float(fee_bps) / 10_000.0
+    return {
+        "fee_usdc": float(fee_usdc),
+        "fee_bps": float(fee_bps if fee_usdc > 0.0 else 0.0),
+        "fee_source": "paper_flat_bps",
+        "fee_type": None,
+        "fee_multiplier": None,
+    }

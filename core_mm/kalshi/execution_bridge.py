@@ -104,6 +104,13 @@ def normalize_kalshi_fill(fill: Dict[str, Any]) -> Dict[str, Any]:
         "side": side,
         "price": price_dollars,
         "size": size,
+        "exchange": "kalshi",
+        "fee_usdc": fill.get("fee_cost"),
+        "fee_cost": fill.get("fee_cost"),
+        "fee_type": fill.get("fee_type"),
+        "fee_multiplier": fill.get("fee_multiplier"),
+        "series_ticker": fill.get("series_ticker"),
+        "event_ticker": fill.get("event_ticker"),
         "raw_kalshi": fill,
     }
 

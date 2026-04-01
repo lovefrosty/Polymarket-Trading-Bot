@@ -195,6 +195,11 @@ class KalshiClient:
         data = self._request("GET", f"/trade-api/v2/markets/{ticker}", auth=True)
         return data.get("market") or data
 
+    def get_series(self, series_ticker: str) -> Dict[str, Any]:
+        """GET /trade-api/v2/series/{series_ticker} → single series dict."""
+        data = self._request("GET", f"/trade-api/v2/series/{series_ticker}", auth=True)
+        return data.get("series") or data
+
     def get_events(self, *, status: str = "open", limit: int = 100) -> List[Dict[str, Any]]:
         """GET /trade-api/v2/events → list of event dicts."""
         params: Dict[str, Any] = {"limit": limit, "status": status}
