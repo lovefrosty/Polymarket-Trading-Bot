@@ -1,25 +1,76 @@
-# Go-Live Reference Guide: Polymarket Market Making Bot
-# Last updated: 2026-03-17
+# Go-Live Reference Guide: Kalshi-First Launch, Polymarket Later
+# Last updated: 2026-03-25
 # Status: Pre-deployment
 
 ---
 
 ## Overview
 
-Paper trading is validated:
-- $100+ net PnL across multiple runs
-- 94.5 bps markout at 1s (fills consistently moving in our favor)
-- 67.5% fill rate, 72% quote rate
-- 31% adverse selection rate
-- Phase 0 gate: PASS on every run
+The primary live launch path is now:
 
-This document covers everything from "I have no account" to "my bot is live
-and making markets with real money." It is the single source of truth for
-the go-live process.
+- Kalshi first
+- Polymarket later, once exchange access is available and separately validated
+
+This means:
+
+- current live-readiness decisions should be made against Kalshi paper evidence
+- the first live deployment should be one active Kalshi market at a time, with selector rotation allowed
+- hedge does not receive launch credit unless it proves realized improvement on
+  Kalshi
+- Kalshi fee correctness is a launch blocker because after-fee edge must be
+  real before capital is deployed
+- the Polymarket-specific material below should be treated as secondary venue
+  preparation, not as the current production launch path
+
+This document covers the overall go-live process, but the current market-level
+promotion decision should follow the BTC Kalshi criteria first.
+
+Sizing policy details live in [Position Sizing Contract](./POSITION_SIZING_CONTRACT.md).
+Market-specific readiness criteria for the current BTC Kalshi cluster live in
+[BTC Kalshi Go-Live Criteria](./BTC_KALSHI_GO_LIVE_CRITERIA.md).
+Local-hardware launch triage and strategy fit live in
+[Local-Only Launch Strategy Triage](./LOCAL_ONLY_LAUNCH_STRATEGY_TRIAGE.md).
+The operator-understanding bar for first deployment lives in
+[Owner Understanding Checklist](./OWNER_UNDERSTANDING_CHECKLIST.md).
+Rotation-aware launch scorecards live in
+[Rotating Single-Market Reporting Spec](./ROTATING_SINGLE_MARKET_REPORTING_SPEC.md).
+
+## First Launch Checklist
+
+Treat this as the actual first-production scope:
+
+- `max_active_markets = 1`
+- one active Kalshi BTC market at a time
+- selector can rotate to a better BTC bucket during the run
+- conservative `trade_size`, `max_size`, and hard caps
+- hedge enabled in code but ignored for launch credit
+- repeatable after-fee paper profitability using the Kalshi fee model
+- unwind / force-flat / kill behavior proven in paper
+- operator can explain why the selected market won and why nearby candidates
+  were rejected
+- operator can explain why the selector switched markets during the run
+
+Post-launch expansion work:
+
+- multi-market inventory calibration
+- multi-market dashboard/operator workflows
+- hedge promotion
+- broader selector threshold optimization
+
+Do not let latency-sensitive alternative strategies compete with this launch
+lane. The current repo recommendation is:
+
+- launch the Kalshi single-market market maker first
+- treat agentic research as a later overlay
+- treat factor investing as a separate system
+- reject HFT/speed strategies until infrastructure changes materially
+
+Polymarket-specific account, wallet, and API setup remains here as a later
+secondary-venue reference.
 
 ---
 
-## PART 1: Account and Wallet Setup (Do This First, Before Any Code)
+## PART 1: Polymarket Account and Wallet Setup (Later Secondary Venue Step)
 
 ### 1.1 Create a Polymarket Account
 
