@@ -116,6 +116,18 @@ def _fmt_last_update(ts_ms: Optional[int]) -> str:
     return _duration_str(age_s * 1000.0) + " ago"
 
 
+def _format_size_limiter(size_plan: Dict[str, Any], side: str) -> str:
+    primary = str(size_plan.get(f"{side}_limiter") or "n/a")
+    chain = str(size_plan.get(f"{side}_limiters") or "")
+    human_primary = primary.replace("_", " ")
+    if not chain:
+        return human_primary
+    human_chain = " -> ".join(part.replace("_", " ") for part in chain.split(",") if part)
+    if not human_chain or human_chain == human_primary:
+        return human_primary
+    return f"{human_primary} [{human_chain}]"
+
+
 def _status_value(snapshot: Dict[str, Any], key: str, default: Any = None) -> Any:
     value = snapshot.get(key)
     return default if value in (None, "") else value
@@ -140,6 +152,242 @@ def _extract_regime(snapshot: Dict[str, Any]) -> str:
     return "unknown"
 
 
+def _humanize_reason_codes(raw: Any) -> str:
+    reason_map = {
+        "book_absent": "Order book is unavailable",
+        "book_empty": "Order book is empty",
+        "one_sided_book": "Book is one-sided",
+        "price_out_of_range": "Market price is outside the safe range",
+        "spread_too_wide": "Spread is too wide to quote safely",
+        "insufficient_volume": "Recent volume is too low",
+        "insufficient_open_interest": "Open interest is too low",
+        "liquidity_score_too_low": "Liquidity score is below the safe threshold",
+        "quoteable_book": "Book is healthy enough to quote",
+        "stale_position": "Inventory is stale and should be reduced",
+        "take_profit": "The bot is harvesting a favorable exit",
+        "stop_loss": "The bot is limiting a losing position",
+        "flow_blocks_buy": "Flow filter is blocking new buys",
+        "flow_blocks_sell": "Flow filter is blocking new sells",
+        "ask_improve": "The bot is improving the ask",
+        "bid_improve": "The bot is improving the bid",
+        "ask_risk_exit_stale_unwind_maker": "The bot is trying a maker exit for stale inventory",
+        "ask_risk_exit_take_profit_maker": "The bot is exiting passively to lock in profit",
+        "ask_fallback_top_ask": "The bot is leaning on the top ask",
+        "bid_fallback_top_bid": "The bot is leaning on the top bid",
+        "freeze": "Trading is frozen by a safety gate",
+        "no_hedge_market": "No better hedge market was available",
+        "hedge_not_better_than_inventory_market": "Hedge quality did not beat the inventory market",
+        "gross_increase_ceiling_exhausted": "Temporary gross exposure would exceed the ceiling",
+        "stale_inventory_required": "Stale inventory was required before hedging",
+        "maker_exit_window_active": "Maker exit window was still active",
+        "hedge_failed_cooldown": "A failed hedge cooldown was still in force",
+        "hedge_failed_no_improvement": "Hedge attempts had not improved inventory enough",
+        "stop_open_window": "Open-window guard blocked the hedge",
+        "force_flat_window": "Force-flat window was active",
+        "forced_reduction": "Forced reduction was already in progress",
+        "paper_only": "Paper-only hedge telemetry",
+    }
+    bits = [str(bit).strip() for bit in str(raw or "").split(",") if str(bit).strip()]
+    if not bits:
+        return "No blocking reason recorded"
+    humanized: List[str] = []
+    for bit in bits[:3]:
+        humanized.append(reason_map.get(bit.lower(), bit.replace("_", " ")))
+    return "; ".join(humanized)
+
+
+def _selection_market_label(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("ticker", "market", "market_id", "slug", "title", "label"):
+            candidate = value.get(key)
+            if candidate not in (None, ""):
+                return str(candidate)
+        return "N/A"
+    return str(value or "N/A")
+
+
+def _freeze_reason_text(raw: Any) -> str:
+    if isinstance(raw, list):
+        if not raw:
+            return "none"
+        return _humanize_reason_codes(",".join(str(item) for item in raw if item not in (None, "")))
+    return _humanize_reason_codes(raw) if raw not in (None, "") else "none"
+
+
+def _control_state_text(raw: Any) -> str:
+    if raw in (None, ""):
+        return "N/A"
+    return str(raw).replace("_", " ").title()
+
+
+def _time_to_expiry_ms(*sources: Any) -> Optional[int]:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("time_to_expiry_ms", "ms_to_expiry", "remaining_ms"):
+            value = source.get(key)
+            try:
+                if value is None:
+                    continue
+                out = int(value)
+                if out >= 0:
+                    return out
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _cluster_net_label(net_yes_exposure_notional: Optional[float]) -> str:
+    net = float(net_yes_exposure_notional or 0.0)
+    if abs(net) < 1e-9:
+        return "Flat"
+    side = "YES" if net > 0 else "NO"
+    return f"{side} {_fmt(abs(net), prefix='$', decimals=2)}"
+
+
+def _cluster_gap_questions(gaps: List[str]) -> List[str]:
+    gap_map = {
+        "cluster control_state": "Which cluster-level gate is binding right now?",
+        "cluster hedge action label": "Did the runner want SKEW, HEDGE, or UNWIND here?",
+        "cluster action reason": "Why did the runner choose that cluster action?",
+        "cluster hedge ratio": "What hedge ratio was the runner targeting?",
+        "hedge target market": "Which market or cluster was the intended hedge target?",
+        "cluster_exposure payload missing": "Which event cluster is carrying the risk right now?",
+    }
+    return [gap_map.get(gap, gap) for gap in gaps]
+
+
+def _selection_gap_questions(gaps: List[str]) -> List[str]:
+    gap_map = {
+        "selection candidate diagnostics missing": "Which markets were even considered on this cycle?",
+        "blocking market id": "Which active market blocked this candidate?",
+        "blocking cluster id": "Which event cluster suppressed this candidate?",
+        "blocking reason": "What multi-market rule caused the suppression?",
+    }
+    return [gap_map.get(gap, gap) for gap in gaps]
+
+
+def _hedge_action_label(raw: Any) -> str:
+    if raw in (None, "", "NONE"):
+        return "N/A"
+    return str(raw).replace("_", " ").upper()
+
+
+def _stale_inventory_label(state: Any, stale_market_count: Any = None) -> str:
+    text = str(state or "").strip().lower()
+    if text in {"stale", "true"}:
+        count = int(stale_market_count or 0)
+        return f"STALE ({count})" if count > 0 else "STALE"
+    return "FRESH"
+
+
+def _fmt_optional_ms(value: Any) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "N/A"
+    except Exception:
+        if value is None:
+            return "N/A"
+    try:
+        return _duration_str(float(value))
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _format_optional_ratio(value: Any) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "N/A"
+        return f"{float(value) * 100.0:.1f}%"
+    except Exception:
+        return "N/A"
+
+
+def _format_distribution_text(distribution: Any) -> str:
+    if distribution in (None, "", {}, []):
+        return "N/A"
+    if isinstance(distribution, dict):
+        parts: List[str] = []
+        for key in ("p50", "p90", "p95", "max"):
+            if key not in distribution:
+                continue
+            value = distribution.get(key)
+            parts.append(f"{key}={_fmt_optional_ms(value)}")
+        if parts:
+            return ", ".join(parts)
+    return str(distribution)
+
+
+def _build_operator_brief(runtime_snapshot: Dict[str, Any], explainer_rows: pd.DataFrame) -> Dict[str, str]:
+    control = runtime_snapshot.get("control_state") if isinstance(runtime_snapshot.get("control_state"), dict) else {}
+    state = str(runtime_snapshot.get("state") or runtime_snapshot.get("book_health") or "unknown")
+    quoteable = bool(runtime_snapshot.get("quoteable"))
+    selected_reason = str(runtime_snapshot.get("selected_reason") or "n/a")
+    regime = _extract_regime(runtime_snapshot)
+    pnl_total = float(runtime_snapshot.get("total_pnl") or 0.0)
+    fills = int(runtime_snapshot.get("fills") or 0)
+
+    if bool(control.get("kill_switch_enabled")):
+        return {
+            "headline": "Kill switch is active",
+            "summary": "Trading is stopped until the kill switch is cleared.",
+            "accent": "#ff3b5c",
+            "detail": f"State: {state} | Regime: {regime}",
+        }
+    if bool(control.get("flatten_only_mode")):
+        return {
+            "headline": "Flattening inventory only",
+            "summary": "New risk is blocked while the bot reduces existing exposure.",
+            "accent": "#fcee0a",
+            "detail": f"Selected reason: {_humanize_reason_codes(selected_reason)}",
+        }
+    if explainer_rows.empty and not quoteable and fills <= 0:
+        return {
+            "headline": "Waiting on market conditions",
+            "summary": f"{_humanize_reason_codes(selected_reason)}. No fills recorded in this session yet.",
+            "accent": "#fcee0a",
+            "detail": f"State: {state} | Regime: {regime} | Session PnL: {_fmt_money(pnl_total)}",
+        }
+
+    if not explainer_rows.empty:
+        latest = explainer_rows.iloc[0].to_dict()
+        decision = str(latest.get("decision_summary") or latest.get("action") or "Waiting")
+        plain = str(latest.get("plain_english") or "").strip()
+        reasons = _humanize_reason_codes(latest.get("reason_codes"))
+        if decision.lower() == "quote":
+            headline = "Trading now"
+            accent = "#05ffa1"
+            summary = plain or "The market is quoteable and the bot is posting liquidity."
+        elif decision.lower() == "freeze":
+            headline = "Trading is frozen"
+            accent = "#ff3b5c"
+            summary = plain or reasons
+        else:
+            headline = "Waiting for a better setup"
+            accent = "#fcee0a"
+            summary = plain or reasons
+        return {
+            "headline": headline,
+            "summary": summary,
+            "accent": accent,
+            "detail": f"Decision: {decision} | Reason: {reasons} | Regime: {regime}",
+        }
+
+    if quoteable:
+        return {
+            "headline": "Ready to trade",
+            "summary": "The market is quoteable, but no recent decision explanation is available yet.",
+            "accent": "#05ffa1",
+            "detail": f"Selected reason: {_humanize_reason_codes(selected_reason)} | Regime: {regime}",
+        }
+    return {
+        "headline": "Waiting on market conditions",
+        "summary": _humanize_reason_codes(selected_reason),
+        "accent": "#fcee0a",
+        "detail": f"State: {state} | Regime: {regime}",
+    }
+
+
 def _render_glass_metric(label: str, value: str, accent: str = "#00f0ff") -> None:
     assert st is not None
     st.markdown(
@@ -149,6 +397,33 @@ def _render_glass_metric(label: str, value: str, accent: str = "#00f0ff") -> Non
                     box-shadow:0 10px 30px rgba(0,0,0,0.20);min-height:88px;">
           <div style="font-size:0.74em;letter-spacing:0.12em;text-transform:uppercase;color:#9aa4b2;">{label}</div>
           <div style="margin-top:6px;font-size:1.15em;font-weight:700;color:{accent};font-family:Orbitron,monospace;">{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_compact_panel(title: str, rows: List[Tuple[str, Any]], accent: str = "#00f0ff") -> None:
+    assert st is not None
+    body = "".join(
+        f"""
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:8px 0;
+                    border-top:1px solid rgba(255,255,255,0.06);">
+          <div style="color:#7a8599;text-transform:uppercase;letter-spacing:0.10em;font-size:0.68em;">{label}</div>
+          <div style="color:#e6edf3;font-size:0.94em;font-weight:600;text-align:right;max-width:65%;
+                      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{value if value not in (None, "") else "N/A"}</div>
+        </div>
+        """
+        for label, value in rows
+    )
+    st.markdown(
+        f"""
+        <div style="padding:14px 16px;border:1px solid rgba(255,255,255,0.08);border-radius:18px;
+                    background:rgba(255,255,255,0.04);backdrop-filter:blur(14px);
+                    box-shadow:0 10px 28px rgba(0,0,0,0.22);">
+          <div style="color:{accent};font-size:0.72em;font-family:Orbitron,monospace;
+                      letter-spacing:0.14em;text-transform:uppercase;margin-bottom:2px;">{title}</div>
+          {body}
         </div>
         """,
         unsafe_allow_html=True,
@@ -167,6 +442,206 @@ def _display_runtime_table(df: pd.DataFrame, columns: List[str]) -> None:
     st.dataframe(show[columns], use_container_width=True, hide_index=True)
 
 
+def _queue_command(db_path: Path, *, command_type: str, payload: Optional[Dict[str, Any]] = None, scope: str = "global") -> None:
+    assert st is not None
+    try:
+        command_id = da.queue_control_command(
+            command_type=command_type,
+            payload=payload or {},
+            scope=scope,
+            requested_by="dashboard",
+            db_path=db_path,
+        )
+    except Exception as exc:
+        st.error(f"Failed to queue command: {exc}")
+        return
+    st.success(f"Queued {command_type} as {command_id}")
+
+
+def _render_run_control(db_path: Path, runtime_snapshot: Dict[str, Any]) -> None:
+    assert st is not None
+    control = da.get_control_plane_snapshot(db_path=db_path)
+    mode = str(runtime_snapshot.get("mode") or "UNKNOWN").upper()
+    st.markdown("### Run control")
+    cols = st.columns(4)
+    with cols[0]:
+        _render_glass_metric("Trading", "ENABLED" if control.get("trading_enabled", True) else "PAUSED", accent="#05ffa1" if control.get("trading_enabled", True) else "#fcee0a")
+    with cols[1]:
+        _render_glass_metric("Kill switch", "ON" if control.get("kill_switch_enabled") else "OFF", accent="#ff3b5c" if control.get("kill_switch_enabled") else "#05ffa1")
+    with cols[2]:
+        _render_glass_metric("Flatten-only", "ON" if control.get("flatten_only_mode") else "OFF", accent="#fcee0a" if control.get("flatten_only_mode") else "#05ffa1")
+    with cols[3]:
+        _render_glass_metric("Pending cmds", str(control.get("pending_count") or 0), accent="#fcee0a")
+
+    info_cols = st.columns(4)
+    with info_cols[0]:
+        _render_glass_metric("Cycle", _fmt(control.get("cycle_secs"), suffix="s", decimals=1))
+    with info_cols[1]:
+        _render_glass_metric("Safe profile", str(control.get("safe_risk_profile") or "custom").upper())
+    with info_cols[2]:
+        _render_glass_metric("Allocated equity", _fmt(control.get("strategy_allocated_equity"), prefix="$", decimals=0))
+    with info_cols[3]:
+        _render_glass_metric("Risk warning", "ON" if control.get("risk_warning_triggered") else "OFF", accent="#fcee0a" if control.get("risk_warning_triggered") else "#05ffa1")
+
+    btn_cols = st.columns(5 if mode == "PAPER" else 4)
+    with btn_cols[0]:
+        if st.button("Pause", key=f"pause_{db_path}", use_container_width=True):
+            _queue_command(db_path, command_type="pause_trading")
+    with btn_cols[1]:
+        if st.button("Resume", key=f"resume_{db_path}", use_container_width=True):
+            _queue_command(db_path, command_type="resume_trading")
+    with btn_cols[2]:
+        if st.button("Cancel Quotes", key=f"cancel_all_{db_path}", use_container_width=True):
+            _queue_command(db_path, command_type="cancel_all_quotes")
+    with btn_cols[3]:
+        if st.button("Kill Switch", key=f"kill_on_{db_path}", use_container_width=True):
+            _queue_command(db_path, command_type="kill_switch_on")
+    if mode == "PAPER":
+        with btn_cols[4]:
+            if st.button("Safe Restart", key=f"safe_restart_{db_path}", use_container_width=True):
+                _queue_command(db_path, command_type="restart_paper_run_safe_profile")
+        if control.get("kill_switch_enabled"):
+            if st.button("Clear Kill Switch", key=f"kill_off_{db_path}", use_container_width=True):
+                _queue_command(db_path, command_type="kill_switch_off")
+
+
+def _render_strategy_settings_controls(db_path: Path, runtime_snapshot: Dict[str, Any]) -> None:
+    assert st is not None
+    settings = da.get_strategy_settings_view(db_path=db_path)
+    current = dict(settings.get("current") or {})
+    pending_patch = dict(settings.get("pending_patch") or {})
+    last_applied_patch = dict(settings.get("last_applied_patch") or {})
+    mode = str(runtime_snapshot.get("mode") or "UNKNOWN").upper()
+
+    st.markdown("### Strategy settings")
+    if mode != "PAPER":
+        st.caption("Live v1 settings remain read-only. Emergency controls only.")
+    cols = st.columns(3)
+    with cols[0]:
+        _render_compact_panel("Current", [(k, current.get(k)) for k in ["safe_risk_profile", "strategy_allocated_equity", "trade_size", "max_size", "hard_position_cap", "quote_spread_multiplier"]], accent="#00f0ff")
+    with cols[1]:
+        _render_compact_panel("Pending", [(k, pending_patch.get(k)) for k in ["safe_risk_profile", "strategy_allocated_equity", "trade_size", "max_size", "hard_position_cap", "quote_spread_multiplier"]], accent="#fcee0a")
+    with cols[2]:
+        _render_compact_panel("Last applied", [(k, last_applied_patch.get(k)) for k in ["safe_risk_profile", "strategy_allocated_equity", "trade_size", "max_size", "hard_position_cap", "quote_spread_multiplier"]], accent="#05ffa1")
+
+    if mode != "PAPER":
+        return
+
+    with st.form(f"settings_patch_{db_path}"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            safe_risk_profile = st.selectbox("Safe risk profile", options=["custom", "200", "500", "1000"], index=max(0, ["custom", "200", "500", "1000"].index(str(current.get("safe_risk_profile") or "custom")) if str(current.get("safe_risk_profile") or "custom") in ["custom", "200", "500", "1000"] else 0))
+            strategy_allocated_equity = st.number_input("Allocated equity", min_value=0.0, value=float(current.get("strategy_allocated_equity") or 0.0), step=50.0)
+            trade_size = st.number_input("Trade size", min_value=0.0, value=float(current.get("trade_size") or 0.0), step=1.0)
+            max_size = st.number_input("Max size", min_value=0.0, value=float(current.get("max_size") or 0.0), step=1.0)
+            min_size = st.number_input("Min size", min_value=0.0, value=float(current.get("min_size") or 0.0), step=1.0)
+            fallback_size = st.number_input("Fallback size", min_value=0.0, value=float(current.get("fallback_size") or 0.0), step=1.0)
+        with c2:
+            hard_position_cap = st.number_input("Hard position cap", min_value=0.0, value=float(current.get("hard_position_cap") or 0.0), step=1.0)
+            min_order_size = st.number_input("Min order size", min_value=0.0, value=float(current.get("min_order_size") or 0.0), step=1.0)
+            within_pct = st.number_input("Within pct", min_value=0.0, value=float(current.get("within_pct") or 0.0), step=0.01, format="%.4f")
+            cycle_secs = st.number_input("Cycle secs", min_value=0.1, value=float(current.get("cycle_secs") or 1.0), step=0.1, format="%.2f")
+            refresh_market_secs = st.number_input("Refresh market secs", min_value=1.0, value=float(current.get("refresh_market_secs") or 60.0), step=5.0)
+            quote_spread_multiplier = st.number_input("Spread multiplier", min_value=0.1, value=float(current.get("quote_spread_multiplier") or 1.0), step=0.1, format="%.2f")
+        with c3:
+            per_event_loss_pct = st.number_input("Per-event loss pct", min_value=0.0, value=float(current.get("per_event_loss_pct") or 0.0), step=0.01, format="%.4f")
+            per_day_loss_pct = st.number_input("Per-day loss pct", min_value=0.0, value=float(current.get("per_day_loss_pct") or 0.0), step=0.01, format="%.4f")
+            stale_duration_scale = st.number_input("Stale duration scale", min_value=0.001, value=float(current.get("stale_duration_scale") or 0.0), step=0.001, format="%.4f")
+            maker_exit_grace_secs = st.number_input("Maker exit grace secs", min_value=0.0, value=float(current.get("maker_exit_grace_secs") or 0.0), step=1.0)
+            cross_escalation_drawdown_pct = st.number_input("Cross escalation pct", min_value=0.0, value=float(current.get("cross_escalation_drawdown_pct") or 0.0), step=0.001, format="%.4f")
+            market_dwell_secs = st.number_input("Market dwell secs", min_value=0.0, value=float(current.get("market_dwell_secs") or 0.0), step=5.0)
+        submit = st.form_submit_button("Stage config patch", use_container_width=True)
+        if submit:
+            candidate_patch = {
+                "safe_risk_profile": safe_risk_profile,
+                "strategy_allocated_equity": strategy_allocated_equity,
+                "trade_size": trade_size,
+                "max_size": max_size,
+                "min_size": min_size,
+                "fallback_size": fallback_size,
+                "hard_position_cap": hard_position_cap,
+                "min_order_size": min_order_size,
+                "within_pct": within_pct,
+                "cycle_secs": cycle_secs,
+                "refresh_market_secs": refresh_market_secs,
+                "quote_spread_multiplier": quote_spread_multiplier,
+                "per_event_loss_pct": per_event_loss_pct,
+                "per_day_loss_pct": per_day_loss_pct,
+                "stale_duration_scale": stale_duration_scale,
+                "maker_exit_grace_secs": maker_exit_grace_secs,
+                "cross_escalation_drawdown_pct": cross_escalation_drawdown_pct,
+                "market_dwell_secs": market_dwell_secs,
+            }
+            patch = {}
+            for key, value in candidate_patch.items():
+                current_value = current.get(key)
+                if isinstance(value, str):
+                    if str(current_value or "") != value:
+                        patch[key] = value
+                    continue
+                try:
+                    current_float = float(current_value) if current_value is not None else None
+                except (TypeError, ValueError):
+                    current_float = None
+                if current_float is None or abs(float(value) - current_float) > 1e-9:
+                    patch[key] = float(value)
+            if not patch:
+                st.info("No setting changes to stage.")
+            else:
+                _queue_command(db_path, command_type="apply_config_patch", payload={"patch": patch})
+
+
+def _render_operator_portfolio_controls(db_path: Path, runtime_snapshot: Dict[str, Any]) -> None:
+    assert st is not None
+    health = runtime_snapshot.get("active_market_health") if isinstance(runtime_snapshot.get("active_market_health"), dict) else {}
+    portfolio_risk = health.get("portfolio_risk") if isinstance(health.get("portfolio_risk"), dict) else {}
+    broker_stats = health.get("broker_stats") if isinstance(health.get("broker_stats"), dict) else {}
+    market_id = str(runtime_snapshot.get("market") or "")
+    event_id = str(health.get("event_id") or "")
+    mode = str(runtime_snapshot.get("mode") or "UNKNOWN").upper()
+
+    st.markdown("### Portfolio management")
+    cols = st.columns(4)
+    with cols[0]:
+        _render_glass_metric("Gross exposure", _fmt_money(portfolio_risk.get("gross_exposure") or 0.0))
+    with cols[1]:
+        _render_glass_metric("Unrealized", _fmt_money(portfolio_risk.get("unrealized_pnl") or 0.0), accent="#05ffa1" if float(portfolio_risk.get("unrealized_pnl") or 0.0) >= 0 else "#ff3b5c")
+    with cols[2]:
+        _render_glass_metric("Realized", _fmt_money(broker_stats.get("realized_net_pnl") or 0.0), accent="#05ffa1" if float(broker_stats.get("realized_net_pnl") or 0.0) >= 0 else "#ff3b5c")
+    with cols[3]:
+        _render_glass_metric("Active positions", str(int(portfolio_risk.get("active_positions") or 0)))
+    if mode == "PAPER":
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            if st.button("Flatten event", key=f"flatten_event_{db_path}", use_container_width=True, disabled=not bool(event_id)):
+                _queue_command(db_path, command_type="flatten_event_inventory", payload={"event_id": event_id}, scope="event")
+        with action_cols[1]:
+            if st.button("Flatten market", key=f"flatten_market_{db_path}", use_container_width=True, disabled=not bool(market_id)):
+                _queue_command(db_path, command_type="flatten_market_inventory", payload={"market_id": market_id}, scope="market")
+    else:
+        st.caption("Live v1 portfolio actions remain read-only except pause / kill-switch controls.")
+
+
+def _render_overnight_supervision(db_path: Path) -> None:
+    assert st is not None
+    rows = da.get_overnight_supervision_rows(db_path=db_path)
+    alerts = da.get_runtime_alert_feed(db_path=db_path)
+    commands = da.get_recent_control_commands(db_path=db_path, limit=12)
+    st.markdown("### Overnight supervision")
+    if rows.empty:
+        st.caption("No overnight supervision rows yet.")
+    else:
+        _display_runtime_table(rows, [col for col in ["workstream", "owner", "status", "evidence", "next_task"] if col in rows.columns])
+    if not alerts.empty:
+        st.markdown("**Alert feed**")
+        _display_runtime_table(alerts, [col for col in ["severity", "owner", "alert_type", "summary", "next_action"] if col in alerts.columns])
+    with st.expander("Control audit", expanded=False):
+        if not commands.empty:
+            _display_runtime_table(commands, [col for col in ["requested_at_ms", "command_type", "scope", "status", "requested_by"] if col in commands.columns])
+        else:
+            st.caption("No control commands yet.")
+
+
 # ── Enhancement A: Market Expiry Countdown ───────────────────────────────────
 
 
@@ -176,12 +651,15 @@ def _parse_expiry_ms(market_id: Optional[str]) -> Optional[int]:
     return int(m.group(1)) * 1000 if m else None
 
 
-def _expiry_badge(market_id: Optional[str]) -> str:
+def _expiry_badge(market_id: Optional[str], *, time_to_expiry_ms: Optional[int] = None) -> str:
     """HTML badge showing time remaining until market close."""
-    expiry_ms = _parse_expiry_ms(market_id)
-    if not expiry_ms:
+    remaining_ms = time_to_expiry_ms
+    if remaining_ms is None:
+        expiry_ms = _parse_expiry_ms(market_id)
+        if expiry_ms:
+            remaining_ms = expiry_ms - int(_time_mod.time() * 1000)
+    if remaining_ms is None:
         return ""
-    remaining_ms = expiry_ms - int(_time_mod.time() * 1000)
     if remaining_ms <= 0:
         return '<span style="color:#f87171;font-weight:600;margin-left:12px;">EXPIRED</span>'
     color = "#f87171" if remaining_ms < 120_000 else ("#facc15" if remaining_ms < 300_000 else "#6ee7b7")
@@ -224,6 +702,8 @@ def _render_health_banner(summary: Dict[str, Any], pnl: Dict[str, Any], sys_payl
     has_books = bool(runner.get("has_books"))
     connected = bool(feed.get("connected"))
     book_updates = int(feed.get("applied_book_updates") or 0)
+    health = sys_payload.get("active_market_health") if isinstance(sys_payload.get("active_market_health"), dict) else {}
+    selection = sys_payload.get("selection") if isinstance(sys_payload.get("selection"), dict) else {}
 
     degraded: List[str] = []
     if not connected:
@@ -233,7 +713,10 @@ def _render_health_banner(summary: Dict[str, Any], pnl: Dict[str, Any], sys_payl
 
     health_class = "warn" if degraded else "ok"
     health_label = "DEGRADED" if degraded else "HEALTHY"
-    expiry_html = _expiry_badge(market_id)
+    expiry_html = _expiry_badge(
+        market_id,
+        time_to_expiry_ms=_time_to_expiry_ms(health, selection, runner),
+    )
 
     dot_class = "live-dot" if not degraded else "live-dot-alert"
     banner_html = f"""
@@ -1383,7 +1866,39 @@ def _render_fills_table(db_path: Path, sys_payload: Dict[str, Any]) -> None:
         return
 
     display = fills_df[
-        [c for c in ["ts", "side", "fill_price", "fill_qty", "realized_net_pnl_delta", "fee_usdc", "token_id"] if c in fills_df.columns]
+        [
+            c
+            for c in [
+                "ts",
+                "side",
+                "fill_price",
+                "fill_qty",
+                "risk_action",
+                "risk_state",
+                "stale_state",
+                "exit_mode",
+                "exit_escalation_reason",
+                "event_id",
+                "current_equity",
+                "market_exposure_notional",
+                "event_exposure_notional",
+                "control_state",
+                "hedge_action",
+                "hedge_action_reason",
+                "hedge_cluster_id",
+                "hedge_market_id",
+                "hedge_target_token_id",
+                "hedge_target_side",
+                "hedge_preferred_side",
+                "hedge_ratio",
+                "hedge_quality_score",
+                "realized_net_pnl_delta",
+                "fee_usdc",
+                "token_id",
+                "market_slug",
+            ]
+            if c in fills_df.columns
+        ]
     ].copy()
 
     if "ts" in display.columns:
@@ -1392,6 +1907,12 @@ def _render_fills_table(db_path: Path, sys_payload: Dict[str, Any]) -> None:
         display["fill_price"] = display["fill_price"].map(lambda v: f"{v:.4f}" if pd.notna(v) else "")
     if "fill_qty" in display.columns:
         display["fill_qty"] = display["fill_qty"].map(lambda v: f"{v:.1f}" if pd.notna(v) else "")
+    for col in ["risk_action", "risk_state", "stale_state", "exit_mode"]:
+        if col in display.columns:
+            display[col] = display[col].fillna("").astype(str)
+    for col in ["current_equity", "market_exposure_notional", "event_exposure_notional"]:
+        if col in display.columns:
+            display[col] = display[col].map(lambda v: f"${v:.2f}" if pd.notna(v) else "")
     if "realized_net_pnl_delta" in display.columns:
         display["realized_net_pnl_delta"] = display["realized_net_pnl_delta"].map(
             lambda v: f"${v:.4f}" if pd.notna(v) else ""
@@ -1406,6 +1927,44 @@ def _render_fills_table(db_path: Path, sys_payload: Dict[str, Any]) -> None:
     display.columns = [c.replace("_", " ").title() for c in display.columns]
     display = display.rename(columns={"Token Id": "Token"})
 
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+def _render_fill_risk_timeline(db_path: Path) -> None:
+    assert st is not None
+    timeline = da.get_fill_risk_timeline(limit=40, db_path=db_path)
+    if timeline.empty:
+        st.caption("No fill/risk timeline events yet.")
+        return
+    display = timeline[
+        [
+            c
+            for c in [
+                "ts",
+                "event_kind",
+                "market_slug",
+                "token_id",
+                "summary",
+                "control_state",
+                "hedge_action",
+                "hedge_action_reason",
+                "hedge_cluster_id",
+                "hedge_market_id",
+                "hedge_target_token_id",
+                "hedge_target_side",
+                "hedge_preferred_side",
+                "risk_action",
+                "exit_mode",
+            ]
+            if c in timeline.columns
+        ]
+    ].copy()
+    if "ts" in display.columns:
+        display["ts"] = display["ts"].dt.strftime("%H:%M:%S")
+    for col in ["event_kind", "risk_action", "exit_mode", "market_slug", "token_id", "summary"]:
+        if col in display.columns:
+            display[col] = display[col].fillna("").astype(str)
+    display.columns = [c.replace("_", " ").title() for c in display.columns]
     st.dataframe(display, use_container_width=True, hide_index=True)
 
 
@@ -1683,6 +2242,8 @@ def _render_bot_thinking(sys_payload: Dict[str, Any], db_path: Path) -> None:
         ask_mode = str(quote.get("ask_mode") or "—")
         buy_amt = size.get("buy_amount") or 0
         sell_amt = size.get("sell_amount") or 0
+        buy_limiter = _format_size_limiter(size, "buy")
+        sell_limiter = _format_size_limiter(size, "sell")
         flow_reason = str(flow.get("reason") or "—")
         allow_buy = flow.get("allow_buy", True)
         allow_sell = flow.get("allow_sell", True)
@@ -1715,6 +2276,7 @@ def _render_bot_thinking(sys_payload: Dict[str, Any], db_path: Path) -> None:
             _row("Flow", f'<span style="color:{flow_color}">{flow_icon} {flow_reason}</span>'),
             _row("Risk", f'<span style="color:{risk_color}">{risk_action}</span>'),
             _row("Size", f'buy {buy_amt:.0f} / sell {sell_amt:.0f}'),
+            _row("Limits", f'<span style="font-size:0.78em;">buy {buy_limiter}; sell {sell_limiter}</span>'),
             _row("Position", f'<b>{position:.1f}</b>'),
             _row("Imbalance", imb_str),
         ])
@@ -1868,6 +2430,546 @@ def _render_inventory_strip(sys_payload: Dict[str, Any], db_path: Path) -> None:
     )
 
 
+def _render_operator_hero(
+    *,
+    runtime_snapshot: Dict[str, Any],
+    explainer_rows: pd.DataFrame,
+    pnl: Dict[str, Any],
+    curve: pd.DataFrame,
+    db_path: Path,
+) -> None:
+    assert st is not None
+    brief = _build_operator_brief(runtime_snapshot, explainer_rows)
+    control = da.get_control_plane_snapshot(db_path=db_path)
+    health = runtime_snapshot.get("active_market_health") if isinstance(runtime_snapshot.get("active_market_health"), dict) else {}
+    portfolio_risk = health.get("portfolio_risk") if isinstance(health.get("portfolio_risk"), dict) else {}
+    summary_cards = st.columns(4)
+    with summary_cards[0]:
+        _render_glass_metric("Quoteable", "YES" if bool(runtime_snapshot.get("quoteable")) else "NO", accent="#05ffa1" if bool(runtime_snapshot.get("quoteable")) else "#ff3b5c")
+    with summary_cards[1]:
+        _render_glass_metric("Risk mode", "FLATTEN" if control.get("flatten_only_mode") else ("PAUSED" if not control.get("trading_enabled", True) else "ACTIVE"), accent="#fcee0a" if control.get("flatten_only_mode") else ("#ff3b5c" if not control.get("trading_enabled", True) else "#05ffa1"))
+    with summary_cards[2]:
+        _render_glass_metric("Regime", _extract_regime(runtime_snapshot).upper(), accent="#00f0ff")
+    with summary_cards[3]:
+        _render_glass_metric("Exposure", _fmt_money(portfolio_risk.get("gross_exposure") or 0.0), accent="#fcee0a")
+
+    chart_col, brief_col = st.columns([7, 5])
+    with chart_col:
+        _pnl_drawdown_chart(curve)
+    with brief_col:
+        st.markdown(
+            f"""
+            <div style="padding:16px 18px;border:1px solid rgba(255,255,255,0.08);border-radius:18px;
+                        background:rgba(255,255,255,0.05);backdrop-filter:blur(14px);
+                        box-shadow:0 12px 30px rgba(0,0,0,0.22);min-height:340px;">
+              <div style="font-size:0.72em;color:#7a8599;text-transform:uppercase;letter-spacing:0.14em;">Operator brief</div>
+              <div style="margin-top:8px;font-family:Orbitron,monospace;font-size:1.35em;font-weight:700;color:{brief['accent']};">
+                {brief['headline']}
+              </div>
+              <div style="margin-top:10px;color:#e6edf3;font-size:0.98em;line-height:1.45;">
+                {brief['summary']}
+              </div>
+              <div style="margin-top:14px;padding:10px 12px;border-radius:12px;background:rgba(0,0,0,0.18);
+                          color:#aab4c3;font-size:0.85em;line-height:1.45;">
+                {brief['detail']}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        _render_compact_panel(
+            "Current supervision",
+            [
+                ("selected market", runtime_snapshot.get("market") or "N/A"),
+                ("state", runtime_snapshot.get("state") or runtime_snapshot.get("book_health") or "unknown"),
+                ("selected reason", _humanize_reason_codes(runtime_snapshot.get("selected_reason"))),
+                ("last update", _fmt_last_update(runtime_snapshot.get("updated_at_ms"))),
+                ("pnl", _fmt_money(runtime_snapshot.get("total_pnl") or pnl.get("total_pnl") or 0.0)),
+            ],
+            accent="#fcee0a",
+        )
+
+
+def _render_cluster_exposure_panel(db_path: Path, runtime_snapshot: Dict[str, Any]) -> None:
+    assert st is not None
+    cluster_snapshot = da.get_cluster_exposure_snapshot(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    cluster_rows = da.get_cluster_exposure_rows(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    market_rows = da.get_cluster_market_rows(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    calibration_gaps = da.get_cluster_calibration_gaps(runtime_snapshot=runtime_snapshot, db_path=db_path)
+
+    st.markdown("### Event cluster exposure")
+    if cluster_rows.empty:
+        st.caption("Cluster exposure is not available for this runtime yet.")
+        return
+
+    active_cluster = cluster_rows.sort_values(
+        by=["active_market_count", "gross_exposure"],
+        ascending=[False, False],
+    ).iloc[0].to_dict()
+
+    top = st.columns(4)
+    with top[0]:
+        _render_glass_metric("Clusters", str(int(cluster_snapshot.get("cluster_count") or len(cluster_rows))))
+    with top[1]:
+        _render_glass_metric("Active clusters", str(int(cluster_snapshot.get("active_cluster_count") or 0)), accent="#05ffa1")
+    with top[2]:
+        _render_glass_metric("Cluster gross", _fmt_money(cluster_snapshot.get("gross_exposure") or 0.0), accent="#fcee0a")
+    with top[3]:
+        _render_glass_metric("Cluster unrealized", _fmt_money(cluster_snapshot.get("unrealized_pnl") or 0.0), accent="#05ffa1" if float(cluster_snapshot.get("unrealized_pnl") or 0.0) >= 0 else "#ff3b5c")
+
+    st.markdown("#### Cluster cards")
+    cluster_cards = st.columns(min(3, max(1, len(cluster_rows))))
+    for idx, (_, cluster_row) in enumerate(cluster_rows.head(6).iterrows()):
+        with cluster_cards[idx % len(cluster_cards)]:
+            _render_compact_panel(
+                str(cluster_row.get("cluster_id") or f"Cluster {idx + 1}"),
+                [
+                    ("markets", f"{int(cluster_row.get('active_market_count') or 0)}/{int(cluster_row.get('market_count') or 0)} active"),
+                    ("net", _cluster_net_label(cluster_row.get("net_yes_exposure_notional"))),
+                    ("gross", _fmt_money(cluster_row.get("gross_exposure") or 0.0)),
+                    ("control", _control_state_text(cluster_row.get("control_state"))),
+                    ("hedge", _hedge_action_label(cluster_row.get("hedge_action"))),
+                    ("stale", _stale_inventory_label(cluster_row.get("stale_inventory_state"), cluster_row.get("stale_market_count"))),
+                    ("expiry", _duration_str(cluster_row.get("time_to_expiry_ms"))),
+                ],
+                accent="#05ffa1" if int(cluster_row.get("active_market_count") or 0) > 0 else "#00f0ff",
+            )
+
+    calibration_cols = st.columns(5)
+    with calibration_cols[0]:
+        _render_glass_metric("Net exposure", _cluster_net_label(active_cluster.get("net_yes_exposure_notional")), accent="#00f0ff")
+    with calibration_cols[1]:
+        _render_glass_metric("Gross exposure", _fmt_money(active_cluster.get("gross_exposure") or 0.0), accent="#fcee0a")
+    with calibration_cols[2]:
+        _render_glass_metric("Active markets", str(int(active_cluster.get("active_market_count") or 0)), accent="#05ffa1")
+    with calibration_cols[3]:
+        _render_glass_metric("Time to expiry", _duration_str(active_cluster.get("time_to_expiry_ms")), accent="#05ffa1")
+    with calibration_cols[4]:
+        _render_glass_metric("Hedge label", _control_state_text(active_cluster.get("hedge_action")), accent="#fcee0a")
+
+    detail_cols = st.columns(2)
+    with detail_cols[0]:
+        _render_compact_panel(
+            "Active cluster",
+            [
+                ("cluster", active_cluster.get("cluster_id")),
+                ("net exposure", _cluster_net_label(active_cluster.get("net_yes_exposure_notional"))),
+                ("gross exposure", _fmt_money(active_cluster.get("gross_exposure"))),
+                ("markets", f"{int(active_cluster.get('active_market_count') or 0)}/{int(active_cluster.get('market_count') or 0)} active"),
+                ("time to expiry", _duration_str(active_cluster.get("time_to_expiry_ms"))),
+            ],
+            accent="#00f0ff",
+        )
+    with detail_cols[1]:
+        _render_compact_panel(
+            "Cluster controls",
+            [
+                ("event cap", _fmt_money(active_cluster.get("max_event_exposure_notional"))),
+                ("cap remaining", _fmt_money(active_cluster.get("remaining_event_exposure_notional"))),
+                ("control state", _control_state_text(active_cluster.get("control_state"))),
+                ("hedge state", _control_state_text(active_cluster.get("hedge_action"))),
+                ("reason", active_cluster.get("hedge_action_reason") or "N/A"),
+                ("hedge ratio", _fmt(active_cluster.get("hedge_ratio"), decimals=2)),
+                ("target market", active_cluster.get("hedge_target_market") or "N/A"),
+                ("target token/side", " / ".join([part for part in [str(active_cluster.get("hedge_target_token") or "").strip(), str(active_cluster.get("hedge_target_side") or "").strip()] if part]) or "N/A"),
+            ],
+            accent="#fcee0a",
+        )
+
+    question_cols = st.columns(2)
+    with question_cols[0]:
+        _render_compact_panel(
+            "Calibration questions answered",
+            [
+                ("bias", _cluster_net_label(active_cluster.get("net_yes_exposure_notional"))),
+                ("gross risk", _fmt_money(active_cluster.get("gross_exposure"))),
+                ("concurrency", f"{int(active_cluster.get('active_market_count') or 0)}/{int(active_cluster.get('market_count') or 0)} active"),
+                ("expiry pressure", _duration_str(active_cluster.get("time_to_expiry_ms"))),
+                ("event headroom", _fmt_money(active_cluster.get("remaining_event_exposure_notional"))),
+            ],
+            accent="#05ffa1",
+        )
+    with question_cols[1]:
+        unanswered = _cluster_gap_questions(calibration_gaps)
+        _render_compact_panel(
+            "Still unknown from runtime",
+            [
+                ("question 1", unanswered[0] if len(unanswered) > 0 else "None"),
+                ("question 2", unanswered[1] if len(unanswered) > 1 else "None"),
+                ("question 3", unanswered[2] if len(unanswered) > 2 else "None"),
+                ("question 4", unanswered[3] if len(unanswered) > 3 else "None"),
+                ("question 5", unanswered[4] if len(unanswered) > 4 else "None"),
+            ],
+            accent="#ff3b5c",
+        )
+
+    if calibration_gaps:
+        st.caption("Calibration visibility gaps: " + ", ".join(calibration_gaps))
+
+    with st.expander("Cluster calibration detail", expanded=False):
+        show_clusters = cluster_rows.copy()
+        show_clusters["time_to_expiry"] = show_clusters["time_to_expiry_ms"].apply(_duration_str)
+        cluster_cols = [
+            col
+            for col in [
+                "cluster_id",
+                "market_count",
+                "active_market_count",
+                "yes_exposure_notional",
+                "no_exposure_notional",
+                "net_yes_exposure_notional",
+                "gross_exposure",
+                "unrealized_pnl",
+                "time_to_expiry",
+                "max_event_exposure_notional",
+                "remaining_event_exposure_notional",
+                "control_state",
+                "hedge_action",
+                "hedge_action_reason",
+                "hedge_ratio",
+                "hedge_target_market",
+                "hedge_target_token",
+                "hedge_target_side",
+            ]
+            if col in show_clusters.columns and (col not in {"control_state", "hedge_action", "hedge_action_reason", "hedge_ratio", "hedge_target_market", "hedge_target_token", "hedge_target_side"} or show_clusters[col].notna().any())
+        ]
+        _display_runtime_table(show_clusters, cluster_cols)
+
+        if not market_rows.empty:
+            st.caption("Markets inside the selected event clusters")
+            show_markets = market_rows.copy()
+            show_markets["time_to_expiry"] = show_markets["time_to_expiry_ms"].apply(_duration_str)
+            market_cols = [
+                col
+                for col in [
+                    "cluster_id",
+                    "market_id",
+                    "active",
+                    "yes_exposure_notional",
+                    "no_exposure_notional",
+                    "market_position_notional",
+                    "market_unrealized_pnl",
+                    "time_to_expiry",
+                    "hedge_action",
+                    "hedge_action_reason",
+                    "hedge_ratio",
+                    "hedge_target_market",
+                    "hedge_target_token",
+                    "hedge_target_side",
+                ]
+                if col in show_markets.columns and (col not in {"hedge_action", "hedge_action_reason", "hedge_ratio", "hedge_target_market", "hedge_target_token", "hedge_target_side"} or show_markets[col].notna().any())
+            ]
+            _display_runtime_table(show_markets, market_cols)
+
+
+def _render_active_books_portfolio_panel(db_path: Path, runtime_snapshot: Dict[str, Any]) -> None:
+    assert st is not None
+    active_rows = da.get_active_market_rows(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    st.markdown("### Active books across portfolio")
+    if active_rows.empty:
+        st.caption("Active multi-market book detail is not available for this runtime yet.")
+        return
+
+    stale_count = int((active_rows.get("stale_inventory_state", pd.Series(dtype=object)).astype(str).str.lower() == "stale").sum()) if "stale_inventory_state" in active_rows.columns else 0
+    cluster_count = int(active_rows.get("cluster_id", pd.Series(dtype=object)).fillna("unmapped").nunique())
+    hedge_action_count = int(active_rows.get("hedge_action", pd.Series(dtype=object)).fillna("").astype(str).replace("NONE", "").replace("N/A", "").ne("").sum()) if "hedge_action" in active_rows.columns else 0
+
+    top = st.columns(4)
+    with top[0]:
+        _render_glass_metric("Active books", str(len(active_rows)), accent="#05ffa1")
+    with top[1]:
+        _render_glass_metric("Clusters touched", str(cluster_count), accent="#00f0ff")
+    with top[2]:
+        _render_glass_metric("Stale books", str(stale_count), accent="#ff3b5c" if stale_count > 0 else "#05ffa1")
+    with top[3]:
+        _render_glass_metric("Books under cluster action", str(hedge_action_count), accent="#fcee0a" if hedge_action_count > 0 else "#05ffa1")
+
+    cols = st.columns(min(3, max(1, len(active_rows))))
+    for idx, (_, market_row) in enumerate(active_rows.head(6).iterrows()):
+        with cols[idx % len(cols)]:
+            _render_compact_panel(
+                str(market_row.get("market_id") or f"Market {idx + 1}"),
+                [
+                    ("cluster", market_row.get("cluster_id") or "N/A"),
+                    ("exposure", _fmt_money(market_row.get("market_position_notional"))),
+                    ("unrealized", _fmt_money(market_row.get("market_unrealized_pnl"))),
+                    ("stale", _stale_inventory_label(market_row.get("stale_inventory_state"))),
+                    ("control", _control_state_text(market_row.get("control_state"))),
+                    ("hedge", _hedge_action_label(market_row.get("hedge_action"))),
+                    ("expiry", _duration_str(market_row.get("time_to_expiry_ms"))),
+                ],
+                accent="#ff3b5c" if str(market_row.get("stale_inventory_state") or "").lower() == "stale" else "#00f0ff",
+            )
+
+    with st.expander("Active book detail", expanded=False):
+        detail = active_rows.copy()
+        if "time_to_expiry_ms" in detail.columns:
+            detail["time_to_expiry"] = detail["time_to_expiry_ms"].apply(_duration_str)
+        cols = [
+            col
+            for col in [
+                "cluster_id",
+                "market_id",
+                "market_position_notional",
+                "market_unrealized_pnl",
+                "stale_inventory_state",
+                "control_state",
+                "hedge_action",
+                "hedge_action_reason",
+                "affected_by_cluster_action",
+                "time_to_expiry",
+            ]
+            if col in detail.columns
+        ]
+        _display_runtime_table(detail, cols)
+
+
+def _render_selection_diagnostics_panel(db_path: Path, runtime_snapshot: Dict[str, Any]) -> None:
+    assert st is not None
+    diag_rows = da.get_selection_diagnostic_rows(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    gaps = da.get_selection_diagnostic_gaps(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    st.markdown("### Selection diagnostics")
+    if diag_rows.empty:
+        st.caption("Selection candidate diagnostics are not available for this runtime yet.")
+        return
+
+    accepted_rows = diag_rows[diag_rows["accepted"].astype(bool)].copy()
+    rejected_rows = diag_rows[~diag_rows["accepted"].astype(bool)].copy()
+    top_reject_reason = "N/A"
+    if not rejected_rows.empty:
+        top_reject_reason = _humanize_reason_codes(rejected_rows["reason"].fillna("").astype(str).mode().iloc[0] if not rejected_rows["reason"].dropna().empty else "N/A")
+    suppressed_rows = diag_rows[
+        diag_rows.get("blocking_market_id", pd.Series(dtype=object)).notna()
+        | diag_rows.get("blocking_cluster_id", pd.Series(dtype=object)).notna()
+        | diag_rows.get("blocking_reason", pd.Series(dtype=object)).notna()
+    ].copy()
+
+    top = st.columns(4)
+    with top[0]:
+        _render_glass_metric("Accepted", str(len(accepted_rows)), accent="#05ffa1")
+    with top[1]:
+        _render_glass_metric("Rejected", str(len(rejected_rows)), accent="#ff3b5c" if len(rejected_rows) > 0 else "#05ffa1")
+    with top[2]:
+        _render_glass_metric("Suppression visible", str(len(suppressed_rows)), accent="#fcee0a" if len(suppressed_rows) > 0 else "#00f0ff")
+    with top[3]:
+        _render_glass_metric("Top reject reason", top_reject_reason, accent="#fcee0a")
+
+    panels = st.columns(2)
+    with panels[0]:
+        best_accept = accepted_rows.iloc[0].to_dict() if not accepted_rows.empty else {}
+        _render_compact_panel(
+            "Accepted queue",
+            [
+                ("top market", best_accept.get("ticker") or "N/A"),
+                ("score", _fmt(best_accept.get("score"), decimals=3)),
+                ("liquidity", _fmt(best_accept.get("liquidity_score"), decimals=3)),
+                ("reason", _humanize_reason_codes(best_accept.get("reason"))),
+                ("quoteability", best_accept.get("quoteability_state") or "N/A"),
+            ],
+            accent="#05ffa1",
+        )
+    with panels[1]:
+        best_reject = rejected_rows.iloc[0].to_dict() if not rejected_rows.empty else {}
+        _render_compact_panel(
+            "Rejected queue",
+            [
+                ("top reject", best_reject.get("ticker") or "N/A"),
+                ("reason", _humanize_reason_codes(best_reject.get("reason"))),
+                ("blocking market", best_reject.get("blocking_market_id") or "N/A"),
+                ("blocking cluster", best_reject.get("blocking_cluster_id") or "N/A"),
+                ("blocking rule", best_reject.get("blocking_reason") or "N/A"),
+            ],
+            accent="#ff3b5c",
+        )
+
+    if gaps:
+        unanswered = _selection_gap_questions(gaps)
+        st.caption("Multi-market visibility gaps: " + ", ".join(gaps))
+        _render_compact_panel(
+            "Still unknown from runtime",
+            [(f"question {idx + 1}", question) for idx, question in enumerate(unanswered[:3])],
+            accent="#ff3b5c",
+        )
+
+    with st.expander("Selection diagnostic detail", expanded=False):
+        show = diag_rows.copy()
+        show["reason"] = show["reason"].apply(_humanize_reason_codes)
+        cols = [
+            col
+            for col in [
+                "status",
+                "ticker",
+                "reason",
+                "quoteability_state",
+                "score",
+                "liquidity_score",
+                "transition_risk",
+                "proximity_score",
+                "volume",
+                "blocking_market_id",
+                "blocking_cluster_id",
+                "blocking_reason",
+            ]
+            if col in show.columns and (col not in {"blocking_market_id", "blocking_cluster_id", "blocking_reason"} or show[col].notna().any())
+        ]
+        _display_runtime_table(show, cols)
+
+
+def _render_hedge_readout_panel(db_path: Path, runtime_snapshot: Dict[str, Any], view_mode: Optional[Any] = None) -> None:
+    assert st is not None
+    hedge_summary = da.get_hedge_readout_summary(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    st.markdown("### Hedge readout")
+
+    candidate_count = int(hedge_summary.get("candidate_count") or 0)
+    accepted_count = int(hedge_summary.get("accepted_count") or 0)
+    rejected_count = int(hedge_summary.get("rejected_count") or 0)
+    if candidate_count <= 0:
+        st.caption("Hedge candidate diagnostics are not available for this runtime yet.")
+
+    top = st.columns(5)
+    with top[0]:
+        _render_glass_metric("Candidates", str(candidate_count), accent="#00f0ff")
+    with top[1]:
+        accepted_rate = hedge_summary.get("accepted_rate")
+        accepted_text = f"{accepted_count}/{candidate_count}" if candidate_count > 0 else "N/A"
+        if accepted_rate is not None:
+            accepted_text = f"{accepted_text} ({_format_optional_ratio(accepted_rate)})"
+        _render_glass_metric("Accepted", accepted_text, accent="#05ffa1" if accepted_count > 0 else "#fcee0a")
+    with top[2]:
+        _render_glass_metric("Rejected", str(rejected_count), accent="#ff3b5c" if rejected_count > 0 else "#05ffa1")
+    with top[3]:
+        quality_gap = hedge_summary.get("quality_gap")
+        quality_text = _fmt(quality_gap, decimals=3) if quality_gap is not None else "N/A"
+        _render_glass_metric("Quality gap", quality_text, accent="#fcee0a")
+    with top[4]:
+        hold_tail = hedge_summary.get("hold_tail") if isinstance(hedge_summary.get("hold_tail"), dict) else {}
+        hold_tail_text = _fmt_optional_ms(hold_tail.get("p95_ms") if isinstance(hold_tail, dict) else None)
+        _render_glass_metric("Hold tail p95", hold_tail_text, accent="#a78bfa")
+
+    selected_reason = hedge_summary.get("selection_reason") or runtime_snapshot.get("selected_reason") or "N/A"
+    top_rejection_reason = hedge_summary.get("top_rejection_reason")
+    top_rejection_count = int(hedge_summary.get("top_rejection_reason_count") or 0)
+    hold_tail = hedge_summary.get("hold_tail") if isinstance(hedge_summary.get("hold_tail"), dict) else {}
+    hold_tail_summary = _format_distribution_text(hold_tail.get("distribution"))
+    hold_tail_source = str(hold_tail.get("source") or "N/A").replace("_", " ")
+    forced_flat_markets = hedge_summary.get("forced_flat_markets") or []
+    forced_flat_events = hedge_summary.get("forced_flat_events") or []
+    flatten_only_cycles = int(hedge_summary.get("flatten_only_cycles") or 0)
+
+    status_bits = [
+        f"Selected reason: {_humanize_reason_codes(selected_reason)}",
+        f"Top rejection: {_humanize_reason_codes(top_rejection_reason)} ({top_rejection_count})" if top_rejection_reason else "Top rejection: N/A",
+        f"Hold tail source: {hold_tail_source}",
+        f"Forced-flat markets: {len(forced_flat_markets)}",
+        f"Forced-flat events: {len(forced_flat_events)}",
+        f"Flatten-only cycles: {flatten_only_cycles}",
+    ]
+    st.caption(" | ".join(status_bits))
+
+    if hedge_summary.get("stale_unwind_observed") or hedge_summary.get("force_flat_observed") or hedge_summary.get("day_loss_observed"):
+        observed_bits = []
+        if hedge_summary.get("stale_unwind_observed"):
+            observed_bits.append("stale unwind observed")
+        if hedge_summary.get("force_flat_observed"):
+            observed_bits.append("force-flat observed")
+        if hedge_summary.get("day_loss_observed"):
+            observed_bits.append("flatten-only observed")
+        st.caption("Flattening diagnostics: " + ", ".join(observed_bits))
+
+    if not _is_dev_mode(view_mode):
+        if top_rejection_reason:
+            st.caption(f"Top hedge rejection reason: {_humanize_reason_codes(top_rejection_reason)}")
+        if hold_tail_summary != "N/A":
+            st.caption(f"Hold-tail distribution: {hold_tail_summary}")
+
+    with st.expander("Hedge candidate detail", expanded=False):
+        detail = da.get_selection_diagnostic_rows(runtime_snapshot=runtime_snapshot, db_path=db_path).copy()
+        if detail.empty:
+            st.caption("No hedge candidate detail available.")
+        else:
+            detail["reason"] = detail["reason"].apply(_humanize_reason_codes)
+            detail_cols = [
+                col
+                for col in [
+                    "status",
+                    "ticker",
+                    "reason",
+                    "quoteability_state",
+                    "score",
+                    "liquidity_score",
+                    "transition_risk",
+                    "proximity_score",
+                    "mid",
+                    "spread",
+                    "volume",
+                    "touch_depth",
+                    "blocking_market_id",
+                    "blocking_cluster_id",
+                    "blocking_reason",
+                ]
+                if col in detail.columns and (col not in {"blocking_market_id", "blocking_cluster_id", "blocking_reason"} or detail[col].notna().any())
+            ]
+            if _is_dev_mode(view_mode):
+                detail["accepted_label"] = detail["accepted"].map(lambda value: "accepted" if bool(value) else "rejected")
+                dev_cols = [
+                    col
+                    for col in [
+                        "accepted_label",
+                        "ticker",
+                        "title",
+                        "reason",
+                        "quoteability_state",
+                        "score",
+                        "liquidity_score",
+                        "transition_risk",
+                        "proximity_score",
+                        "mid",
+                        "spread",
+                        "volume",
+                        "touch_depth",
+                        "blocking_market_id",
+                        "blocking_cluster_id",
+                        "blocking_reason",
+                    ]
+                    if col in detail.columns
+                ]
+                _display_runtime_table(detail, dev_cols)
+            else:
+                _display_runtime_table(detail, detail_cols)
+
+    with st.expander("Hedge tail detail", expanded=False):
+        tail = hedge_summary.get("hold_tail") if isinstance(hedge_summary.get("hold_tail"), dict) else {}
+        if not tail:
+            st.caption("Hold-tail metrics are not present in this runtime yet.")
+        else:
+            tail_rows = pd.DataFrame(
+                [
+                    {"metric": "sample_count", "value": tail.get("sample_count")},
+                    {"metric": "p50_ms", "value": _fmt_optional_ms(tail.get("p50_ms"))},
+                    {"metric": "p90_ms", "value": _fmt_optional_ms(tail.get("p90_ms"))},
+                    {"metric": "p95_ms", "value": _fmt_optional_ms(tail.get("p95_ms"))},
+                    {"metric": "max_ms", "value": _fmt_optional_ms(tail.get("max_ms"))},
+                    {"metric": "distribution", "value": _format_distribution_text(tail.get("distribution"))},
+                ]
+            )
+            _display_runtime_table(tail_rows, ["metric", "value"])
+
+            if hedge_summary.get("forced_flat_markets") or hedge_summary.get("forced_flat_events"):
+                forced_rows = pd.DataFrame(
+                    [
+                        {
+                            "metric": "forced_flat_markets",
+                            "value": ", ".join(str(item) for item in hedge_summary.get("forced_flat_markets") or []) or "N/A",
+                        },
+                        {
+                            "metric": "forced_flat_events",
+                            "value": ", ".join(str(item) for item in hedge_summary.get("forced_flat_events") or []) or "N/A",
+                        },
+                    ]
+                )
+                _display_runtime_table(forced_rows, ["metric", "value"])
+
+
 # ── Tab Entry Points ─────────────────────────────────────────────────────────
 
 
@@ -1972,98 +3074,193 @@ def render_market_making_tab(db_path: Path, view_mode: Optional[Any] = None) -> 
         _render_glass_metric("State", str(runtime_snapshot.get("state") or runtime_snapshot.get("book_health") or "unknown"), accent="#05ffa1" if runtime_snapshot.get("quoteable") else "#fcee0a")
     with cols[3]:
         _render_glass_metric("PnL", _fmt_money(runtime_snapshot.get("total_pnl") or pnl.get("total_pnl") or 0.0), accent="#05ffa1" if float(runtime_snapshot.get("total_pnl") or 0.0) >= 0 else "#ff3b5c")
-
-    st.markdown("### Why it is trading or freezing")
     explainer_rows = explainer.copy()
+    _render_operator_hero(
+        runtime_snapshot=runtime_snapshot,
+        explainer_rows=explainer_rows,
+        pnl=pnl,
+        curve=curve,
+        db_path=db_path,
+    )
+
+    st.markdown("### Why it is trading or waiting")
     if not explainer_rows.empty:
-        keep_cols = [col for col in ["ts", "market_label", "decision_summary", "plain_english", "ev", "reason_codes"] if col in explainer_rows.columns]
+        latest_rows = explainer_rows.head(5).copy()
+        keep_cols = [
+            col
+            for col in [
+                "ts",
+                "market_label",
+                "decision_summary",
+                "plain_english",
+                "ev",
+                "reason_codes",
+                "control_state",
+                "hedge_action",
+                "hedge_action_reason",
+                "hedge_cluster_id",
+                "hedge_market_id",
+                "hedge_target_token_id",
+                "hedge_target_side",
+                "hedge_preferred_side",
+                "hedge_ratio",
+            ]
+            if col in latest_rows.columns
+        ]
         if not _is_dev_mode(view_mode) and "reason_codes" in keep_cols:
             keep_cols.remove("reason_codes")
-        _display_runtime_table(explainer_rows, keep_cols)
+        _display_runtime_table(latest_rows, keep_cols)
     else:
         st.caption("No decision history yet.")
 
     st.markdown("### Selection and market health")
     selection = runtime_snapshot.get("selection") if isinstance(runtime_snapshot.get("selection"), dict) else {}
     health = runtime_snapshot.get("active_market_health") if isinstance(runtime_snapshot.get("active_market_health"), dict) else {}
-    a, b, c = st.columns(3)
+    a, b, c, d = st.columns(4)
     with a:
-        _render_glass_metric("Selected reason", str(runtime_snapshot.get("selected_reason") or selection.get("selected_reason") or "N/A"), accent="#fcee0a")
+        _render_glass_metric("Selected reason", _humanize_reason_codes(runtime_snapshot.get("selected_reason") or selection.get("selected_reason") or "N/A"), accent="#fcee0a")
     with b:
         _render_glass_metric("Quoteable", "YES" if bool(runtime_snapshot.get("quoteable")) else "NO", accent="#05ffa1" if runtime_snapshot.get("quoteable") else "#ff3b5c")
     with c:
         _render_glass_metric("Spread", _fmt_bps(runtime_snapshot.get("spread_bps")))
+    with d:
+        _render_glass_metric("Book health", str(runtime_snapshot.get("book_health") or "unknown").upper(), accent="#05ffa1" if str(runtime_snapshot.get("book_health") or "").lower() == "healthy" else "#fcee0a")
 
     if health or selection:
         detail_cols = st.columns(2)
         with detail_cols[0]:
-            st.markdown("**Selection**")
-            st.write({
-                "selected_market": selection.get("selected_market") or selection.get("market") or runtime_snapshot.get("market"),
-                "selected_score": selection.get("selected_score"),
-                "selected_reason": selection.get("selected_reason") or runtime_snapshot.get("selected_reason"),
-                "freeze_reasons": selection.get("freeze_reasons") or runtime_snapshot.get("freeze_reasons"),
-            })
+            _render_compact_panel(
+                "Selection",
+                [
+                    ("market", _selection_market_label(selection.get("selected_market") or selection.get("market") or runtime_snapshot.get("market"))),
+                    ("score", selection.get("selected_score")),
+                    ("reason", _humanize_reason_codes(selection.get("selected_reason") or runtime_snapshot.get("selected_reason"))),
+                    ("freeze", _freeze_reason_text(selection.get("freeze_reasons") or runtime_snapshot.get("freeze_reasons"))),
+                ],
+                accent="#fcee0a",
+            )
         with detail_cols[1]:
-            st.markdown("**Book health**")
-            st.write({
-                "state": health.get("state") or runtime_snapshot.get("state"),
-                "quoteable": health.get("quoteable", runtime_snapshot.get("quoteable")),
-                "book_valid_both_sides": health.get("book_valid_both_sides", runtime_snapshot.get("book_valid_both_sides")),
-                "spread_bps": health.get("spread_bps") or runtime_snapshot.get("spread_bps"),
-                "book_health": health.get("book_health") or runtime_snapshot.get("book_health"),
-            })
+            _render_compact_panel(
+                "Book health",
+                [
+                    ("state", health.get("state") or runtime_snapshot.get("state")),
+                    ("quoteable", "YES" if health.get("quoteable", runtime_snapshot.get("quoteable")) else "NO"),
+                    ("both sides", "YES" if health.get("book_valid_both_sides", runtime_snapshot.get("book_valid_both_sides")) else "NO"),
+                    ("spread", _fmt_bps(health.get("spread_bps") or runtime_snapshot.get("spread_bps"))),
+                    ("health", health.get("book_health") or runtime_snapshot.get("book_health")),
+                ],
+                accent="#05ffa1",
+            )
 
-    st.divider()
-    st.markdown("### Tracked markets")
-    if market_summary.empty:
-        st.caption("No tracked markets yet.")
-    else:
-        market_rows = market_summary.copy()
-        market_rows["last_update"] = market_rows.get("last_update_ms", pd.Series(dtype="float64")).apply(lambda ts: _short_time(int(ts)) if pd.notna(ts) and float(ts) > 0 else "N/A")
-        market_rows["spread"] = market_rows.get("current_spread_bps")
-        market_rows["profitability"] = market_rows.get("profitability_usd")
-        cols_to_show = [
-            col
-            for col in [
-                "market_slug",
-                "symbol",
-                "market",
-                "state",
-                "decisions",
-                "active_orders",
-                "fills",
-                "spread",
-                "profitability",
-                "last_update",
+    _render_active_books_portfolio_panel(db_path, runtime_snapshot)
+    _render_cluster_exposure_panel(db_path, runtime_snapshot)
+    _render_selection_diagnostics_panel(db_path, runtime_snapshot)
+    _render_hedge_readout_panel(db_path, runtime_snapshot, view_mode=view_mode)
+
+    with st.expander("Operator controls", expanded=False):
+        _render_run_control(db_path, runtime_snapshot)
+        _render_operator_portfolio_controls(db_path, runtime_snapshot)
+
+    with st.expander("Strategy settings and overnight supervision", expanded=False):
+        _render_strategy_settings_controls(db_path, runtime_snapshot)
+        _render_overnight_supervision(db_path)
+
+    with st.expander("Tracked markets", expanded=False):
+        if market_summary.empty:
+            st.caption("No tracked markets yet.")
+        else:
+            market_rows = market_summary.copy()
+            market_rows["last_update"] = market_rows.get("last_update_ms", pd.Series(dtype="float64")).apply(lambda ts: _short_time(int(ts)) if pd.notna(ts) and float(ts) > 0 else "N/A")
+            market_rows["spread"] = market_rows.get("current_spread_bps")
+            market_rows["profitability"] = market_rows.get("profitability_usd")
+            cols_to_show = [
+                col
+                for col in [
+                    "market_slug",
+                    "symbol",
+                    "market",
+                    "state",
+                    "decisions",
+                    "active_orders",
+                    "fills",
+                    "spread",
+                    "profitability",
+                    "last_update",
+                ]
+                if col in market_rows.columns or col in {"spread", "profitability", "last_update"}
             ]
-            if col in market_rows.columns or col in {"spread", "profitability", "last_update"}
-        ]
-        if not _is_dev_mode(view_mode):
-            cols_to_show = [col for col in cols_to_show if col != "market_slug"]
-        _display_runtime_table(market_rows, cols_to_show)
+            if not _is_dev_mode(view_mode):
+                cols_to_show = [col for col in cols_to_show if col != "market_slug"]
+            _display_runtime_table(market_rows, cols_to_show)
 
-    st.divider()
-    st.markdown("### Live operations")
-    ops = operations.copy()
-    if not ops.empty:
-        ops["ts"] = pd.to_datetime(ops["ts_ms"], unit="ms", utc=True, errors="coerce")
-        ops["when"] = ops["ts"].dt.strftime("%H:%M:%S")
-        op_cols = [col for col in ["when", "row_type", "market_label", "action", "why", "price", "size", "status"] if col in ops.columns]
-        if _is_dev_mode(view_mode):
-            op_cols = [col for col in ["when", "row_type", "market_slug", "token_id", "action", "why", "price", "size", "status"] if col in ops.columns]
-        _display_runtime_table(ops, op_cols)
-    else:
-        st.caption("No recent operations.")
+    with st.expander("Live operations", expanded=False):
+        ops = operations.copy()
+        if not ops.empty:
+            ops["ts"] = pd.to_datetime(ops["ts_ms"], unit="ms", utc=True, errors="coerce")
+            ops["when"] = ops["ts"].dt.strftime("%H:%M:%S")
+            op_cols = [
+                col
+                for col in [
+                    "when",
+                    "row_type",
+                    "market_label",
+                    "action",
+                    "why",
+                    "price",
+                    "size",
+                    "status",
+                    "control_state",
+                    "hedge_action",
+                    "hedge_action_reason",
+                    "hedge_cluster_id",
+                    "hedge_market_id",
+                    "hedge_target_token_id",
+                    "hedge_target_side",
+                    "hedge_preferred_side",
+                    "hedge_ratio",
+                ]
+                if col in ops.columns
+            ]
+            if _is_dev_mode(view_mode):
+                op_cols = [
+                    col
+                    for col in [
+                        "when",
+                        "row_type",
+                        "market_slug",
+                        "token_id",
+                        "action",
+                        "why",
+                        "control_state",
+                        "hedge_action",
+                        "hedge_action_reason",
+                        "hedge_cluster_id",
+                        "hedge_market_id",
+                        "hedge_target_token_id",
+                        "hedge_target_side",
+                        "hedge_preferred_side",
+                        "hedge_ratio",
+                        "price",
+                        "size",
+                        "status",
+                    ]
+                    if col in ops.columns
+                ]
+            _display_runtime_table(ops, op_cols)
+        else:
+            st.caption("No recent operations.")
 
     st.divider()
     if runtime_snapshot.get("stage") == "running":
         st.markdown("**Below the fold: fills, exposure, and charts**")
-    _render_performance_risk(pnl, summary, sys_payload, curve, eq_df, db_path)
     _render_inventory_strip(sys_payload, db_path)
     st.markdown("**Live fills**")
     _render_fills_table(db_path, sys_payload)
+    st.markdown("**Fill + Risk Timeline**")
+    _render_fill_risk_timeline(db_path)
     _fill_timeline_sparkline(db_path, sys_payload)
+    with st.expander("Performance and risk detail", expanded=False):
+        _render_performance_risk(pnl, summary, sys_payload, curve, eq_df, db_path)
 
 
 def render_alpha_overlay_tab(db_path: Path) -> None:
@@ -2136,7 +3333,7 @@ def render_portfolio_tab(db_path: Path, view_mode: Optional[Any] = None) -> None
                 x=alt.X("ts:T", title="Time"),
                 y=alt.Y("total_pnl:Q", title="Portfolio PnL"),
                 tooltip=["ts:T", "total_pnl:Q", "realized_net_pnl:Q", "unrealized_pnl:Q"],
-            ).properties(height=320)
+            ).properties(height=340)
             st.altair_chart(chart, use_container_width=True)
     with summary_col:
         selected_row = runtimes.iloc[0].to_dict() if not runtimes.empty else {}
@@ -2144,68 +3341,22 @@ def render_portfolio_tab(db_path: Path, view_mode: Optional[Any] = None) -> None
             match = runtimes[runtimes["db_path"].astype(str) == str(db_path.resolve())]
             if not match.empty:
                 selected_row = match.iloc[0].to_dict()
-        st.markdown("### Selected strategy")
-        st.write({
-            "strategy": selected_row.get("strategy_name"),
-            "exchange": selected_row.get("exchange"),
-            "mode": selected_row.get("mode"),
-            "stage": selected_row.get("stage"),
-            "market": selected_row.get("market_label") or selected_row.get("market"),
-            "health": selected_row.get("book_health"),
-            "quoteable": selected_row.get("quoteable"),
-            "pnl": selected_row.get("total_pnl"),
-            "fills": selected_row.get("fills"),
-        })
-        st.markdown("**Portfolio health**")
-        st.write({
-            "fills_total": fills_total,
-            "active_runs": active_runs,
-            "quoteable_runs": quoteable_runs,
-            "selected_reason": current_snapshot.get("selected_reason"),
-        })
-
-    st.divider()
-    st.markdown("### Strategy registry")
-    runtime_rows = runtimes.copy()
-    if not runtime_rows.empty:
-        runtime_rows["selected"] = runtime_rows["db_path"].astype(str) == str(db_path.resolve()) if "db_path" in runtime_rows.columns else False
-        runtime_rows["last_update"] = runtime_rows.apply(
-            lambda row: _fmt_last_update(
-                int(
-                    ((row.get("snapshot") or {}).get("updated_at_ms") if isinstance(row.get("snapshot"), dict) else row.get("updated_at_ms"))
-                    or 0
-                )
-            ),
-            axis=1,
+        _render_compact_panel(
+            "Selected strategy",
+            [
+                ("strategy", selected_row.get("strategy_name")),
+                ("exchange", selected_row.get("exchange")),
+                ("mode", selected_row.get("mode")),
+                ("state", selected_row.get("stage")),
+                ("market", selected_row.get("market_label") or selected_row.get("market")),
+                ("health", selected_row.get("book_health")),
+                ("quoteable", "YES" if selected_row.get("quoteable") else "NO"),
+                ("pnl", _fmt_money(selected_row.get("total_pnl"))),
+                ("fills", selected_row.get("fills")),
+            ],
+            accent="#05ffa1",
         )
-        runtime_rows["selected_reason"] = runtime_rows.get("selected_reason", pd.Series(dtype=object)).fillna("")
-        show_cols = [
-            col for col in [
-                "selected",
-                "label",
-                "exchange",
-                "mode",
-                "stage",
-                "market_label",
-                "decisions",
-                "fills",
-                "total_pnl",
-                "quoteable",
-                "book_health",
-                "spread_bps",
-                "selected_reason",
-                "last_update",
-            ]
-            if col in runtime_rows.columns
-        ]
-        if _is_dev_mode(view_mode):
-            show_cols = [col for col in ["selected", "label", "runtime_root", "db_path", "exchange", "mode", "stage", "market", "market_label", "decisions", "fills", "total_pnl", "quoteable", "book_health", "spread_bps", "selected_reason", "last_update"] if col in runtime_rows.columns]
-        _display_runtime_table(runtime_rows, show_cols)
-    else:
-        st.caption("No discovered runtimes yet.")
 
-    st.divider()
-    st.markdown("### Strategy summary")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         _render_glass_metric("Selected market", selected_market)
@@ -2213,6 +3364,45 @@ def render_portfolio_tab(db_path: Path, view_mode: Optional[Any] = None) -> None
         _render_glass_metric("Current state", str(current_snapshot.get("state") or current_snapshot.get("book_health") or "unknown"))
     with col_c:
         _render_glass_metric("Reason", str(current_snapshot.get("selected_reason") or "N/A"), accent="#fcee0a")
+
+    with st.expander("Strategy registry", expanded=False):
+        runtime_rows = runtimes.copy()
+        if not runtime_rows.empty:
+            runtime_rows["selected"] = runtime_rows["db_path"].astype(str) == str(db_path.resolve()) if "db_path" in runtime_rows.columns else False
+            runtime_rows["last_update"] = runtime_rows.apply(
+                lambda row: _fmt_last_update(
+                    int(
+                        ((row.get("snapshot") or {}).get("updated_at_ms") if isinstance(row.get("snapshot"), dict) else row.get("updated_at_ms"))
+                        or 0
+                    )
+                ),
+                axis=1,
+            )
+            runtime_rows["selected_reason"] = runtime_rows.get("selected_reason", pd.Series(dtype=object)).fillna("")
+            show_cols = [
+                col for col in [
+                    "selected",
+                    "label",
+                    "exchange",
+                    "mode",
+                    "stage",
+                    "market_label",
+                    "decisions",
+                    "fills",
+                    "total_pnl",
+                    "quoteable",
+                    "book_health",
+                    "spread_bps",
+                    "selected_reason",
+                    "last_update",
+                ]
+                if col in runtime_rows.columns
+            ]
+            if _is_dev_mode(view_mode):
+                show_cols = [col for col in ["selected", "label", "runtime_root", "db_path", "exchange", "mode", "stage", "market", "market_label", "decisions", "fills", "total_pnl", "quoteable", "book_health", "spread_bps", "selected_reason", "last_update"] if col in runtime_rows.columns]
+            _display_runtime_table(runtime_rows, show_cols)
+        else:
+            st.caption("No discovered runtimes yet.")
 
     if _is_dev_mode(view_mode):
         with st.expander("Advanced telemetry", expanded=False):

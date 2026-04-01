@@ -18,6 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover
     st = None  # type: ignore[assignment]
 
 from dashboard.contracts import DrillthroughContext
+from core_mm.control_plane import ControlCommandStore
 
 
 _default_db = os.getenv("RUNTIME_DB_PATH", "runtime.db")
@@ -40,6 +41,14 @@ def _connect(db_path: Path) -> sqlite3.Connection:
         cx.execute("PRAGMA query_only = 1")
     except sqlite3.OperationalError:
         pass
+    return cx
+
+
+def _connect_write(db_path: Path) -> sqlite3.Connection:
+    cx = sqlite3.connect(db_path.as_posix())
+    cx.execute("PRAGMA journal_mode=WAL")
+    cx.execute("PRAGMA synchronous=NORMAL")
+    cx.execute("PRAGMA busy_timeout=5000")
     return cx
 
 
@@ -68,6 +77,18 @@ def existing_tables(db_path: Optional[Path] = None) -> List[str]:
     finally:
         cx.close()
     return sorted(str(row[0]) for row in rows if row and row[0])
+
+
+def table_columns(table: str, db_path: Optional[Path] = None) -> List[str]:
+    path = db_path or resolve_db_path()
+    if not path.exists():
+        return []
+    cx = _connect(path)
+    try:
+        rows = cx.execute(f"PRAGMA table_info({table})").fetchall()
+    finally:
+        cx.close()
+    return [str(row[1]) for row in rows if row and len(row) > 1 and row[1]]
 
 
 def require_sources(
@@ -120,12 +141,67 @@ def safe_json(raw: Any) -> Dict[str, Any]:
     return {}
 
 
+def _hedge_context_from_mapping(mapping: Any) -> Dict[str, Any]:
+    if not isinstance(mapping, dict):
+        return {}
+    return {
+        "control_state": mapping.get("control_state") or mapping.get("hedge_control_state"),
+        "hedge_action": mapping.get("hedge_action"),
+        "hedge_cluster_id": mapping.get("hedge_cluster_id") or mapping.get("cluster_id"),
+        "hedge_action_reason": mapping.get("hedge_action_reason"),
+        "hedge_market_id": mapping.get("hedge_market_id"),
+        "hedge_target_token_id": mapping.get("hedge_target_token_id"),
+        "hedge_target_side": mapping.get("hedge_target_side"),
+        "hedge_preferred_side": mapping.get("hedge_preferred_side"),
+        "hedge_ratio": mapping.get("hedge_ratio"),
+        "hedge_quality_score": mapping.get("hedge_quality_score"),
+        "hedge_success_window_ms": mapping.get("hedge_success_window_ms"),
+        "hedge_failed_cooldown_until_ms": mapping.get("hedge_failed_cooldown_until_ms"),
+    }
+
+
 def parse_reasons(raw: Any) -> List[str]:
     if raw is None:
         return []
     if isinstance(raw, str):
         return [item.strip() for item in raw.split(",") if item.strip()]
     return []
+
+
+def humanize_reason_codes(raw: Any) -> str:
+    reason_map = {
+        "book_absent": "order book unavailable",
+        "book_empty": "order book empty",
+        "one_sided_book": "one-sided book",
+        "price_out_of_range": "price outside safe range",
+        "spread_too_wide": "spread too wide",
+        "insufficient_volume": "volume too low",
+        "insufficient_open_interest": "open interest too low",
+        "liquidity_score_too_low": "liquidity score too low",
+        "stale_position": "stale inventory needs reducing",
+        "take_profit": "locking in profit",
+        "stop_loss": "cutting a losing position",
+        "flow_blocks_buy": "buy flow blocked",
+        "flow_blocks_sell": "sell flow blocked",
+        "quoteable_book": "book is quoteable",
+        "freeze": "safety gate freeze",
+        "no_hedge_market": "no better hedge market was available",
+        "hedge_not_better_than_inventory_market": "hedge quality did not beat the inventory market",
+        "gross_increase_ceiling_exhausted": "temporary gross exposure would exceed the ceiling",
+        "stale_inventory_required": "stale inventory was required before hedging",
+        "maker_exit_window_active": "maker exit window was still active",
+        "hedge_failed_cooldown": "failed hedge cooldown was still active",
+        "hedge_failed_no_improvement": "hedge did not improve inventory enough",
+        "stop_open_window": "open-window guard blocked the hedge",
+        "force_flat_window": "force-flat window was active",
+        "forced_reduction": "forced reduction was already in progress",
+        "paper_only": "paper-only hedge telemetry",
+    }
+    reasons = parse_reasons(raw)
+    if not reasons:
+        return "policy gate"
+    words = [reason_map.get(reason.lower(), reason.replace("_", " ")) for reason in reasons[:3]]
+    return "; ".join(words)
 
 
 def classify_signal_action(action: str) -> bool:
@@ -224,6 +300,24 @@ def _format_age_s(age_s: float) -> str:
     return f"{hours:.1f}h"
 
 
+def _cluster_exposure_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cluster_exposure = payload.get("cluster_exposure")
+    if isinstance(cluster_exposure, dict):
+        return cluster_exposure
+    runner = payload.get("runner") if isinstance(payload.get("runner"), dict) else {}
+    cluster_exposure = runner.get("cluster_exposure")
+    return cluster_exposure if isinstance(cluster_exposure, dict) else {}
+
+
+def _cluster_hedge_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cluster_hedge = payload.get("cluster_hedge")
+    if isinstance(cluster_hedge, dict):
+        return cluster_hedge
+    runner = payload.get("runner") if isinstance(payload.get("runner"), dict) else {}
+    cluster_hedge = runner.get("cluster_hedge")
+    return cluster_hedge if isinstance(cluster_hedge, dict) else {}
+
+
 def _runtime_health_snapshot(status: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
     runner = payload.get("runner") if isinstance(payload.get("runner"), dict) else {}
     selection = status.get("selection") if isinstance(status.get("selection"), dict) else {}
@@ -314,6 +408,9 @@ def get_runtime_status_snapshot(runtime_root: Optional[Path] = None, db_path: Op
     orders = _int_or_none(status.get("order_actions"))
 
     broker_stats = payload.get("broker_stats") if isinstance(payload.get("broker_stats"), dict) else {}
+    control_state = payload.get("control_state") if isinstance(payload.get("control_state"), dict) else {}
+    if not control_state and isinstance(status.get("control_state"), dict):
+        control_state = status.get("control_state")  # type: ignore[assignment]
     realized_net_pnl = _float_or_none(broker_stats.get("realized_net_pnl"))
     unrealized_pnl = _float_or_none(broker_stats.get("unrealized_pnl"))
     total_pnl = None
@@ -346,9 +443,765 @@ def get_runtime_status_snapshot(runtime_root: Optional[Path] = None, db_path: Op
         "state": health["state"],
         "freeze_reasons": health["freeze_reasons"],
         "runner": runner,
+        "control_state": control_state,
+        "cluster_exposure": _cluster_exposure_payload(payload),
+        "cluster_hedge": _cluster_hedge_payload(payload),
         "status": status,
         "payload_json": payload,
     }
+
+
+def get_cluster_exposure_snapshot(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    cluster_exposure = snapshot.get("cluster_exposure")
+    return cluster_exposure if isinstance(cluster_exposure, dict) else {}
+
+
+def get_cluster_hedge_snapshot(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    cluster_hedge = snapshot.get("cluster_hedge")
+    return cluster_hedge if isinstance(cluster_hedge, dict) else {}
+
+
+def get_cluster_exposure_rows(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    cluster_exposure = get_cluster_exposure_snapshot(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    cluster_hedge = get_cluster_hedge_snapshot(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    clusters = cluster_exposure.get("clusters")
+    if not isinstance(clusters, list) or not clusters:
+        return pd.DataFrame()
+
+    hedge_by_cluster: Dict[str, Dict[str, Any]] = {}
+    for hedge_cluster in cluster_hedge.get("clusters") or []:
+        if not isinstance(hedge_cluster, dict):
+            continue
+        cluster_id = str(hedge_cluster.get("cluster_id") or "")
+        if cluster_id:
+            hedge_by_cluster[cluster_id] = hedge_cluster
+
+    rows: List[Dict[str, Any]] = []
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        cluster_id = str(cluster.get("cluster_id") or cluster.get("event_id") or "")
+        hedge_meta = hedge_by_cluster.get(cluster_id, {})
+        row = {
+            "cluster_id": cluster_id or None,
+            "event_id": cluster.get("event_id"),
+            "market_count": _int_or_none(cluster.get("market_count")) or 0,
+            "active_market_count": _int_or_none(cluster.get("active_market_count")) or 0,
+            "yes_exposure_notional": _float_or_none(cluster.get("yes_exposure_notional")) or 0.0,
+            "no_exposure_notional": _float_or_none(cluster.get("no_exposure_notional")) or 0.0,
+            "net_yes_exposure_notional": _float_or_none(cluster.get("net_yes_exposure_notional")) or 0.0,
+            "gross_exposure": _float_or_none(cluster.get("gross_exposure")) or 0.0,
+            "unrealized_pnl": _float_or_none(cluster.get("unrealized_pnl")) or 0.0,
+            "time_to_expiry_ms": _int_or_none(cluster.get("time_to_expiry_ms")),
+            "max_event_exposure_notional": _float_or_none(cluster.get("max_event_exposure_notional")),
+            "remaining_event_exposure_notional": _float_or_none(cluster.get("remaining_event_exposure_notional")),
+            "stale_inventory_state": "stale" if bool(cluster.get("has_stale_inventory")) else "fresh",
+            "stale_market_count": _int_or_none(cluster.get("stale_market_count")) or 0,
+            "stale_exposure_notional": _float_or_none(cluster.get("stale_exposure_notional")) or 0.0,
+            "control_state": hedge_meta.get("control_state") or cluster.get("control_state") or cluster.get("state"),
+            "hedge_action": hedge_meta.get("action") or cluster.get("hedge_action") or cluster.get("action") or cluster.get("next_action"),
+            "hedge_action_reason": hedge_meta.get("action_reason") or cluster.get("hedge_action_reason") or cluster.get("action_reason") or cluster.get("reason"),
+            "hedge_ratio": _float_or_none(
+                hedge_meta.get("hedge_ratio")
+                if hedge_meta.get("hedge_ratio") is not None
+                else (cluster.get("hedge_ratio") if cluster.get("hedge_ratio") is not None else cluster.get("target_hedge_ratio"))
+            ),
+            "hedge_target_market": hedge_meta.get("hedge_market_id") or cluster.get("hedge_target_market") or cluster.get("hedge_target_market_id") or cluster.get("target_market"),
+            "hedge_target_token": hedge_meta.get("hedge_target_token_id") or cluster.get("hedge_target_token") or cluster.get("hedge_target_token_id"),
+            "hedge_target_side": hedge_meta.get("hedge_target_side") or cluster.get("hedge_target_side"),
+            "dominant_side": hedge_meta.get("dominant_side"),
+            "affected_market_ids": list(hedge_meta.get("affected_market_ids") or []),
+            "hedge_rejection_reasons": ", ".join(str(item) for item in (hedge_meta.get("rejection_reasons") or []) if item not in (None, "")) or None,
+        }
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        by=["active_market_count", "gross_exposure", "cluster_id"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+
+def get_cluster_market_rows(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    cluster_exposure = get_cluster_exposure_snapshot(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    cluster_rows = get_cluster_exposure_rows(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    clusters = cluster_exposure.get("clusters")
+    if not isinstance(clusters, list) or not clusters:
+        return pd.DataFrame()
+
+    cluster_meta: Dict[str, Dict[str, Any]] = {}
+    if not cluster_rows.empty:
+        cluster_meta = {
+            str(row.get("cluster_id") or ""): row
+            for row in cluster_rows.to_dict("records")
+            if str(row.get("cluster_id") or "")
+        }
+
+    rows: List[Dict[str, Any]] = []
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        cluster_id = cluster.get("cluster_id") or cluster.get("event_id")
+        cluster_info = cluster_meta.get(str(cluster_id or ""), {})
+        markets = cluster.get("markets")
+        if not isinstance(markets, list):
+            continue
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            market_id = market.get("market_id") or market.get("condition_id")
+            affected_market_ids = cluster_info.get("affected_market_ids") or []
+            rows.append(
+                {
+                    "cluster_id": cluster_id,
+                    "market_id": market_id,
+                    "condition_id": market.get("condition_id"),
+                    "active": bool(market.get("active")),
+                    "market_position_notional": _float_or_none(market.get("market_position_notional")) or 0.0,
+                    "market_unrealized_pnl": _float_or_none(market.get("market_unrealized_pnl")) or 0.0,
+                    "yes_exposure_notional": _float_or_none(market.get("yes_exposure_notional")) or 0.0,
+                    "no_exposure_notional": _float_or_none(market.get("no_exposure_notional")) or 0.0,
+                    "unknown_exposure_notional": _float_or_none(market.get("unknown_exposure_notional")) or 0.0,
+                    "time_to_expiry_ms": _int_or_none(market.get("time_to_expiry_ms")),
+                    "stale_inventory_state": "stale" if bool(market.get("has_stale_inventory")) else ("stale" if bool(cluster.get("has_stale_inventory")) else "fresh"),
+                    "control_state": cluster_info.get("control_state"),
+                    "hedge_action": market.get("hedge_action") or market.get("action") or market.get("next_action") or cluster_info.get("hedge_action"),
+                    "hedge_action_reason": market.get("hedge_action_reason") or market.get("action_reason") or market.get("reason") or cluster_info.get("hedge_action_reason"),
+                    "hedge_ratio": _float_or_none(
+                        market.get("hedge_ratio")
+                        if market.get("hedge_ratio") is not None
+                        else (market.get("target_hedge_ratio") if market.get("target_hedge_ratio") is not None else cluster_info.get("hedge_ratio"))
+                    ),
+                    "hedge_target_market": market.get("hedge_target_market") or market.get("hedge_target_market_id") or market.get("target_market") or cluster_info.get("hedge_target_market"),
+                    "hedge_target_token": market.get("hedge_target_token") or market.get("hedge_target_token_id") or cluster_info.get("hedge_target_token"),
+                    "hedge_target_side": market.get("hedge_target_side") or cluster_info.get("hedge_target_side"),
+                    "affected_by_cluster_action": bool(market_id and market_id in affected_market_ids),
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        by=["active", "cluster_id", "market_position_notional"],
+        ascending=[False, True, False],
+    ).reset_index(drop=True)
+
+
+def get_active_market_rows(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    cluster_market_rows = get_cluster_market_rows(runtime_snapshot=snapshot, db_path=db_path)
+    if not cluster_market_rows.empty:
+        active_rows = cluster_market_rows[cluster_market_rows["active"].astype(bool)].copy()
+        if not active_rows.empty:
+            return active_rows.sort_values(
+                by=["cluster_id", "market_position_notional", "market_id"],
+                ascending=[True, False, True],
+            ).reset_index(drop=True)
+
+    runner = snapshot.get("runner") if isinstance(snapshot.get("runner"), dict) else {}
+    active_market_health = snapshot.get("active_market_health") if isinstance(snapshot.get("active_market_health"), dict) else {}
+    market_ids = runner.get("market_ids") or active_market_health.get("market_ids") or []
+    if not isinstance(market_ids, list) or not market_ids:
+        return pd.DataFrame()
+    rows = []
+    for market_id in market_ids:
+        rows.append(
+            {
+                "cluster_id": None,
+                "market_id": market_id,
+                "active": True,
+                "market_position_notional": None,
+                "market_unrealized_pnl": None,
+                "time_to_expiry_ms": _int_or_none(active_market_health.get("time_to_expiry_ms")),
+                "stale_inventory_state": None,
+                "control_state": None,
+                "hedge_action": None,
+                "hedge_action_reason": None,
+                "affected_by_cluster_action": False,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def get_selection_diagnostic_rows(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), dict) else {}
+    rows: List[Dict[str, Any]] = []
+    for accepted_state, key in ((True, "accepted_candidates"), (False, "rejected_candidates")):
+        candidates = selection.get(key) or []
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            rows.append(
+                {
+                    "accepted": accepted_state,
+                    "status": "accepted" if accepted_state else "rejected",
+                    "ticker": candidate.get("ticker"),
+                    "title": candidate.get("title"),
+                    "reason": candidate.get("reason"),
+                    "quoteability_state": candidate.get("quoteability_state"),
+                    "score": _float_or_none(candidate.get("score")),
+                    "liquidity_score": _float_or_none(candidate.get("liquidity_score")),
+                    "transition_risk": _float_or_none(candidate.get("transition_risk")),
+                    "proximity_score": _float_or_none(candidate.get("proximity_score")),
+                    "mid": _float_or_none(candidate.get("mid")),
+                    "spread": _float_or_none(candidate.get("spread")),
+                    "volume": _float_or_none(candidate.get("volume")),
+                    "touch_depth": _float_or_none(candidate.get("touch_depth")),
+                    "blocking_market_id": candidate.get("blocking_market_id") or candidate.get("suppressed_by_market_id"),
+                    "blocking_cluster_id": candidate.get("blocking_cluster_id") or candidate.get("suppressed_by_cluster_id"),
+                    "blocking_reason": candidate.get("blocking_reason") or candidate.get("suppression_reason"),
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        by=["accepted", "score", "liquidity_score"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+
+def get_selection_diagnostic_gaps(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> List[str]:
+    rows = get_selection_diagnostic_rows(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    if rows.empty:
+        return ["selection candidate diagnostics missing"]
+    missing: List[str] = []
+    if "blocking_market_id" not in rows.columns or not rows["blocking_market_id"].notna().any():
+        missing.append("blocking market id")
+    if "blocking_cluster_id" not in rows.columns or not rows["blocking_cluster_id"].notna().any():
+        missing.append("blocking cluster id")
+    if "blocking_reason" not in rows.columns or not rows["blocking_reason"].notna().any():
+        missing.append("blocking reason")
+    return missing
+
+
+def _hedge_candidate_rows_from_snapshot(runtime_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cluster_hedge = get_cluster_hedge_snapshot(runtime_snapshot=runtime_snapshot)
+    cluster_exposure = get_cluster_exposure_snapshot(runtime_snapshot=runtime_snapshot)
+    exposure_by_cluster: Dict[str, Dict[str, Any]] = {}
+    for cluster in cluster_exposure.get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        cluster_id = str(cluster.get("cluster_id") or "").strip()
+        if cluster_id:
+            exposure_by_cluster[cluster_id] = cluster
+
+    rows: List[Dict[str, Any]] = []
+    for cluster in cluster_hedge.get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        cluster_id = str(cluster.get("cluster_id") or "").strip()
+        if not cluster_id:
+            continue
+        exposure = exposure_by_cluster.get(cluster_id, {})
+        candidate_summary = dict(cluster.get("candidate_summary") or {})
+        rejection_reasons = [str(item) for item in (cluster.get("rejection_reasons") or []) if item not in (None, "")]
+        candidate_state = str(cluster.get("candidate_state") or "").strip().lower()
+        if not candidate_state:
+            candidate_state = "rejected" if rejection_reasons else ("accepted" if str(cluster.get("action") or "").upper() == "HEDGE" else "deferred")
+        hedge_quality_score = _float_or_none(cluster.get("hedge_quality_score"))
+        inventory_quality_score = _float_or_none(
+            cluster.get("inventory_market_quality_score")
+            if cluster.get("inventory_market_quality_score") not in (None, "")
+            else exposure.get("dominant_inventory_market_quality_score")
+        )
+        hedge_quality_gap = _float_or_none(cluster.get("hedge_quality_gap"))
+        if hedge_quality_gap is None and hedge_quality_score is not None and inventory_quality_score is not None:
+            hedge_quality_gap = hedge_quality_score - inventory_quality_score
+        best_candidate = dict(candidate_summary.get("best_candidate") or {})
+        rows.append(
+            {
+                "cluster_id": cluster_id,
+                "action": str(cluster.get("action") or "NONE"),
+                "candidate_state": candidate_state,
+                "control_state": str(cluster.get("control_state") or "NORMAL"),
+                "action_reason": cluster.get("action_reason"),
+                "dominant_side": cluster.get("dominant_side"),
+                "hedge_market_id": cluster.get("hedge_market_id"),
+                "hedge_target_token_id": cluster.get("hedge_target_token_id"),
+                "hedge_target_side": cluster.get("hedge_target_side"),
+                "hedge_ratio": _float_or_none(cluster.get("hedge_ratio")),
+                "inventory_market_quality_score": inventory_quality_score,
+                "hedge_quality_score": hedge_quality_score,
+                "hedge_execution_quality_score": _float_or_none(cluster.get("hedge_execution_quality_score")),
+                "hedge_quality_gap": hedge_quality_gap,
+                "hedge_covariance": _float_or_none(cluster.get("hedge_covariance")),
+                "hedge_correlation": _float_or_none(cluster.get("hedge_correlation")),
+                "hedge_beta_raw": _float_or_none(cluster.get("hedge_beta_raw")),
+                "hedge_beta": _float_or_none(cluster.get("hedge_beta")),
+                "hedge_beta_shrunk": _float_or_none(cluster.get("hedge_beta_shrunk")),
+                "hedge_beta_clipped": _float_or_none(cluster.get("hedge_beta_clipped")),
+                "hedge_covariance_sample_count": _int_or_none(cluster.get("hedge_covariance_sample_count")),
+                "hedge_covariance_state": cluster.get("hedge_covariance_state"),
+                "hedge_covariance_confidence": cluster.get("hedge_covariance_confidence"),
+                "hedge_pair_score": _float_or_none(cluster.get("hedge_pair_score")),
+                "hedgeability_tier": cluster.get("hedgeability_tier"),
+                "hedge_structural_score": _float_or_none(cluster.get("hedge_structural_score")),
+                "hedge_covariance_score": _float_or_none(cluster.get("hedge_covariance_score")),
+                "hedge_beta_stability_score": _float_or_none(cluster.get("hedge_beta_stability_score")),
+                "hedge_execution_availability_score": _float_or_none(cluster.get("hedge_execution_availability_score")),
+                "hedge_realized_outcome_score": _float_or_none(cluster.get("hedge_realized_outcome_score")),
+                "hedge_relation_confidence_state": cluster.get("hedge_relation_confidence_state"),
+                "hedge_permission_state": cluster.get("hedge_permission_state"),
+                "hedge_rejection_reason": cluster.get("hedge_rejection_reason"),
+                "hedge_model_state": cluster.get("hedge_model_state"),
+                "hedge_realized_improvement_state": cluster.get("hedge_realized_improvement_state"),
+                "hedge_success_window_ms": _int_or_none(cluster.get("hedge_success_window_ms")),
+                "hedge_failed_cooldown_until_ms": _int_or_none(cluster.get("hedge_failed_cooldown_until_ms")),
+                "candidate_count": _int_or_none(candidate_summary.get("candidate_count")),
+                "accepted_count": _int_or_none(candidate_summary.get("accepted_count")),
+                "rejection_counts_json": json.dumps(candidate_summary.get("rejection_counts") or {}, sort_keys=True),
+                "best_candidate_market_id": best_candidate.get("market_id"),
+                "best_candidate_token_id": best_candidate.get("token_id"),
+                "best_candidate_quality_score": _float_or_none(best_candidate.get("quality_score")),
+                "best_candidate_quality_gap": _float_or_none(best_candidate.get("quality_gap")),
+                "best_candidate_alignment_fraction": _float_or_none(best_candidate.get("alignment_fraction")),
+                "search_profile": candidate_summary.get("search_profile"),
+                "proof_only_lane": bool(candidate_summary.get("proof_only_lane")),
+                "proof_only_bucket_distance": _int_or_none(candidate_summary.get("proof_only_bucket_distance")),
+                "proof_only_expiry_slack_ms": _int_or_none(candidate_summary.get("proof_only_expiry_slack_ms")),
+                "rejection_reasons": json.dumps(sorted(rejection_reasons)),
+                "affected_market_ids": json.dumps(sorted(str(item) for item in (cluster.get("affected_market_ids") or []) if item not in (None, ""))),
+                "token_directives_json": json.dumps(cluster.get("token_directives") or [], sort_keys=True),
+                "quality_gap_state": (
+                    "positive"
+                    if hedge_quality_gap is not None and hedge_quality_gap > 0
+                    else "negative"
+                    if hedge_quality_gap is not None and hedge_quality_gap < 0
+                    else "flat"
+                    if hedge_quality_gap == 0
+                    else "unknown"
+                ),
+            }
+        )
+    return rows
+
+
+def get_hedge_candidate_rows(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    path = db_path or resolve_db_path()
+    rows: pd.DataFrame = pd.DataFrame()
+    if table_exists("hedge_candidates", path):
+        desired_columns = [
+            "ts_ms",
+            "event_id",
+            "cluster_id",
+            "action",
+            "candidate_state",
+            "control_state",
+            "action_reason",
+            "dominant_side",
+            "hedge_market_id",
+            "hedge_target_token_id",
+            "hedge_target_side",
+            "hedge_ratio",
+            "inventory_market_quality_score",
+            "hedge_quality_score",
+            "hedge_execution_quality_score",
+            "hedge_quality_gap",
+            "hedge_covariance",
+            "hedge_correlation",
+            "hedge_beta_raw",
+            "hedge_beta",
+            "hedge_beta_shrunk",
+            "hedge_beta_clipped",
+            "hedge_covariance_sample_count",
+            "hedge_covariance_state",
+            "hedge_covariance_confidence",
+            "hedge_pair_score",
+            "hedgeability_tier",
+            "hedge_structural_score",
+            "hedge_covariance_score",
+            "hedge_beta_stability_score",
+            "hedge_execution_availability_score",
+            "hedge_realized_outcome_score",
+            "hedge_relation_confidence_state",
+            "hedge_permission_state",
+            "hedge_rejection_reason",
+            "hedge_model_state",
+            "hedge_realized_improvement_state",
+            "hedge_success_window_ms",
+            "hedge_failed_cooldown_until_ms",
+            "candidate_count",
+            "accepted_count",
+            "rejection_counts_json",
+            "best_candidate_market_id",
+            "best_candidate_token_id",
+            "best_candidate_quality_score",
+            "best_candidate_quality_gap",
+            "best_candidate_alignment_fraction",
+            "search_profile",
+            "proof_only_lane",
+            "proof_only_bucket_distance",
+            "proof_only_expiry_slack_ms",
+            "rejection_reasons",
+            "affected_market_ids",
+            "token_directives_json",
+            "quality_gap_state",
+            "payload_json",
+        ]
+        available = set(table_columns("hedge_candidates", db_path=path))
+        selected_columns = [column for column in desired_columns if column in available]
+        rows = query_df(
+            f"""
+            SELECT
+                {', '.join(selected_columns)}
+            FROM hedge_candidates
+            ORDER BY ts_ms ASC, event_id ASC
+            """,
+            db_path=path,
+        )
+    if rows.empty:
+        rows = pd.DataFrame(_hedge_candidate_rows_from_snapshot(snapshot))
+    if rows.empty:
+        return rows
+    rows = rows.copy()
+    candidate_state = rows["candidate_state"].astype(str) if "candidate_state" in rows.columns else pd.Series([""] * len(rows), index=rows.index)
+    rows["accepted"] = candidate_state.eq("accepted")
+    rows["rejected"] = candidate_state.eq("rejected")
+    rows["deferred"] = candidate_state.eq("deferred")
+    if "hedge_quality_gap" in rows.columns:
+        rows["hedge_quality_gap"] = rows["hedge_quality_gap"].apply(_float_or_none)
+    if "hedge_covariance" in rows.columns:
+        rows["hedge_covariance"] = rows["hedge_covariance"].apply(_float_or_none)
+    if "hedge_correlation" in rows.columns:
+        rows["hedge_correlation"] = rows["hedge_correlation"].apply(_float_or_none)
+    if "hedge_beta_raw" in rows.columns:
+        rows["hedge_beta_raw"] = rows["hedge_beta_raw"].apply(_float_or_none)
+    if "hedge_beta" in rows.columns:
+        rows["hedge_beta"] = rows["hedge_beta"].apply(_float_or_none)
+    if "hedge_beta_shrunk" in rows.columns:
+        rows["hedge_beta_shrunk"] = rows["hedge_beta_shrunk"].apply(_float_or_none)
+    if "hedge_beta_clipped" in rows.columns:
+        rows["hedge_beta_clipped"] = rows["hedge_beta_clipped"].apply(_float_or_none)
+    if "hedge_covariance_sample_count" in rows.columns:
+        rows["hedge_covariance_sample_count"] = rows["hedge_covariance_sample_count"].apply(_int_or_none)
+    for column in (
+        "hedge_pair_score",
+        "hedge_structural_score",
+        "hedge_covariance_score",
+        "hedge_beta_stability_score",
+        "hedge_execution_availability_score",
+        "hedge_realized_outcome_score",
+    ):
+        if column in rows.columns:
+            rows[column] = rows[column].apply(_float_or_none)
+    if "candidate_count" in rows.columns:
+        rows["candidate_count"] = rows["candidate_count"].apply(_int_or_none)
+    if "accepted_count" in rows.columns:
+        rows["accepted_count"] = rows["accepted_count"].apply(_int_or_none)
+    if "best_candidate_quality_score" in rows.columns:
+        rows["best_candidate_quality_score"] = rows["best_candidate_quality_score"].apply(_float_or_none)
+    if "best_candidate_quality_gap" in rows.columns:
+        rows["best_candidate_quality_gap"] = rows["best_candidate_quality_gap"].apply(_float_or_none)
+    if "best_candidate_alignment_fraction" in rows.columns:
+        rows["best_candidate_alignment_fraction"] = rows["best_candidate_alignment_fraction"].apply(_float_or_none)
+    if "proof_only_lane" in rows.columns:
+        rows["proof_only_lane"] = rows["proof_only_lane"].apply(lambda value: bool(_int_or_none(value)))
+    if "rejection_counts_json" in rows.columns:
+        rows["rejection_counts_json"] = rows["rejection_counts_json"].fillna("{}")
+    if "rejection_reasons" in rows.columns:
+        rows["rejection_reason_count"] = rows["rejection_reasons"].apply(
+            lambda raw: len(json.loads(raw)) if isinstance(raw, str) and raw else (len(raw) if isinstance(raw, list) else 0)
+        )
+    else:
+        rows["rejection_reason_count"] = 0
+    if "candidate_count" in rows.columns and "accepted_count" in rows.columns:
+        rows["rejected_count"] = rows["candidate_count"].fillna(0).astype(int) - rows["accepted_count"].fillna(0).astype(int)
+    else:
+        rows["rejected_count"] = 0
+    return rows.sort_values(
+        by=["accepted", "hedge_quality_gap", "hedge_quality_score", "cluster_id"],
+        ascending=[False, False, False, True],
+    ).reset_index(drop=True)
+
+
+def get_hedge_candidate_gaps(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> List[str]:
+    rows = get_hedge_candidate_rows(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    if rows.empty:
+        return ["hedge candidate diagnostics missing"]
+    missing: List[str] = []
+    if "hedge_quality_gap" not in rows.columns or not rows["hedge_quality_gap"].notna().any():
+        missing.append("hedge quality gap")
+    if "hedge_market_id" not in rows.columns or not rows["hedge_market_id"].notna().any():
+        missing.append("hedge target market")
+    if "hedge_target_token_id" not in rows.columns or "hedge_target_side" not in rows.columns:
+        missing.append("hedge target token/side")
+    return missing
+
+
+def _first_present_dict(*sources: Any) -> Dict[str, Any]:
+    for source in sources:
+        if isinstance(source, dict):
+            return source
+    return {}
+
+
+def _extract_ms_metric(*sources: Any, keys: Sequence[str]) -> Optional[float]:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(out):
+                continue
+            return out
+    return None
+
+
+def _extract_hold_tail_metrics(summary: Dict[str, Any], risk_proof: Dict[str, Any], control: Dict[str, Any]) -> Dict[str, Any]:
+    hold_tail_payload = _first_present_dict(
+        summary.get("hold_tail"),
+        summary.get("hold_tail_metrics"),
+        risk_proof.get("hold_tail"),
+        risk_proof.get("hold_tail_metrics"),
+        control.get("hold_tail"),
+    )
+    hold_tail_distribution = hold_tail_payload.get("distribution") if isinstance(hold_tail_payload, dict) else None
+    if hold_tail_distribution is None:
+        for source in (summary, risk_proof, control):
+            if not isinstance(source, dict):
+                continue
+            for key in ("hold_tail_distribution", "distribution"):
+                if key in source and source.get(key) not in (None, ""):
+                    hold_tail_distribution = source.get(key)
+                    break
+            if hold_tail_distribution is not None:
+                break
+
+    sample_count = None
+    for key in ("sample_count", "count", "n", "observations", "samples"):
+        value = _extract_ms_metric(hold_tail_payload, summary, risk_proof, control, keys=(key,))
+        if value is not None:
+            sample_count = int(value)
+            break
+
+    source = None
+    if hold_tail_payload:
+        source = "nested"
+    elif any(key in summary for key in ("hold_tail_distribution", "hold_tail")):
+        source = "summary"
+    elif any(key in risk_proof for key in ("hold_tail_distribution", "hold_tail")):
+        source = "risk_proof"
+
+    return {
+        "sample_count": sample_count,
+        "p50_ms": _extract_ms_metric(hold_tail_payload, summary, risk_proof, control, keys=("p50_ms", "p50", "median_ms", "median")),
+        "p90_ms": _extract_ms_metric(hold_tail_payload, summary, risk_proof, control, keys=("p90_ms", "p90")),
+        "p95_ms": _extract_ms_metric(hold_tail_payload, summary, risk_proof, control, keys=("p95_ms", "p95")),
+        "max_ms": _extract_ms_metric(hold_tail_payload, summary, risk_proof, control, keys=("max_ms", "max", "p100_ms")),
+        "distribution": hold_tail_distribution if hold_tail_distribution not in ({}, []) else None,
+        "source": source,
+    }
+
+
+def _summarize_hedge_rejections(selection_rows: pd.DataFrame) -> Dict[str, Any]:
+    if selection_rows.empty or "accepted" not in selection_rows.columns:
+        return {"reason_counts": {}, "top_reason": None, "top_reason_count": 0}
+    rejected = selection_rows[~selection_rows["accepted"].astype(bool)].copy()
+    if rejected.empty or "reason" not in rejected.columns:
+        return {"reason_counts": {}, "top_reason": None, "top_reason_count": 0}
+    reasons = rejected["reason"].dropna().astype(str)
+    if reasons.empty:
+        return {"reason_counts": {}, "top_reason": None, "top_reason_count": 0}
+    counts = reasons.value_counts()
+    return {
+        "reason_counts": {str(key): int(value) for key, value in counts.to_dict().items()},
+        "top_reason": str(counts.index[0]),
+        "top_reason_count": int(counts.iloc[0]),
+    }
+
+
+def get_hedge_readout_summary(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), dict) else {}
+    control = get_control_plane_snapshot(db_path=db_path)
+    run_summary = get_run_summary(runtime_root=snapshot.get("runtime_root"), db_path=db_path)
+    risk_proof = dict(run_summary.get("risk_proof") or {})
+
+    rows = get_selection_diagnostic_rows(runtime_snapshot=snapshot, db_path=db_path)
+    accepted_rows = rows[rows["accepted"].astype(bool)].copy() if not rows.empty and "accepted" in rows.columns else pd.DataFrame()
+    rejected_rows = rows[~rows["accepted"].astype(bool)].copy() if not rows.empty and "accepted" in rows.columns else pd.DataFrame()
+
+    top_accepted: Dict[str, Any] = {}
+    top_rejected: Dict[str, Any] = {}
+    top_accepted_score: Optional[float] = None
+    top_rejected_score: Optional[float] = None
+
+    if not accepted_rows.empty:
+        score_cols = [col for col in ("score", "liquidity_score", "transition_risk", "proximity_score") if col in accepted_rows.columns]
+        if score_cols:
+            accepted_sorted = accepted_rows.sort_values(by=score_cols[: min(2, len(score_cols))], ascending=[False] * min(2, len(score_cols)))
+        else:
+            accepted_sorted = accepted_rows.sort_values(by=["ticker"], ascending=[True])
+        top_accepted = accepted_sorted.iloc[0].to_dict()
+        top_accepted_score = _float_or_none(top_accepted.get("score"))
+
+    if not rejected_rows.empty:
+        score_cols = [col for col in ("score", "liquidity_score", "transition_risk", "proximity_score") if col in rejected_rows.columns]
+        if score_cols:
+            rejected_sorted = rejected_rows.sort_values(by=score_cols[: min(2, len(score_cols))], ascending=[False] * min(2, len(score_cols)))
+        else:
+            rejected_sorted = rejected_rows.sort_values(by=["ticker"], ascending=[True])
+        top_rejected = rejected_sorted.iloc[0].to_dict()
+        top_rejected_score = _float_or_none(top_rejected.get("score"))
+
+    rejection_summary = _summarize_hedge_rejections(rows)
+    quality_gap = None
+    if top_accepted_score is not None and top_rejected_score is not None:
+        quality_gap = float(top_accepted_score) - float(top_rejected_score)
+
+    cluster_hedge = snapshot.get("cluster_hedge") if isinstance(snapshot.get("cluster_hedge"), dict) else {}
+    cluster_count = len(cluster_hedge.get("clusters") or []) if isinstance(cluster_hedge, dict) else 0
+
+    accepted_count = int(len(accepted_rows))
+    candidate_count = int(len(rows))
+    hold_tail = _extract_hold_tail_metrics(run_summary, risk_proof, control)
+
+    return {
+        "candidate_count": candidate_count,
+        "accepted_count": accepted_count,
+        "rejected_count": int(len(rejected_rows)),
+        "accepted_rate": (float(accepted_count) / float(candidate_count)) if candidate_count > 0 else None,
+        "top_accepted": top_accepted,
+        "top_rejected": top_rejected,
+        "top_accepted_score": top_accepted_score,
+        "top_rejected_score": top_rejected_score,
+        "quality_gap": quality_gap,
+        "rejection_reason_counts": rejection_summary["reason_counts"],
+        "top_rejection_reason": rejection_summary["top_reason"],
+        "top_rejection_reason_count": rejection_summary["top_reason_count"],
+        "selection_reason": selection.get("selected_reason") or selection.get("reason") or snapshot.get("selected_reason"),
+        "selected_market": selection.get("selected_market") or selection.get("market") or snapshot.get("market"),
+        "selected_score": _float_or_none(selection.get("selected_score")),
+        "selected_quoteability_state": selection.get("quoteability_state") or selection.get("selected_quoteability_state"),
+        "cluster_count": cluster_count,
+        "hold_tail": hold_tail,
+        "risk_proof": risk_proof,
+        "forced_flat_events": list(control.get("forced_flat_events") or []),
+        "forced_flat_markets": list(control.get("forced_flat_markets") or []),
+        "stale_unwind_observed": bool(risk_proof.get("stale_unwind_observed")),
+        "force_flat_observed": bool(risk_proof.get("force_flat_observed")),
+        "day_loss_observed": bool(risk_proof.get("day_loss_observed")),
+        "flatten_only_cycles": _int_or_none(risk_proof.get("flatten_only_cycles")) or 0,
+    }
+
+
+def get_cluster_calibration_gaps(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> List[str]:
+    cluster_exposure = get_cluster_exposure_snapshot(runtime_snapshot=runtime_snapshot, db_path=db_path)
+    clusters = cluster_exposure.get("clusters")
+    if not isinstance(clusters, list) or not clusters:
+        return ["cluster_exposure payload missing"]
+
+    missing: List[str] = []
+    if not any(isinstance(cluster, dict) and cluster.get("control_state") not in (None, "") for cluster in clusters):
+        missing.append("cluster control_state")
+    if not any(
+        isinstance(cluster, dict)
+        and (
+            cluster.get("hedge_action") not in (None, "")
+            or cluster.get("action") not in (None, "")
+            or cluster.get("next_action") not in (None, "")
+        )
+        for cluster in clusters
+    ):
+        missing.append("cluster hedge action label")
+    if not any(
+        isinstance(cluster, dict)
+        and (
+            cluster.get("hedge_action_reason") not in (None, "")
+            or cluster.get("action_reason") not in (None, "")
+            or cluster.get("reason") not in (None, "")
+        )
+        for cluster in clusters
+    ):
+        missing.append("cluster action reason")
+    if not any(isinstance(cluster, dict) and cluster.get("unrealized_pnl") not in (None, "") for cluster in clusters):
+        missing.append("cluster unrealized_pnl")
+    if not any(
+        isinstance(cluster, dict)
+        and (
+            cluster.get("hedge_ratio") not in (None, "")
+            or cluster.get("target_hedge_ratio") not in (None, "")
+        )
+        for cluster in clusters
+    ):
+        missing.append("cluster hedge ratio")
+    if not any(
+        isinstance(cluster, dict)
+        and (
+            cluster.get("hedge_target_market") not in (None, "")
+            or cluster.get("hedge_target_market_id") not in (None, "")
+            or cluster.get("hedge_target_cluster_id") not in (None, "")
+            or cluster.get("target_market") not in (None, "")
+        )
+        for cluster in clusters
+    ):
+        missing.append("hedge target market")
+    if not any(
+        isinstance(cluster, dict)
+        and (
+            cluster.get("hedge_target_token") not in (None, "")
+            or cluster.get("hedge_target_token_id") not in (None, "")
+            or cluster.get("hedge_target_side") not in (None, "")
+        )
+        for cluster in clusters
+    ):
+        missing.append("hedge target token/side")
+    return missing
 
 
 def discover_core_mm_runtimes(repo_root: Optional[Path] = None) -> pd.DataFrame:
@@ -689,19 +1542,9 @@ def get_strategy_operation_rows(db_path: Optional[Path] = None, limit: int = 60)
     decisions = query_df(
         f"""
         SELECT
-          ts_ms,
-          'decision' AS row_type,
-          market AS market_slug,
-          token_id,
-          action,
-          reason_codes,
-          p_hat,
-          expected_edge,
-          expected_cost,
-          NULL AS price,
-          NULL AS size,
-          NULL AS status
-        FROM decisions
+          d.*,
+          'decision' AS row_type
+        FROM decisions d
         ORDER BY ts_ms DESC, COALESCE(decision_id, '') DESC
         LIMIT {capped_limit}
         """,
@@ -741,6 +1584,8 @@ def get_strategy_operation_rows(db_path: Optional[Path] = None, limit: int = 60)
     combined = pd.concat([decisions, orders], ignore_index=True, sort=False) if not orders.empty else decisions
     if combined.empty:
         return combined
+    if "market_slug" not in combined.columns and "market" in combined.columns:
+        combined["market_slug"] = combined["market"]
     combined["market_label"] = combined["market_slug"].apply(lambda value: _friendly_symbol_from_market_slug(value) or _market_label_from_slug(value))
     combined["why"] = combined.apply(
         lambda row: str(row.get("reason_codes") or "").strip() or (
@@ -757,17 +1602,7 @@ def get_decision_explainer_rows(db_path: Optional[Path] = None, limit: int = 20)
         return pd.DataFrame()
     df = query_df(
         f"""
-        SELECT
-          ts_ms,
-          decision_id,
-          market,
-          token_id,
-          action,
-          reason_codes,
-          p_hat,
-          expected_edge,
-          expected_cost,
-          policy_json
+        SELECT *
         FROM decisions
         ORDER BY ts_ms DESC, COALESCE(decision_id, '') DESC
         LIMIT {max(1, int(limit))}
@@ -777,6 +1612,33 @@ def get_decision_explainer_rows(db_path: Optional[Path] = None, limit: int = 20)
     if df.empty:
         return df
     out = adapt_decisions(df)
+    for column in [
+        "control_state",
+        "hedge_action",
+        "hedge_cluster_id",
+        "hedge_action_reason",
+        "hedge_market_id",
+        "hedge_target_token_id",
+        "hedge_target_side",
+        "hedge_preferred_side",
+        "hedge_ratio",
+        "hedge_quality_score",
+        "hedge_success_window_ms",
+        "hedge_failed_cooldown_until_ms",
+    ]:
+        if column not in out.columns:
+            out[column] = None
+    if "policy_json" in out.columns:
+        for idx, row in out.iterrows():
+            policy = safe_json(row.get("policy_json"))
+            hedge_context = _hedge_context_from_mapping(policy.get("hedge_context"))
+            if not hedge_context:
+                desired_quotes = list(policy.get("desired_quotes") or [])
+                if desired_quotes:
+                    hedge_context = _hedge_context_from_mapping(desired_quotes[0].get("metadata") or {})
+            for key, value in hedge_context.items():
+                if key in out.columns and (row.get(key) in (None, "") or pd.isna(row.get(key))):
+                    out.at[idx, key] = value
     out["market_label"] = out["market"].apply(lambda value: _market_label_from_slug(str(value)))
     out["symbol"] = out["market"].apply(lambda value: _friendly_symbol_from_market_slug(value))
     out["decision_summary"] = out.apply(
@@ -791,7 +1653,7 @@ def get_decision_explainer_rows(db_path: Optional[Path] = None, limit: int = 20)
         lambda row: (
             "Trading now"
             if str(row.get("gate_result") or "").upper() == "ALLOW"
-            else f"Waiting: {str(row.get('reason_codes') or 'policy gate')}"
+            else f"Waiting: {humanize_reason_codes(row.get('reason_codes'))}"
         ),
         axis=1,
     )
@@ -839,10 +1701,34 @@ def get_runtime_config_snapshot(runtime_root: Optional[Path] = None, db_path: Op
         "max_spread_bps": _float_or_none(policy.get("max_spread_bps")),
         "max_slippage_bps": _float_or_none(policy.get("max_slippage_bps")),
     }
-    for key in ("trade_size", "max_size", "reverse_position_min_size", "min_order_size", "within_pct", "fee_bps", "fee_mode", "min_size", "fallback_size"):
+    for key in (
+        "safe_risk_profile",
+        "strategy_allocated_equity",
+        "use_allocated_equity_for_risk",
+        "risk_based_share_sizing",
+        "trade_size",
+        "max_size",
+        "min_order_size",
+        "within_pct",
+        "fee_bps",
+        "fee_mode",
+        "min_size",
+        "fallback_size",
+        "cycle_secs",
+        "refresh_market_secs",
+        "quote_spread_multiplier",
+        "market_dwell_secs",
+        "hard_position_cap",
+        "stale_duration_scale",
+        "maker_exit_grace_secs",
+        "cross_escalation_drawdown_pct",
+        "pre_kill_warning_fraction",
+    ):
         value = status_config.get(key, state_config.get(key))
-        if key == "fee_mode":
+        if key == "fee_mode" or key == "safe_risk_profile":
             merged[key] = str(value) if value is not None else None
+        elif key in {"use_allocated_equity_for_risk", "risk_based_share_sizing"}:
+            merged[key] = bool(value) if value is not None else None
         else:
             merged[key] = _float_or_none(value)
     return merged
@@ -1997,14 +2883,7 @@ def get_fills_recent(limit: int = 20, db_path: Optional[Path] = None) -> pd.Data
         return pd.DataFrame()
     df = query_df(
         f"""
-        SELECT
-          ts_ms,
-          order_id,
-          token_id,
-          side,
-          fill_price,
-          fill_qty,
-          payload_json
+        SELECT *
         FROM fills
         ORDER BY ts_ms DESC
         LIMIT {int(limit)}
@@ -2015,12 +2894,294 @@ def get_fills_recent(limit: int = 20, db_path: Optional[Path] = None) -> pd.Data
         return df
     realized_deltas: List[Optional[float]] = []
     fee_usdc: List[Optional[float]] = []
+    market_slugs: List[Optional[str]] = []
+    event_ids: List[Optional[str]] = []
+    control_states: List[Optional[str]] = []
+    hedge_actions: List[Optional[str]] = []
+    hedge_cluster_ids: List[Optional[str]] = []
+    hedge_action_reasons: List[Optional[str]] = []
+    hedge_market_ids: List[Optional[str]] = []
+    hedge_target_token_ids: List[Optional[str]] = []
+    hedge_target_sides: List[Optional[str]] = []
+    hedge_preferred_sides: List[Optional[str]] = []
+    hedge_ratios: List[Optional[float]] = []
+    hedge_quality_scores: List[Optional[float]] = []
+    hedge_success_windows: List[Optional[int]] = []
+    hedge_failed_cooldown_until_ms: List[Optional[int]] = []
+    liquidity_modes: List[Optional[str]] = []
+    fill_triggers: List[Optional[str]] = []
+    quote_modes: List[Optional[str]] = []
+    risk_actions: List[Optional[str]] = []
+    risk_states: List[Optional[str]] = []
+    stale_states: List[Optional[str]] = []
+    exit_modes: List[Optional[str]] = []
+    exit_escalations: List[Optional[str]] = []
+    buy_reentry_blocked: List[Optional[bool]] = []
+    current_equities: List[Optional[float]] = []
+    market_exposures: List[Optional[float]] = []
+    event_exposures: List[Optional[float]] = []
+    time_to_expiry: List[Optional[int]] = []
     for _, row in df.iterrows():
         payload = safe_json(row.get("payload_json"))
+        placement = safe_json(payload.get("placement_metadata"))
         realized_deltas.append(_float_or_none(payload.get("realized_net_pnl_delta")))
         fee_usdc.append(_float_or_none(payload.get("fee_usdc")))
+        market_slugs.append(payload.get("market_slug"))
+        event_ids.append(placement.get("event_id"))
+        control_states.append(row.get("control_state") or payload.get("control_state") or placement.get("control_state"))
+        hedge_actions.append(row.get("hedge_action") or payload.get("hedge_action") or placement.get("hedge_action"))
+        hedge_cluster_ids.append(row.get("hedge_cluster_id") or payload.get("hedge_cluster_id") or placement.get("hedge_cluster_id"))
+        hedge_action_reasons.append(row.get("hedge_action_reason") or payload.get("hedge_action_reason") or placement.get("hedge_action_reason"))
+        hedge_market_ids.append(row.get("hedge_market_id") or payload.get("hedge_market_id") or placement.get("hedge_market_id"))
+        hedge_target_token_ids.append(row.get("hedge_target_token_id") or payload.get("hedge_target_token_id") or placement.get("hedge_target_token_id"))
+        hedge_target_sides.append(row.get("hedge_target_side") or payload.get("hedge_target_side") or placement.get("hedge_target_side"))
+        hedge_preferred_sides.append(row.get("hedge_preferred_side") or payload.get("hedge_preferred_side") or placement.get("hedge_preferred_side"))
+        hedge_ratios.append(_float_or_none(row.get("hedge_ratio") or payload.get("hedge_ratio") or placement.get("hedge_ratio")))
+        hedge_quality_scores.append(_float_or_none(row.get("hedge_quality_score") or payload.get("hedge_quality_score") or placement.get("hedge_quality_score")))
+        hedge_success_windows.append(_int_or_none(row.get("hedge_success_window_ms") or payload.get("hedge_success_window_ms") or placement.get("hedge_success_window_ms")))
+        hedge_failed_cooldown_until_ms.append(_int_or_none(row.get("hedge_failed_cooldown_until_ms") or payload.get("hedge_failed_cooldown_until_ms") or placement.get("hedge_failed_cooldown_until_ms")))
+        liquidity_modes.append(payload.get("liquidity_mode"))
+        fill_triggers.append(payload.get("fill_trigger"))
+        quote_modes.append(placement.get("quote_mode"))
+        risk_actions.append(placement.get("risk_action"))
+        risk_states.append(placement.get("risk_state"))
+        stale_states.append(placement.get("stale_state"))
+        exit_modes.append(placement.get("exit_mode"))
+        exit_escalations.append(placement.get("exit_escalation_reason"))
+        buy_reentry_blocked.append(placement.get("buy_reentry_blocked"))
+        current_equities.append(_float_or_none(placement.get("current_equity")))
+        market_exposures.append(_float_or_none(placement.get("market_exposure_notional")))
+        event_exposures.append(_float_or_none(placement.get("event_exposure_notional")))
+        time_to_expiry.append(_int_or_none(placement.get("time_to_expiry_ms")))
     df["realized_net_pnl_delta"] = realized_deltas
     df["fee_usdc"] = fee_usdc
+    df["market_slug"] = market_slugs
+    df["event_id"] = event_ids
+    df["control_state"] = control_states
+    df["hedge_action"] = hedge_actions
+    df["hedge_cluster_id"] = hedge_cluster_ids
+    df["hedge_action_reason"] = hedge_action_reasons
+    df["hedge_market_id"] = hedge_market_ids
+    df["hedge_target_token_id"] = hedge_target_token_ids
+    df["hedge_target_side"] = hedge_target_sides
+    df["hedge_preferred_side"] = hedge_preferred_sides
+    df["hedge_ratio"] = hedge_ratios
+    df["hedge_quality_score"] = hedge_quality_scores
+    df["hedge_success_window_ms"] = hedge_success_windows
+    df["hedge_failed_cooldown_until_ms"] = hedge_failed_cooldown_until_ms
+    df["liquidity_mode"] = liquidity_modes
+    df["fill_trigger"] = fill_triggers
+    df["quote_mode"] = quote_modes
+    df["risk_action"] = risk_actions
+    df["risk_state"] = risk_states
+    df["stale_state"] = stale_states
+    df["exit_mode"] = exit_modes
+    df["exit_escalation_reason"] = exit_escalations
+    df["buy_reentry_blocked"] = buy_reentry_blocked
+    df["current_equity"] = current_equities
+    df["market_exposure_notional"] = market_exposures
+    df["event_exposure_notional"] = event_exposures
+    df["time_to_expiry_ms"] = time_to_expiry
+    df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
+    return df
+
+
+def get_fill_risk_timeline(limit: int = 100, db_path: Optional[Path] = None) -> pd.DataFrame:
+    events: List[Dict[str, Any]] = []
+    capped_limit = max(10, int(limit))
+
+    if table_exists("fills", db_path=db_path):
+        fills = query_df(
+            f"""
+            SELECT *
+            FROM fills
+            ORDER BY ts_ms DESC
+            LIMIT {capped_limit}
+            """,
+            db_path=db_path,
+        )
+        for _, row in fills.iterrows():
+            payload = safe_json(row.get("payload_json"))
+            placement = safe_json(payload.get("placement_metadata"))
+            hedge_context = _hedge_context_from_mapping({
+                **placement,
+                **payload,
+                **row.to_dict(),
+            })
+            side = str(row.get("side") or "").upper()
+            qty = _float_or_none(row.get("fill_qty"))
+            px = _float_or_none(row.get("fill_price"))
+            summary = f"FILL {side} {qty or 0:.0f} @ {px or 0:.3f}"
+            risk_action = str(placement.get("risk_action") or "NORMAL")
+            if risk_action != "NORMAL":
+                summary = f"{summary} · {risk_action}"
+            control_state = str(hedge_context.get("control_state") or "").strip()
+            hedge_action = str(hedge_context.get("hedge_action") or "").strip()
+            hedge_reason = str(hedge_context.get("hedge_action_reason") or "").strip()
+            target_bits = [
+                str(hedge_context.get("hedge_market_id") or "").strip(),
+                str(hedge_context.get("hedge_target_token_id") or "").strip(),
+                str(hedge_context.get("hedge_target_side") or "").strip(),
+            ]
+            if control_state:
+                summary = f"{summary} · {control_state}"
+            if hedge_action and hedge_action != "NONE":
+                summary = f"{summary} · {hedge_action}"
+            if hedge_reason:
+                summary = f"{summary} · {hedge_reason}"
+            if any(target_bits):
+                summary = f"{summary} · {'/'.join(bit for bit in target_bits if bit)}"
+            events.append(
+                {
+                    "ts_ms": _int_or_none(row.get("ts_ms")),
+                    "event_kind": "fill",
+                    "market_slug": payload.get("market_slug"),
+                    "token_id": row.get("token_id"),
+                    "summary": summary,
+                    "side": row.get("side"),
+                    "control_state": control_state or None,
+                    "hedge_action": hedge_action or None,
+                    "hedge_action_reason": hedge_reason or None,
+                    "hedge_cluster_id": hedge_context.get("hedge_cluster_id") or None,
+                    "hedge_market_id": hedge_context.get("hedge_market_id") or None,
+                    "hedge_target_token_id": hedge_context.get("hedge_target_token_id") or None,
+                    "hedge_target_side": hedge_context.get("hedge_target_side") or None,
+                    "hedge_preferred_side": hedge_context.get("hedge_preferred_side") or None,
+                    "hedge_ratio": _float_or_none(hedge_context.get("hedge_ratio")),
+                    "hedge_quality_score": _float_or_none(hedge_context.get("hedge_quality_score")),
+                    "hedge_success_window_ms": _int_or_none(hedge_context.get("hedge_success_window_ms")),
+                    "hedge_failed_cooldown_until_ms": _int_or_none(hedge_context.get("hedge_failed_cooldown_until_ms")),
+                    "risk_action": placement.get("risk_action"),
+                    "risk_state": placement.get("risk_state"),
+                    "stale_state": placement.get("stale_state"),
+                    "exit_mode": placement.get("exit_mode"),
+                    "exit_escalation_reason": placement.get("exit_escalation_reason"),
+                }
+            )
+
+    if table_exists("decisions", db_path=db_path):
+        decisions = query_df(
+            f"""
+            SELECT *
+            FROM decisions
+            ORDER BY ts_ms DESC
+            LIMIT {capped_limit * 2}
+            """,
+            db_path=db_path,
+        )
+        for _, row in decisions.iterrows():
+            policy = safe_json(row.get("policy_json"))
+            risk = safe_json(policy.get("risk_decision"))
+            if not risk:
+                continue
+            hedge_context = _hedge_context_from_mapping({
+                **safe_json(policy.get("hedge_context")),
+                **safe_json((policy.get("desired_quotes") or [{}])[0].get("metadata") if isinstance(policy.get("desired_quotes"), list) and policy.get("desired_quotes") else {}),
+                **row.to_dict(),
+            })
+            action = str(risk.get("action") or row.get("action") or "NORMAL")
+            risk_state = str(risk.get("risk_state") or "normal")
+            stale_state = str(risk.get("stale_state") or "flat")
+            exit_reason = risk.get("exit_escalation_reason")
+            stop_open = bool(risk.get("stop_open_triggered"))
+            force_flat = bool(risk.get("force_flat_triggered"))
+            if action == "NORMAL" and risk_state == "normal" and stale_state != "stale" and not exit_reason and not stop_open and not force_flat:
+                continue
+            summary_bits = [action]
+            control_state = str(hedge_context.get("control_state") or row.get("control_state") or "NORMAL").strip()
+            hedge_action = str(hedge_context.get("hedge_action") or row.get("hedge_action") or "NONE").strip()
+            hedge_reason = str(hedge_context.get("hedge_action_reason") or row.get("hedge_action_reason") or "").strip()
+            if risk_state not in {"", "normal"}:
+                summary_bits.append(risk_state)
+            if control_state and control_state != "NORMAL":
+                summary_bits.append(control_state)
+            if hedge_action and hedge_action != "NONE":
+                summary_bits.append(hedge_action)
+            if stale_state == "stale":
+                summary_bits.append("stale")
+            if stop_open:
+                summary_bits.append("stop-open")
+            if force_flat:
+                summary_bits.append("force-flat")
+            if hedge_reason:
+                summary_bits.append(hedge_reason)
+            hedge_target_bits = [
+                str(hedge_context.get("hedge_market_id") or row.get("hedge_market_id") or "").strip(),
+                str(hedge_context.get("hedge_target_token_id") or row.get("hedge_target_token_id") or "").strip(),
+                str(hedge_context.get("hedge_target_side") or row.get("hedge_target_side") or "").strip(),
+            ]
+            if any(hedge_target_bits):
+                summary_bits.append("/".join(bit for bit in hedge_target_bits if bit))
+            if exit_reason:
+                summary_bits.append(str(exit_reason))
+            events.append(
+                {
+                    "ts_ms": _int_or_none(row.get("ts_ms")),
+                    "event_kind": "risk",
+                    "market_slug": row.get("market"),
+                    "token_id": row.get("token_id"),
+                    "summary": " · ".join(summary_bits),
+                    "side": None,
+                    "control_state": control_state or None,
+                    "hedge_action": hedge_action or None,
+                    "hedge_action_reason": hedge_reason or None,
+                    "hedge_cluster_id": hedge_context.get("hedge_cluster_id") or row.get("hedge_cluster_id") or None,
+                    "hedge_market_id": hedge_context.get("hedge_market_id") or row.get("hedge_market_id") or None,
+                    "hedge_target_token_id": hedge_context.get("hedge_target_token_id") or row.get("hedge_target_token_id") or None,
+                    "hedge_target_side": hedge_context.get("hedge_target_side") or row.get("hedge_target_side") or None,
+                    "hedge_preferred_side": hedge_context.get("hedge_preferred_side") or row.get("hedge_preferred_side") or None,
+                    "hedge_ratio": _float_or_none(hedge_context.get("hedge_ratio") or row.get("hedge_ratio")),
+                    "hedge_quality_score": _float_or_none(hedge_context.get("hedge_quality_score") or row.get("hedge_quality_score")),
+                    "hedge_success_window_ms": _int_or_none(hedge_context.get("hedge_success_window_ms") or row.get("hedge_success_window_ms")),
+                    "hedge_failed_cooldown_until_ms": _int_or_none(hedge_context.get("hedge_failed_cooldown_until_ms") or row.get("hedge_failed_cooldown_until_ms")),
+                    "risk_action": action,
+                    "risk_state": risk_state,
+                    "stale_state": stale_state,
+                    "exit_mode": risk.get("exit_mode"),
+                    "exit_escalation_reason": exit_reason,
+                }
+            )
+
+    if table_exists("system_state", db_path=db_path):
+        states = query_df(
+            f"""
+            SELECT as_of_ts, payload_json
+            FROM system_state
+            ORDER BY as_of_ts ASC
+            LIMIT {capped_limit * 4}
+            """,
+            db_path=db_path,
+        )
+        previous_market: Optional[str] = None
+        for _, row in states.iterrows():
+            payload = safe_json(row.get("payload_json"))
+            runner = safe_json(payload.get("runner"))
+            market_id = runner.get("market_id")
+            if market_id in (None, ""):
+                continue
+            market_text = str(market_id)
+            if previous_market is not None and market_text != previous_market:
+                events.append(
+                    {
+                        "ts_ms": _int_or_none(row.get("as_of_ts")),
+                        "event_kind": "market_switch",
+                        "market_slug": market_text,
+                        "token_id": None,
+                        "summary": f"MARKET SWITCH {previous_market} -> {market_text}",
+                        "side": None,
+                        "risk_action": None,
+                        "risk_state": None,
+                        "stale_state": None,
+                        "exit_mode": None,
+                        "exit_escalation_reason": None,
+                    }
+                )
+            previous_market = market_text
+
+    if not events:
+        return pd.DataFrame()
+    df = pd.DataFrame(events)
+    df = df.dropna(subset=["ts_ms"]).sort_values("ts_ms", ascending=False).head(capped_limit).reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
     return df
 
@@ -2031,6 +3192,193 @@ def get_latest_system_payload(db_path: Optional[Path] = None) -> Dict[str, Any]:
         return {}
     df = query_df("SELECT payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1", db_path=db_path)
     return safe_json(safe_first(df, "payload_json", "{}"))
+
+
+def queue_control_command(
+    *,
+    command_type: str,
+    payload: Optional[Dict[str, Any]] = None,
+    scope: str = "global",
+    requested_by: str = "dashboard",
+    expires_in_ms: int = 120_000,
+    db_path: Optional[Path] = None,
+) -> str:
+    path = db_path or resolve_db_path()
+    runtime_root = runtime_root_for_db(path)
+    status = get_run_status(runtime_root=runtime_root, db_path=path)
+    run_id = str(status.get("run_id") or runtime_root.name)
+    store = ControlCommandStore(path)
+    return store.submit_command(
+        run_id=run_id,
+        runtime_root=runtime_root.as_posix(),
+        scope=scope,
+        command_type=str(command_type or ""),
+        payload=dict(payload or {}),
+        requested_by=str(requested_by or "dashboard"),
+        expires_in_ms=int(expires_in_ms),
+    )
+
+
+def get_recent_control_commands(db_path: Optional[Path] = None, limit: int = 20) -> pd.DataFrame:
+    if not table_exists("control_commands", db_path=db_path):
+        return pd.DataFrame()
+    return query_df(
+        """
+        SELECT command_id, run_id, runtime_root, scope, command_type,
+               requested_by, requested_at_ms, status, expires_at_ms,
+               payload_json, result_json
+        FROM control_commands
+        ORDER BY requested_at_ms DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+        db_path=db_path,
+    )
+
+
+def get_recent_control_events(db_path: Optional[Path] = None, limit: int = 40) -> pd.DataFrame:
+    if not table_exists("control_events", db_path=db_path):
+        return pd.DataFrame()
+    return query_df(
+        """
+        SELECT event_id, command_id, ts_ms, event_type, status, payload_json
+        FROM control_events
+        ORDER BY ts_ms DESC, event_id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+        db_path=db_path,
+    )
+
+
+def get_control_plane_snapshot(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    runtime_snapshot = get_runtime_status_snapshot(db_path=db_path)
+    payload = runtime_snapshot.get("payload_json") if isinstance(runtime_snapshot.get("payload_json"), dict) else {}
+    control_state = safe_json(payload.get("control_state"))
+    if not control_state:
+        control_state = safe_json((payload.get("runner") or {}).get("control_state"))
+    status_control = runtime_snapshot.get("status", {}).get("control_state") if isinstance(runtime_snapshot.get("status"), dict) else {}
+    if isinstance(status_control, dict):
+        control_state = {**status_control, **control_state}
+    commands = get_recent_control_commands(db_path=db_path, limit=20)
+    pending = commands[commands["status"].astype(str) == "pending"] if not commands.empty and "status" in commands.columns else pd.DataFrame()
+    last_applied = (
+        commands[commands["status"].astype(str) == "applied"].iloc[0].to_dict()
+        if not commands.empty and "status" in commands.columns and any(commands["status"].astype(str) == "applied")
+        else {}
+    )
+    return {
+        "trading_enabled": bool(control_state.get("trading_enabled", True)),
+        "kill_switch_enabled": bool(control_state.get("kill_switch_enabled", False)),
+        "flatten_only_mode": bool(control_state.get("flatten_only_mode", False)),
+        "halt_after_flatten": bool(control_state.get("halt_after_flatten", False)),
+        "risk_warning_triggered": bool(control_state.get("risk_warning_triggered", False)),
+        "cycle_secs": _float_or_none(control_state.get("cycle_secs")),
+        "refresh_market_secs": _float_or_none(control_state.get("refresh_market_secs")),
+        "quote_spread_multiplier": _float_or_none(control_state.get("quote_spread_multiplier")),
+        "strategy_allocated_equity": _float_or_none(control_state.get("strategy_allocated_equity")),
+        "use_allocated_equity_for_risk": bool(control_state.get("use_allocated_equity_for_risk")) if control_state.get("use_allocated_equity_for_risk") is not None else None,
+        "risk_based_share_sizing": bool(control_state.get("risk_based_share_sizing")) if control_state.get("risk_based_share_sizing") is not None else None,
+        "safe_risk_profile": control_state.get("safe_risk_profile"),
+        "forced_flat_events": list(control_state.get("forced_flat_events") or []),
+        "forced_flat_markets": list(control_state.get("forced_flat_markets") or []),
+        "last_control_command": control_state.get("last_control_command") or {},
+        "pending_count": int(len(pending)),
+        "last_applied": last_applied,
+    }
+
+
+def get_strategy_settings_view(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    config = get_runtime_config_snapshot(db_path=db_path)
+    control = get_control_plane_snapshot(db_path=db_path)
+    commands = get_recent_control_commands(db_path=db_path, limit=30)
+    pending_patch: Dict[str, Any] = {}
+    last_applied_patch: Dict[str, Any] = {}
+    if not commands.empty:
+        for _, row in commands.iterrows():
+            if str(row.get("command_type") or "") != "apply_config_patch":
+                continue
+            payload = safe_json(row.get("payload_json"))
+            result = safe_json(row.get("result_json"))
+            patch = safe_json(payload.get("patch")) if "patch" in payload else payload
+            if str(row.get("status") or "") == "pending" and not pending_patch:
+                pending_patch = patch
+            if str(row.get("status") or "") == "applied" and not last_applied_patch:
+                last_applied_patch = safe_json(result.get("applied")) if "applied" in result else patch
+    return {
+        "current": config,
+        "pending_patch": pending_patch,
+        "last_applied_patch": last_applied_patch,
+        "control": control,
+    }
+
+
+def get_runtime_alert_feed(db_path: Optional[Path] = None) -> pd.DataFrame:
+    snapshot = get_runtime_status_snapshot(db_path=db_path)
+    control = get_control_plane_snapshot(db_path=db_path)
+    rows: List[Dict[str, Any]] = []
+    now_ts = _now_ms()
+    if not snapshot.get("quoteable"):
+        rows.append({"ts_ms": now_ts, "severity": "warn", "owner": "Kant", "alert_type": "quoteability", "summary": "Runtime is not quoteable", "next_action": "Inspect selection and live books"})
+    if str(snapshot.get("book_health") or "") not in {"healthy", "unknown"}:
+        rows.append({"ts_ms": now_ts, "severity": "warn", "owner": "Kant", "alert_type": "book_health", "summary": f"Book health degraded: {snapshot.get('book_health')}", "next_action": "Review book diagnostics and feed health"})
+    if control.get("pending_count", 0) > 0:
+        rows.append({"ts_ms": now_ts, "severity": "info", "owner": "Ramanujan", "alert_type": "control_backlog", "summary": f"{control.get('pending_count')} pending control command(s)", "next_action": "Verify runner is acknowledging staged commands"})
+    commands = get_recent_control_commands(db_path=db_path, limit=20)
+    if not commands.empty and "status" in commands.columns:
+        rejected = commands[commands["status"].astype(str) == "rejected"]
+        if not rejected.empty:
+            latest = rejected.iloc[0]
+            rows.append({
+                "ts_ms": _int_or_none(latest.get("requested_at_ms")) or now_ts,
+                "severity": "critical",
+                "owner": "Ramanujan",
+                "alert_type": "command_rejected",
+                "summary": f"Control command rejected: {latest.get('command_type')}",
+                "next_action": "Inspect command validation and dashboard payload",
+            })
+    events = get_fill_risk_timeline(limit=100, db_path=db_path)
+    if not events.empty and "risk_action" in events.columns:
+        stale_count = int((events["risk_action"].astype(str) == "STALE_UNWIND").sum())
+        if stale_count >= 10:
+            rows.append({"ts_ms": now_ts, "severity": "warn", "owner": "Kant", "alert_type": "stale_inventory", "summary": f"High stale unwind activity: {stale_count} recent events", "next_action": "Review stale timer and quote quality"})
+    return pd.DataFrame(rows).sort_values("ts_ms", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def get_overnight_supervision_rows(db_path: Optional[Path] = None) -> pd.DataFrame:
+    snapshot = get_runtime_status_snapshot(db_path=db_path)
+    alerts = get_runtime_alert_feed(db_path=db_path)
+    rows: List[Dict[str, Any]] = []
+    rows.append(
+        {
+            "workstream": "Kalshi live-readiness gates",
+            "owner": "Kant",
+            "status": "active" if bool(snapshot.get("quoteable")) else "needs_attention",
+            "evidence": snapshot.get("market") or "No active market",
+            "next_task": "Keep paper runtime safe and quoteable",
+        }
+    )
+    rows.append(
+        {
+            "workstream": "Dashboard operator surface",
+            "owner": "Ramanujan",
+            "status": "active",
+            "evidence": f"{int(len(alerts))} active alerts" if not alerts.empty else "No active dashboard alerts",
+            "next_task": "Keep controls, telemetry, and monitoring readable",
+        }
+    )
+    if not alerts.empty:
+        for _, row in alerts.head(4).iterrows():
+            rows.append(
+                {
+                    "workstream": str(row.get("alert_type") or "alert"),
+                    "owner": str(row.get("owner") or "Ramanujan"),
+                    "status": str(row.get("severity") or "info"),
+                    "evidence": str(row.get("summary") or ""),
+                    "next_task": str(row.get("next_action") or ""),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def get_per_token_inventory(db_path: Optional[Path] = None) -> pd.DataFrame:
@@ -2510,11 +3858,17 @@ def get_latest_decisions_per_token(
     for _, row in df.iterrows():
         tid = str(row.get("token_id", ""))
         payload = safe_json(row.get("policy_json"))
+        metadata = _desired_quote_metadata(payload)
         result[tid] = {
+            "market": row.get("market"),
+            "token_id": row.get("token_id"),
             "action": str(row.get("action") or "?"),
             "reason_codes": str(row.get("reason_codes") or ""),
             "ts_ms": row.get("ts_ms"),
             "expected_edge": _float_or_none(row.get("expected_edge")),
+            "p_fair": _float_or_none(metadata.get("p_fair")),
+            "fee_type": metadata.get("fee_type"),
+            "fee_multiplier": _float_or_none(metadata.get("fee_multiplier")),
             "book_diag": payload.get("book_diag") or {},
             "metrics": payload.get("metrics") or {},
             "flow_filter": payload.get("flow_filter") or {},
@@ -2523,6 +3877,270 @@ def get_latest_decisions_per_token(
             "risk_decision": payload.get("risk_decision") or {},
         }
     return result
+
+
+def _safe_json_list(raw: Any) -> List[Any]:
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _desired_quote_metadata(policy: Dict[str, Any]) -> Dict[str, Any]:
+    desired_quotes = _safe_json_list(policy.get("desired_quotes"))
+    for quote in desired_quotes:
+        if not isinstance(quote, dict):
+            continue
+        metadata = quote.get("metadata")
+        if isinstance(metadata, dict):
+            return metadata
+    return {}
+
+
+def get_latest_decision_snapshot(
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if not table_exists("decisions", db_path=db_path):
+        return {}
+    df = query_df(
+        """
+        SELECT *
+        FROM decisions
+        ORDER BY ts_ms DESC, COALESCE(decision_id, '') DESC
+        LIMIT 1
+        """,
+        db_path=db_path,
+    )
+    if df.empty:
+        return {}
+
+    row = df.iloc[0]
+    policy = safe_json(row.get("policy_json"))
+    metadata = _desired_quote_metadata(policy)
+    size_plan = policy.get("size_plan") if isinstance(policy.get("size_plan"), dict) else {}
+    risk_decision = policy.get("risk_decision") if isinstance(policy.get("risk_decision"), dict) else {}
+
+    return {
+        "market": row.get("market"),
+        "token_id": row.get("token_id"),
+        "action": row.get("action"),
+        "reason_codes": row.get("reason_codes"),
+        "expected_edge": _float_or_none(row.get("expected_edge")),
+        "expected_cost": _float_or_none(row.get("expected_cost")),
+        "p_fair": _float_or_none(metadata.get("p_fair")),
+        "fee_type": metadata.get("fee_type"),
+        "fee_multiplier": _float_or_none(metadata.get("fee_multiplier")),
+        "buy_amount": _float_or_none(size_plan.get("buy_amount")),
+        "sell_amount": _float_or_none(size_plan.get("sell_amount")),
+        "buy_limiter": size_plan.get("buy_limiter"),
+        "sell_limiter": size_plan.get("sell_limiter"),
+        "buy_limiters": size_plan.get("buy_limiters"),
+        "sell_limiters": size_plan.get("sell_limiters"),
+        "risk_action": risk_decision.get("action"),
+        "risk_state": risk_decision.get("risk_state"),
+        "hedge_action": row.get("hedge_action") or metadata.get("hedge_action"),
+        "quote_plan": policy.get("quote_plan") if isinstance(policy.get("quote_plan"), dict) else {},
+        "size_plan": size_plan,
+        "risk_decision": risk_decision,
+        "metadata": metadata,
+        "ts_ms": _int_or_none(row.get("ts_ms")),
+    }
+
+
+def get_selection_session_summary(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+    episode_limit: int = 5,
+) -> Dict[str, Any]:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    selected_reason = str(snapshot.get("selected_reason") or "")
+    if not table_exists("system_state", db_path=db_path):
+        return {
+            "episode_count": 0,
+            "market_change_count": 0,
+            "current_episode_started_at_ms": None,
+            "previous_market": None,
+            "latest_switch_reason": selected_reason or None,
+            "top_markets_by_decision_count": [],
+            "top_switch_reasons": [],
+            "recent_episodes": [],
+        }
+
+    states = query_df(
+        """
+        SELECT as_of_ts, payload_json
+        FROM system_state
+        ORDER BY as_of_ts ASC
+        """,
+        db_path=db_path,
+    )
+    episodes: List[Dict[str, Any]] = []
+    previous_market: Optional[str] = None
+    for _, row in states.iterrows():
+        payload = safe_json(row.get("payload_json"))
+        runner = payload.get("runner") if isinstance(payload.get("runner"), dict) else {}
+        selection = payload.get("selection")
+        if not isinstance(selection, dict):
+            selection = runner.get("selection") if isinstance(runner.get("selection"), dict) else {}
+        selected_market = selection.get("selected_market") if isinstance(selection.get("selected_market"), dict) else {}
+        market_text = (
+            selected_market.get("ticker")
+            or selected_market.get("slug")
+            or runner.get("market_id")
+            or ""
+        )
+        if not market_text:
+            continue
+        market_text = str(market_text)
+        reason = str(
+            selection.get("selected_reason")
+            or selected_market.get("reason")
+            or runner.get("selected_reason")
+            or ""
+        )
+        if market_text != previous_market:
+            episodes.append(
+                {
+                    "ts_ms": _int_or_none(row.get("as_of_ts")),
+                    "market": market_text,
+                    "reason": reason or None,
+                }
+            )
+            previous_market = market_text
+
+    top_markets_df = query_df(
+        """
+        SELECT market, COUNT(*) AS decision_count
+        FROM decisions
+        WHERE market IS NOT NULL AND market != ''
+        GROUP BY market
+        ORDER BY decision_count DESC, market ASC
+        LIMIT 5
+        """,
+        db_path=db_path,
+    )
+    top_markets = [
+        {
+            "market": row.get("market"),
+            "decision_count": int(row.get("decision_count") or 0),
+        }
+        for _, row in top_markets_df.iterrows()
+    ]
+
+    switch_reason_counts: Dict[str, int] = {}
+    for episode in episodes[1:]:
+        reason = str(episode.get("reason") or "unknown")
+        switch_reason_counts[reason] = switch_reason_counts.get(reason, 0) + 1
+    top_switch_reasons = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(
+            switch_reason_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:5]
+    ]
+
+    previous_market_value = episodes[-2]["market"] if len(episodes) > 1 else None
+    latest_switch_reason = None
+    if episodes:
+        latest_switch_reason = episodes[-1].get("reason") or None
+    if not latest_switch_reason:
+        latest_switch_reason = selected_reason or None
+
+    return {
+        "episode_count": len(episodes),
+        "market_change_count": max(0, len(episodes) - 1),
+        "current_episode_started_at_ms": episodes[-1]["ts_ms"] if episodes else None,
+        "previous_market": previous_market_value,
+        "latest_switch_reason": latest_switch_reason,
+        "top_markets_by_decision_count": top_markets,
+        "top_switch_reasons": top_switch_reasons,
+        "recent_episodes": episodes[-max(1, int(episode_limit)):],
+    }
+
+
+def get_session_performance_summary(
+    *,
+    runtime_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else get_runtime_status_snapshot(db_path=db_path)
+    pnl = get_paper_pnl_summary(db_path=db_path)
+    fill_count = int(query_df("SELECT COUNT(*) AS n FROM fills", db_path=db_path).get("n", pd.Series([0])).iloc[0] if table_exists("fills", db_path=db_path) else 0)
+    distinct_orders = int(query_df("SELECT COUNT(DISTINCT order_id) AS n FROM fills", db_path=db_path).get("n", pd.Series([0])).iloc[0] if table_exists("fills", db_path=db_path) else 0)
+
+    control_state_counts = {
+        str(row.get("control_state") or "UNKNOWN"): int(row.get("n") or 0)
+        for _, row in query_df(
+            """
+            SELECT control_state, COUNT(*) AS n
+            FROM decisions
+            GROUP BY control_state
+            """,
+            db_path=db_path,
+        ).iterrows()
+    } if table_exists("decisions", db_path=db_path) else {}
+    hedge_action_counts = {
+        str(row.get("hedge_action") or "UNKNOWN"): int(row.get("n") or 0)
+        for _, row in query_df(
+            """
+            SELECT hedge_action, COUNT(*) AS n
+            FROM decisions
+            GROUP BY hedge_action
+            """,
+            db_path=db_path,
+        ).iterrows()
+    } if table_exists("decisions", db_path=db_path) else {}
+
+    risk_action_counts: Dict[str, int] = {}
+    if table_exists("decisions", db_path=db_path):
+        decisions = query_df("SELECT policy_json FROM decisions", db_path=db_path)
+        for _, row in decisions.iterrows():
+            policy = safe_json(row.get("policy_json"))
+            risk = policy.get("risk_decision") if isinstance(policy.get("risk_decision"), dict) else {}
+            action = str(risk.get("action") or "NONE")
+            risk_action_counts[action] = risk_action_counts.get(action, 0) + 1
+
+    latest_fill_fee: Dict[str, Any] = {}
+    if table_exists("fills", db_path=db_path):
+        fills = query_df(
+            """
+            SELECT payload_json
+            FROM fills
+            ORDER BY ts_ms DESC, COALESCE(order_id, '') DESC
+            LIMIT 1
+            """,
+            db_path=db_path,
+        )
+        if not fills.empty:
+            payload = safe_json(fills.iloc[0].get("payload_json"))
+            latest_fill_fee = {
+                "fee_source": payload.get("fee_source"),
+                "fee_type": payload.get("fee_type"),
+                "fee_multiplier": _float_or_none(payload.get("fee_multiplier")),
+                "realized_net_pnl_delta": _float_or_none(payload.get("realized_net_pnl_delta")),
+            }
+
+    return {
+        "fill_count": fill_count,
+        "distinct_orders": distinct_orders,
+        "turnover": pnl.get("turnover"),
+        "cumulative_fees": pnl.get("cumulative_fees"),
+        "max_drawdown_abs": pnl.get("max_drawdown_abs"),
+        "max_drawdown_pct_peak": pnl.get("max_drawdown_pct"),
+        "control_state_counts": control_state_counts,
+        "risk_action_counts": risk_action_counts,
+        "hedge_action_counts": hedge_action_counts,
+        "latest_fill_fee": latest_fill_fee,
+        "realized_net_pnl": snapshot.get("realized_net_pnl"),
+        "unrealized_pnl": snapshot.get("unrealized_pnl"),
+        "total_pnl": snapshot.get("total_pnl"),
+    }
 
 
 def get_quote_time_series(

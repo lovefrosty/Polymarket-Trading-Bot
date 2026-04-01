@@ -52,12 +52,12 @@ TERMINAL_CSS = """
 
 :root {
   --bg: #0a0a0f;
-  --bg-card: rgba(15, 15, 25, 0.85);
+  --bg-card: rgba(13, 15, 21, 0.68);
   --panel: transparent;
   --muted: #7a8599;
   --text: #e6edf3;
-  --border: rgba(0, 240, 255, 0.12);
-  --border-bright: rgba(0, 240, 255, 0.30);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-bright: rgba(255, 255, 255, 0.14);
   --accent-cyan: #00f0ff;
   --accent-magenta: #ff2a6d;
   --accent-green: #05ffa1;
@@ -86,8 +86,8 @@ body::before {
   z-index: 9999;
   background-image: repeating-linear-gradient(
     to bottom,
-    rgba(0, 240, 255, 0.015),
-    rgba(0, 240, 255, 0.015) 1px,
+    rgba(255, 255, 255, 0.012),
+    rgba(255, 255, 255, 0.012) 1px,
     transparent 1px,
     transparent 3px
   );
@@ -100,9 +100,9 @@ body::before {
   inset: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(rgba(0,240,255,0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0,240,255,0.03) 1px, transparent 1px);
-  background-size: 50px 50px;
+    radial-gradient(circle at 12% 20%, rgba(255,255,255,0.05), transparent 28%),
+    radial-gradient(circle at 82% 14%, rgba(0,240,255,0.04), transparent 26%),
+    radial-gradient(circle at 50% 100%, rgba(255,42,109,0.05), transparent 32%);
 }
 
 .block-container { padding-top: 0.8rem; }
@@ -119,17 +119,17 @@ div[data-testid="stMarkdownContainer"], section[data-testid="stSidebar"],
 
 /* ── Metric cards: glassmorphism + neon border ──────────────────────── */
 div[data-testid="stMetric"] {
-  background: var(--bg-card) !important;
+  background: rgba(255,255,255,0.04) !important;
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--border-bright);
-  border-radius: 8px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
   padding: 12px;
-  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease, background 0.3s ease;
 }
 div[data-testid="stMetric"]:hover {
-  border-color: var(--accent-cyan);
-  box-shadow: var(--glow-cyan);
+  border-color: rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.06) !important;
 }
 
 /* ── Metric text ────────────────────────────────────────────────────── */
@@ -151,21 +151,35 @@ div[data-testid="stMetricDelta"] > div {
 
 /* ── Data frames ────────────────────────────────────────────────────── */
 div[data-testid="stDataFrame"] {
-  background: var(--bg-card) !important;
+  background: rgba(255,255,255,0.03) !important;
   backdrop-filter: blur(8px);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 16px;
   padding: 4px;
 }
 div[data-testid="stDataFrame"] * {
   background: transparent !important;
   color: var(--text) !important;
 }
+div[data-testid="stTable"] {
+  background: rgba(255,255,255,0.03) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 16px !important;
+}
+[data-testid="stJson"] {
+  background: rgba(255,255,255,0.03) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 16px !important;
+}
+[data-testid="stSidebarCollapsedControl"] {
+  background: rgba(255,255,255,0.04) !important;
+  border-radius: 12px !important;
+}
 
 /* ── Sidebar ────────────────────────────────────────────────────────── */
 section[data-testid="stSidebar"] {
-  border-right: 1px solid var(--border-bright);
-  background: rgba(10,10,15,0.95) !important;
+  border-right: 1px solid var(--border);
+  background: rgba(8,10,14,0.84) !important;
 }
 
 /* ── Headings with glow ─────────────────────────────────────────────── */
@@ -214,9 +228,9 @@ small, .muted { color: var(--muted) !important; }
 
 /* ── Top bar ────────────────────────────────────────────────────────── */
 .topbar {
-  border: 1px solid var(--border-bright);
-  border-radius: 8px;
-  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: rgba(255,255,255,0.04);
   backdrop-filter: blur(12px);
   padding: 12px;
   margin-bottom: 10px;
@@ -237,11 +251,11 @@ div[data-baseweb="tab-list"] {
   border-bottom: 1px solid var(--border) !important;
 }
 button[data-baseweb="tab"] {
-  background: rgba(0,240,255,0.04) !important;
-  color: var(--accent-cyan) !important;
+  background: rgba(255,255,255,0.03) !important;
+  color: #b5c0d0 !important;
   border: 1px solid transparent !important;
   border-bottom: none !important;
-  border-radius: 6px 6px 0 0 !important;
+  border-radius: 12px 12px 0 0 !important;
   margin-right: 2px !important;
   padding: 8px 18px !important;
   font-family: 'Orbitron', 'Rajdhani', monospace !important;
@@ -252,17 +266,17 @@ button[data-baseweb="tab"] {
   transition: all 0.2s ease !important;
 }
 button[data-baseweb="tab"]:hover {
-  background: rgba(0,240,255,0.10) !important;
+  background: rgba(255,255,255,0.06) !important;
   color: #ffffff !important;
-  border-color: var(--border-bright) !important;
+  border-color: var(--border) !important;
   border-bottom: none !important;
 }
 button[data-baseweb="tab"][aria-selected="true"] {
-  background: rgba(0,240,255,0.12) !important;
+  background: rgba(255,255,255,0.08) !important;
   color: #ffffff !important;
-  border: 1px solid var(--accent-cyan) !important;
-  border-bottom: 2px solid var(--accent-cyan) !important;
-  box-shadow: 0 0 8px rgba(0,240,255,0.2), inset 0 0 12px rgba(0,240,255,0.05);
+  border: 1px solid rgba(255,255,255,0.16) !important;
+  border-bottom: 2px solid rgba(255,255,255,0.26) !important;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.18), inset 0 0 12px rgba(255,255,255,0.02);
 }
 button[data-baseweb="tab"] p, button[data-baseweb="tab"] span {
   color: inherit !important;
@@ -274,8 +288,8 @@ button[data-baseweb="tab"] p, button[data-baseweb="tab"] span {
 /* ── Expanders ──────────────────────────────────────────────────────── */
 details[data-testid="stExpander"] {
   border: 1px solid var(--border) !important;
-  border-radius: 6px !important;
-  background: var(--bg-card) !important;
+  border-radius: 16px !important;
+  background: rgba(255,255,255,0.03) !important;
 }
 details[data-testid="stExpander"] summary {
   color: var(--accent-cyan) !important;
@@ -295,15 +309,15 @@ details[data-testid="stExpander"] summary {
 
 /* ── Custom component classes ───────────────────────────────────────── */
 .neon-card {
-  background: var(--bg-card);
+  background: rgba(255,255,255,0.04);
   backdrop-filter: blur(12px);
-  border: 1px solid var(--border-bright);
-  border-radius: 8px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
   padding: 16px;
   transition: border-color 0.3s ease, box-shadow 0.3s ease;
 }
 .neon-card:hover {
-  box-shadow: var(--glow-cyan);
+  box-shadow: 0 12px 28px rgba(0,0,0,0.22);
 }
 .neon-card-green {
   border-color: rgba(5,255,161,0.3);
@@ -1247,6 +1261,49 @@ def _render_selected_run_status(view_mode: ViewMode) -> None:
     cols[2].metric("Total PnL", f"${float(snapshot.get('total_pnl') or pnl_summary.get('total_pnl') or 0.0):.2f}")
     dd_value = pnl_summary.get("max_drawdown_abs")
     cols[3].metric("Max drawdown", f"${float(dd_value):.2f}" if dd_value is not None else "N/A")
+    selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), dict) else {}
+    portfolio_selection = selection.get("portfolio_selection") if isinstance(selection.get("portfolio_selection"), dict) else {}
+    selected_market = selection.get("selected_market") if isinstance(selection.get("selected_market"), dict) else {}
+    diag_rows = da.get_selection_diagnostic_rows(runtime_snapshot=snapshot, db_path=db_path)
+    if selection or not diag_rows.empty:
+        selected_score = selected_market.get("score")
+        selected_spread = selected_market.get("spread")
+        selected_liquidity = selected_market.get("liquidity_score")
+        selected_mid = selected_market.get("mid") if selected_market.get("mid") is not None else selected_market.get("mid_price")
+        st.markdown("**Why This Market**")
+        why_cols = st.columns(4)
+        why_cols[0].metric("Launch scope", str(portfolio_selection.get("launch_scope") or "single_market").replace("_", " "))
+        why_cols[1].metric("Max active", int(portfolio_selection.get("max_active_markets") or 1))
+        why_cols[2].metric("Selector score", f"{float(selected_score):.3f}" if selected_score not in (None, "") else "N/A")
+        why_cols[3].metric("Spread", f"{float(selected_spread) * 100.0:.2f}%" if selected_spread not in (None, "") else "N/A")
+        detail_bits = [
+            f"market={selected_market.get('ticker') or selected_market.get('slug') or snapshot.get('market') or 'n/a'}",
+            f"reason={selected_market.get('reason') or selection.get('selected_reason') or 'n/a'}",
+            f"quoteability={selected_market.get('quoteability_state') or 'n/a'}",
+            f"liquidity={(f'{float(selected_liquidity):.3f}' if selected_liquidity not in (None, '') else 'N/A')}",
+            f"mid={(f'{float(selected_mid):.3f}' if selected_mid not in (None, '') else 'N/A')}",
+        ]
+        st.caption(" | ".join(detail_bits))
+        if not diag_rows.empty:
+            accepted = diag_rows[diag_rows["accepted"].astype(bool)].copy()
+            rejected = diag_rows[~diag_rows["accepted"].astype(bool)].copy()
+            if "ticker" in accepted.columns or "title" in accepted.columns:
+                accepted["market"] = accepted.get("ticker", "").fillna("") + " " + accepted.get("title", "").fillna("")
+                rejected["market"] = rejected.get("ticker", "").fillna("") + " " + rejected.get("title", "").fillna("")
+            show_cols = [col for col in ["market", "reason", "score", "spread", "mid", "liquidity_score", "touch_depth", "volume"] if col in diag_rows.columns or col == "market"]
+            panel_cols = st.columns(2)
+            with panel_cols[0]:
+                st.caption("Top accepted candidates")
+                if accepted.empty:
+                    st.caption("None")
+                else:
+                    st.dataframe(accepted[show_cols].head(5), use_container_width=True, hide_index=True)
+            with panel_cols[1]:
+                st.caption("Top rejected candidates")
+                if rejected.empty:
+                    st.caption("None")
+                else:
+                    st.dataframe(rejected[show_cols].head(5), use_container_width=True, hide_index=True)
     if is_developer_mode(view_mode):
         st.caption(
             f"runtime_db={db_path} realized={float(pnl_summary.get('realized_net_pnl') or 0.0):.2f} "
@@ -1459,6 +1516,31 @@ def _time_to_window_end(slug: str) -> str:
     return f"{mm:02d}:{ss:02d}"
 
 
+def _runtime_time_to_window_end(snapshot: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(snapshot, dict):
+        return None
+    health = snapshot.get("active_market_health") if isinstance(snapshot.get("active_market_health"), dict) else {}
+    selection = snapshot.get("selection") if isinstance(snapshot.get("selection"), dict) else {}
+    runner = snapshot.get("runner") if isinstance(snapshot.get("runner"), dict) else {}
+    for source in (health, selection, runner):
+        if not isinstance(source, dict):
+            continue
+        value = source.get("time_to_expiry_ms")
+        try:
+            if value is None:
+                continue
+            remaining = int(value)
+        except (TypeError, ValueError):
+            continue
+        if remaining <= 0:
+            return "closed"
+        total_s = int(remaining / 1000)
+        mm = total_s // 60
+        ss = total_s % 60
+        return f"{mm:02d}:{ss:02d}"
+    return None
+
+
 def compute_topbar_metrics(filters: DashboardFilters) -> TopBarMetrics:
     state = query_df(
         "SELECT as_of_ts, is_frozen, reasons, mode, payload_json FROM system_state ORDER BY as_of_ts DESC LIMIT 1"
@@ -1476,6 +1558,8 @@ def compute_topbar_metrics(filters: DashboardFilters) -> TopBarMetrics:
     if market_slug == "ALL":
         recent_market = query_df("SELECT market FROM decisions ORDER BY ts_ms DESC LIMIT 1")
         market_slug = str(safe_first(recent_market, "market", "ALL"))
+    runtime_snapshot = da.get_runtime_status_snapshot(db_path=_current_db_path())
+    runtime_eta = _runtime_time_to_window_end(runtime_snapshot)
 
     token_ids = _selected_market_tokens(market_slug)
 
@@ -1605,7 +1689,7 @@ def compute_topbar_metrics(filters: DashboardFilters) -> TopBarMetrics:
         readiness_state=readiness_state,
         market_slug=market_slug,
         token_ids=token_ids,
-        time_to_window_end=_time_to_window_end(market_slug),
+        time_to_window_end=runtime_eta or _time_to_window_end(market_slug),
         pstar_age_current_ms=float(pstar_age_current) if pstar_age_current is not None else None,
         pstar_age_p95_5m_ms=float(pstar_age_p95_5m) if pstar_age_p95_5m is not None else None,
         ws_lag_current_ms=float(ws_lag_current) if ws_lag_current is not None and not pd.isna(ws_lag_current) else None,
@@ -2315,8 +2399,10 @@ def _render_inventory_quotes(
                 )
             st.dataframe(pd.DataFrame(rows), width="stretch", height=180)
 
-    st.markdown('<div class="readonly-btn"><b>READ ONLY:</b> Cancel all quotes</div>', unsafe_allow_html=True)
-    st.button("Cancel all quotes", disabled=True, help="Dashboard is read-only unless explicitly enabled in a future ops phase.")
+    st.markdown(
+        '<div class="readonly-btn"><b>CONTROL PLANE:</b> Use the Strategy Drilldown tab for staged pause / kill / cancel commands.</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _render_microstructure(
@@ -2451,7 +2537,12 @@ def render_dashboard() -> None:
     if st is None:
         raise RuntimeError("streamlit_not_installed")
 
-    st.set_page_config(page_title="TRADING SPACESTATION", layout="wide", page_icon="")
+    st.set_page_config(
+        page_title="TRADING SPACESTATION",
+        layout="wide",
+        page_icon="",
+        initial_sidebar_state="collapsed",
+    )
     st.markdown(TERMINAL_CSS, unsafe_allow_html=True)
     st.markdown(
         '<h1 style="font-family:Orbitron,monospace;font-size:1.6em;margin-bottom:0;'
@@ -2462,17 +2553,10 @@ def render_dashboard() -> None:
     )
     st.caption("Autonomous market-making engine across Polymarket & Kalshi")
 
-    if _runtime_schema_missing():
-        st.markdown(
-            '<div class="warn"><b>Runtime not initialized</b> - start <code>scripts/run_core_mm.py --runtime-root ...</code> to create standalone runtime telemetry.</div>',
-            unsafe_allow_html=True,
-        )
-
     filters, policy, view_mode = _build_filters()
 
     topbar_slot = st.empty()
     status_slot = st.empty()
-    global_status_slot = st.empty()
 
     use_fragment = bool(policy.auto_refresh and hasattr(st, "fragment"))
 
@@ -2486,11 +2570,10 @@ def render_dashboard() -> None:
         with topbar_slot.container():
             _render_topbar(metrics, health, view_mode, label_registry)
         with status_slot.container():
-            st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
-            _render_selected_run_status(view_mode)
-
-        with global_status_slot.container():
-            render_global_status_bar(_current_db_path())
+            if is_developer_mode(view_mode):
+                st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
+                _render_selected_run_status(view_mode)
+                render_global_status_bar(_current_db_path())
 
         start_ts, end_ts = _time_filter(filters.window_minutes)
         db = _current_db_path()
