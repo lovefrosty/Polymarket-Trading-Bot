@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from core_mm.book_manager import BookManager
 from core_mm.paper_broker import PaperBroker
 
@@ -260,6 +262,45 @@ def test_taker_cross_fill_charges_fees() -> None:
     assert fill["fee_usdc"] > 0  # Taker fee > 0
     expected_fee = 10 * 0.52 * 25.0 / 10_000.0
     assert abs(fill["fee_usdc"] - expected_fee) < 0.001
+
+
+def test_kalshi_paper_cross_fill_uses_kalshi_fee_model() -> None:
+    books = BookManager()
+    books.apply_snapshot("KXBTC-26MAR2203-B69150:yes", bids=[(0.48, 100)], asks=[(0.52, 100)], ts_ms=_now_ms())
+    broker = PaperBroker(book_manager=books, fee_bps=25.0)
+    result = broker.place_order(
+        token_id="KXBTC-26MAR2203-B69150:yes",
+        side="buy",
+        price=0.52,
+        size=10,
+        metadata={"exchange": "kalshi", "fee_model_exchange": "kalshi", "fee_type": "quadratic", "fee_multiplier": 1.0},
+    )
+    fill = result.payload["fill"]
+    assert fill["fee_usdc"] == 0.18
+    assert fill["fee_source"] == "paper_kalshi_model"
+    assert fill["fee_bps"] > 25.0
+
+
+def test_kalshi_paper_touch_fill_uses_maker_fee_schedule() -> None:
+    books = BookManager()
+    books.apply_snapshot("KXBTC-26MAR2203-B69150:yes", bids=[(0.49, 150)], asks=[(0.51, 160)], ts_ms=_now_ms())
+    broker = PaperBroker(book_manager=books, fee_bps=25.0, min_queue_wait_ms=0)
+    broker.place_order(
+        token_id="KXBTC-26MAR2203-B69150:yes",
+        side="buy",
+        price=0.49,
+        size=10,
+        metadata={
+            "exchange": "kalshi",
+            "fee_model_exchange": "kalshi",
+            "fee_type": "quadratic_with_maker_fees",
+            "fee_multiplier": 1.0,
+        },
+    )
+    fills = broker.sweep_fills("KXBTC-26MAR2203-B69150:yes")
+    assert len(fills) == 1
+    assert fills[0]["fill_trigger"] == "touch"
+    assert fills[0]["fee_usdc"] == pytest.approx(0.05)
 
 
 # ── Bankroll tracking tests ────────────────────────────────────────

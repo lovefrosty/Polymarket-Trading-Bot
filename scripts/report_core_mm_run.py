@@ -31,6 +31,29 @@ def build_phase0_report(runtime_root: Path) -> Dict[str, Any]:
     cycle_summary = dict(summary.get("cycle_summary") or {})
     execution_quality = dict(summary.get("execution_quality") or {})
     phase0 = dict(summary.get("phase0_acceptance") or {})
+    risk_proof = dict(summary.get("risk_proof") or {})
+    hedge_candidates = dict(summary.get("hedge_candidate_summary") or {})
+    kill_switch_validation = dict(status.get("kill_switch_validation") or {})
+    kill_switch_status = str(kill_switch_validation.get("status") or "not_run")
+    safety_controls_observed = {
+        "stale_unwind": bool(risk_proof.get("stale_unwind_observed")),
+        "force_flat": bool(risk_proof.get("force_flat_observed")),
+        "day_loss": bool(risk_proof.get("day_loss_observed")),
+        "kill_switch": bool(risk_proof.get("kill_switch_applied_commands") or risk_proof.get("kill_switch_cycles")),
+    }
+    live_safe_go_no_go = "go"
+    blockers = []
+    if not bool(phase0.get("economics_ready_for_phase1")):
+        blockers.append("paper_economics_not_ready")
+    if not bool(phase0.get("quoteable_cycles_present")):
+        blockers.append("quoteable_selection_not_proven")
+    if kill_switch_status != "passed":
+        blockers.append("kill_switch_not_validated")
+    for control_name in ("stale_unwind", "force_flat", "day_loss"):
+        if not safety_controls_observed[control_name]:
+            blockers.append(f"{control_name}_not_observed")
+    if blockers:
+        live_safe_go_no_go = "no_go"
     report = {
         "runtime_root": root.as_posix(),
         "mode": status.get("mode"),
@@ -70,6 +93,26 @@ def build_phase0_report(runtime_root: Path) -> Dict[str, Any]:
             "no_quote_reason_counts": cycle_summary.get("no_quote_reason_counts") or {},
         },
         "phase0_acceptance": phase0,
+        "risk_proof": risk_proof,
+        "hedge_candidates": {
+            "clusters_seen": hedge_candidates.get("clusters_seen"),
+            "accepted_clusters": hedge_candidates.get("accepted_clusters"),
+            "rejected_clusters": hedge_candidates.get("rejected_clusters"),
+            "deferred_clusters": hedge_candidates.get("deferred_clusters"),
+            "action_counts": hedge_candidates.get("action_counts") or {},
+            "candidate_state_counts": hedge_candidates.get("candidate_state_counts") or {},
+            "rejection_reason_counts": hedge_candidates.get("rejection_reason_counts") or {},
+            "quality_gap_state_counts": hedge_candidates.get("quality_gap_state_counts") or {},
+            "avg_quality_gap": hedge_candidates.get("avg_quality_gap"),
+        },
+        "live_readiness": {
+            "go_no_go": live_safe_go_no_go,
+            "kill_switch_validation_status": kill_switch_status,
+            "quoteable_selection_coherent": bool(phase0.get("quoteable_cycles_present")),
+            "paper_economics_ready": bool(phase0.get("economics_ready_for_phase1")),
+            "safety_controls_observed": safety_controls_observed,
+            "blockers": blockers,
+        },
         "recommendation": _phase0_recommendation(str(phase0.get("result") or "")),
     }
     return report
