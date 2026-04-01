@@ -23,6 +23,7 @@ if str(_ROOT) not in sys.path:
 from config.settings import load_markets, load_settings, validate_markets_config
 from core.book_cache import BookCache, BookHealthState, BookSnapshot
 from core.broker_base import BrokerEvent, BrokerSnapshot, OrderIntent
+from core.brokers.cli_broker import CLIBroker, CLIBrokerConfig
 from core.broker_polymarket import (
     EXPECTED_CLOB_CLIENT_VERSION,
     BrokerContractError,
@@ -4322,6 +4323,8 @@ async def _run() -> None:
     mode, observe_live_alias = _resolve_runtime_mode(mode_raw)
     if mode not in {"OBSERVE", "PAPER", "TRADE"}:
         raise ValueError(f"unsupported_mode:{mode_raw}")
+    if args.sim_exec and args.cli_exec:
+        raise ValueError("execution_mode_flags_conflict")
     paper_experiment_profile = _apply_paper_experiment_profile(mode, constitution)
     trading_cfg = constitution.get("trading", {}) if isinstance(constitution, dict) else {}
     policy_cfg = constitution.get("policy", {}) if isinstance(constitution, dict) else {}
@@ -4470,7 +4473,22 @@ async def _run() -> None:
     )
 
     broker = None
-    if mode == "PAPER":
+    if args.sim_exec:
+        broker = SimBroker(
+            books=books,
+            constraints=constraints,
+            time_mapper=time_mapper,
+            fee_status_by_asset={asset_id: "unknown" for asset_id in asset_ids},
+            config=SimBrokerConfig(latency_ms=0, fee_mode="MAKE"),
+        )
+    elif args.cli_exec and mode in {"PAPER", "TRADE"}:
+        broker = CLIBroker(
+            CLIBrokerConfig(
+                dry_run=bool(args.dry_run),
+                timeout_secs=float(trading_cfg.get("cli_timeout_secs", 10.0) or 10.0),
+            )
+        )
+    elif mode == "PAPER":
         broker = SimBroker(
             books=books,
             constraints=constraints,
@@ -5877,6 +5895,8 @@ async def _run() -> None:
             "mode_requested": mode_raw,
             "mode_effective": mode,
             "observe_live_alias": bool(observe_live_alias),
+            "sim_exec": bool(args.sim_exec),
+            "cli_exec": bool(args.cli_exec),
             "order_actions_enabled": bool(mode in {"PAPER", "TRADE"}),
             "reference_poll_secs": float(settings.reference_poll_secs),
             "pstar_max_age_ms": int(pstar_builder.max_age_ms),
@@ -5906,6 +5926,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quote-interval-ms", type=int, default=None, help="Quote loop interval in ms")
     parser.add_argument("--stats-interval-ms", type=int, default=None, help="Stats loop interval in ms")
     parser.add_argument("--dry-run", action="store_true", help="Dry-run live broker methods")
+    parser.add_argument("--sim_exec", action="store_true", help="Force simulated execution broker")
+    parser.add_argument("--cli_exec", action="store_true", help="Force CLI execution broker")
     return parser.parse_args()
 
 
