@@ -18,8 +18,10 @@ import pandas as pd
 
 try:
     import streamlit as st
+    import streamlit.components.v1 as stc
 except ModuleNotFoundError:  # pragma: no cover
     st = None  # type: ignore[assignment]
+    stc = None  # type: ignore[assignment]
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -355,7 +357,27 @@ details[data-testid="stExpander"] summary {
 }
 
 hr { border: none; border-top: 1px solid var(--border); }
+
+/* Prevent scroll jump on fragment re-renders */
+.main, .main > div, section.main > div { overflow-anchor: none !important; }
 </style>
+"""
+
+_SCROLL_RESTORE_JS = """
+<script>
+(function(){
+  var p = window.parent || window;
+  var k = 'poly_scrollY';
+  try {
+    var s = p.sessionStorage.getItem(k);
+    if (s) { p.requestAnimationFrame(function(){ p.scrollTo(0, +s); }); }
+    if (!p._polyScrollListening) {
+      p._polyScrollListening = true;
+      p.addEventListener('scroll', function(){ p.sessionStorage.setItem(k, p.scrollY); }, {passive:true});
+    }
+  } catch(e){}
+})();
+</script>
 """
 
 
@@ -1303,6 +1325,122 @@ def _style_chart(chart):
     )
 
 
+def _render_order_book_depth_chart(
+    filters: DashboardFilters,
+    heavy_refresh: bool,
+) -> None:
+    assert st is not None
+    if alt is None:
+        return
+    start_ts = _now_ms() - 10 * 60_000
+    book_df = _heavy_df(
+        f"ob_depth::{filters.selected_market}",
+        """
+        SELECT side, ROUND(price, 3) AS price, SUM(qty) AS total_qty
+        FROM orders
+        WHERE ts_ms >= ?
+          AND (LOWER(status) IN ('open','working','new','resting','submitted','accepted')
+            OR LOWER(COALESCE(fsm_state,'')) LIKE '%quote%')
+        GROUP BY side, ROUND(price, 3)
+        ORDER BY price
+        """,
+        (start_ts,),
+        heavy_refresh,
+    )
+    if book_df.empty:
+        st.caption("No resting orders to display in order book.")
+        return
+
+    book_df["side_label"] = book_df["side"].str.lower().apply(
+        lambda s: "BID" if s in ("buy", "bid") else "ASK"
+    )
+    color_scale = alt.Scale(domain=["BID", "ASK"], range=["#05ffa1", "#ff3b5c"])
+    chart = (
+        alt.Chart(book_df)
+        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X("price:Q", title="Price", scale=alt.Scale(domain=[0, 1])),
+            y=alt.Y("total_qty:Q", title="Size"),
+            color=alt.Color("side_label:N", scale=color_scale, title="Side"),
+            tooltip=["side_label:N", alt.Tooltip("price:Q", format=".3f"), alt.Tooltip("total_qty:Q", format=".2f")],
+        )
+        .properties(height=160)
+    )
+    st.altair_chart(_style_chart(chart), use_container_width=True)
+
+
+def _render_price_history_chart(
+    filters: DashboardFilters,
+    heavy_refresh: bool,
+) -> None:
+    assert st is not None
+    if alt is None:
+        return
+    start_ts, _ = _time_filter(filters.window_minutes)
+
+    price_df = _heavy_df(
+        f"price_hist::{filters.selected_market}",
+        """
+        SELECT ts_ms, p_hat, token_id
+        FROM decisions
+        WHERE ts_ms >= ? AND p_hat IS NOT NULL
+        ORDER BY ts_ms ASC
+        LIMIT 2000
+        """,
+        (start_ts,),
+        heavy_refresh,
+    )
+    if price_df.empty:
+        st.caption("No price history yet.")
+        return
+
+    price_df["ts"] = pd.to_datetime(price_df["ts_ms"], unit="ms", utc=True)
+
+    order_df = _heavy_df(
+        f"price_orders::{filters.selected_market}",
+        """
+        SELECT ts_ms, side, price, token_id
+        FROM orders
+        WHERE ts_ms >= ?
+        ORDER BY ts_ms ASC
+        LIMIT 500
+        """,
+        (start_ts,),
+        heavy_refresh,
+    )
+
+    line = (
+        alt.Chart(price_df)
+        .mark_line(strokeWidth=2, opacity=0.9)
+        .encode(
+            x=alt.X("ts:T", title="Time"),
+            y=alt.Y("p_hat:Q", title="Price (prob)", scale=alt.Scale(domain=[0, 1])),
+            color=alt.Color("token_id:N", legend=None),
+        )
+    )
+    layers: List[Any] = [line]
+
+    if not order_df.empty:
+        order_df["ts"] = pd.to_datetime(order_df["ts_ms"], unit="ms", utc=True)
+        order_df["color"] = order_df["side"].str.lower().apply(
+            lambda s: "#05ffa1" if s in ("buy", "bid") else "#ff3b5c"
+        )
+        dots = (
+            alt.Chart(order_df)
+            .mark_circle(size=40, opacity=0.75)
+            .encode(
+                x=alt.X("ts:T"),
+                y=alt.Y("price:Q", scale=alt.Scale(domain=[0, 1])),
+                color=alt.Color("side:N", scale=alt.Scale(domain=["buy", "sell"], range=["#05ffa1", "#ff3b5c"]), title="Orders"),
+                tooltip=["side:N", alt.Tooltip("price:Q", format=".3f"), "ts:T"],
+            )
+        )
+        layers.append(dots)
+
+    combined = alt.layer(*layers).properties(height=200)
+    st.altair_chart(_style_chart(combined), use_container_width=True)
+
+
 def _parse_reasons(raw: Any) -> List[str]:
     return da.parse_reasons(raw)
 
@@ -2078,18 +2216,26 @@ def _render_overview(
             unsafe_allow_html=True,
         )
 
-    book_snapshot, book_bbo = _recent_order_book_snapshot(filters.selected_market, label_registry, heavy_refresh)
-    st.subheader("Order Book Telemetry")
-    b1, b2, b3 = st.columns(3)
-    b1.metric("Book rows", str(book_snapshot.get("row_count", 0)))
-    b2.metric("Active tokens", str(book_snapshot.get("token_count", 0)))
-    last_age_ms = book_snapshot.get("last_update_age_ms")
-    b3.metric("Book freshness", _fmt_ms(last_age_ms))
-    if book_bbo.empty:
-        st.info("No recent order-book snapshot available for the selected market.")
-    else:
-        st.dataframe(book_bbo, width="stretch", height=180)
+    # ── Live price + order placement chart ──────────────────────────────
+    st.subheader("Price & Order Placement")
+    _render_price_history_chart(filters, heavy_refresh)
 
+    # ── Order book depth ─────────────────────────────────────────────────
+    st.subheader("Order Book Depth")
+    col_book_chart, col_book_stats = st.columns([3, 1])
+    with col_book_chart:
+        _render_order_book_depth_chart(filters, heavy_refresh)
+    with col_book_stats:
+        book_snapshot, book_bbo = _recent_order_book_snapshot(filters.selected_market, label_registry, heavy_refresh)
+        last_age_ms = book_snapshot.get("last_update_age_ms")
+        st.metric("Book rows", str(book_snapshot.get("row_count", 0)))
+        st.metric("Active tokens", str(book_snapshot.get("token_count", 0)))
+        st.metric("Freshness (ms)", _fmt_ms(last_age_ms))
+    if not book_bbo.empty:
+        with st.expander("BBO Table", expanded=False):
+            st.dataframe(book_bbo, use_container_width=True, height=160)
+
+    # ── Live feed ────────────────────────────────────────────────────────
     st.subheader("Live Feed")
     if not feed_df.empty:
         feed_df["ts"] = pd.to_datetime(feed_df["ts_ms"], unit="ms", utc=True)
@@ -2101,50 +2247,51 @@ def _render_overview(
                 lambda value: human_reason(str(value).split(",")[0].strip(), None, view_mode) if value else ""
             )
     if is_developer_mode(view_mode):
-        st.dataframe(feed_df, width="stretch", height=260)
+        st.dataframe(feed_df, use_container_width=True, height=220)
     else:
-        trader_cols = [col for col in ["ts", "type", "Market", "Side", "event", "details", "ev", "strategy"] if col in feed_df.columns]
+        trader_cols = [col for col in ["ts", "type", "Market", "Side", "event", "details"] if col in feed_df.columns]
         if feed_df.empty:
             st.info(EMPTY_STATE_MESSAGES["live_feed"])
         else:
-            st.dataframe(feed_df[trader_cols], width="stretch", height=260)
+            st.dataframe(feed_df[trader_cols], use_container_width=True, height=220)
 
-    st.subheader("Top Signals")
-    signal_df = _apply_decision_filters(decisions, filters)
-    signal_df = signal_df.sort_values("ts_ms", ascending=False).head(filters.lookback_rows)
-    display_signals = build_signals_table_for_view(signal_df, view_mode, label_registry)
-    if display_signals.empty:
-        st.info(EMPTY_STATE_MESSAGES["signals"])
-    else:
-        st.dataframe(display_signals, width="stretch", height=240)
+    # ── Signals + EV (collapsed by default for traders) ─────────────────
+    with st.expander("Signals & EV Distribution", expanded=is_developer_mode(view_mode)):
+        signal_df = _apply_decision_filters(decisions, filters)
+        signal_df = signal_df.sort_values("ts_ms", ascending=False).head(filters.lookback_rows)
+        display_signals = build_signals_table_for_view(signal_df, view_mode, label_registry)
+        if display_signals.empty:
+            st.info(EMPTY_STATE_MESSAGES["signals"])
+        else:
+            st.dataframe(display_signals, use_container_width=True, height=220)
 
-    ev_df = _heavy_df(
-        "overview_ev_hist",
-        """
-        SELECT (expected_edge - expected_cost) AS ev
-        FROM decisions
-        WHERE ts_ms >= ?
-        ORDER BY ts_ms DESC
-        LIMIT 5000
-        """,
-        (start_ts,),
-        heavy_refresh,
-    )
-    positive = 0.0
-    if not ev_df.empty and "ev" in ev_df.columns:
-        positive = float((ev_df["ev"] > 0).mean())
-    st.metric("% positive EV", _fmt_ratio(positive))
-    if not ev_df.empty and alt is not None and "ev" in ev_df.columns:
-        ev_clean = ev_df[ev_df["ev"].notna()].copy()
-        if not ev_clean.empty:
-            ev_clean["bucket"] = pd.cut(ev_clean["ev"], bins=24)
-            hist = ev_clean.groupby("bucket").size().reset_index(name="n")
-            hist["mid"] = hist["bucket"].apply(lambda item: (item.left + item.right) / 2)
-            chart = alt.Chart(hist).mark_bar().encode(
-                x=alt.X("mid:Q", title="EV"),
-                y=alt.Y("n:Q", title="count"),
-            ).properties(height=160)
-            st.altair_chart(_style_chart(chart), width="stretch")
+        ev_df = _heavy_df(
+            "overview_ev_hist",
+            """
+            SELECT (expected_edge - expected_cost) AS ev
+            FROM decisions
+            WHERE ts_ms >= ?
+            ORDER BY ts_ms DESC
+            LIMIT 5000
+            """,
+            (start_ts,),
+            heavy_refresh,
+        )
+        positive = 0.0
+        if not ev_df.empty and "ev" in ev_df.columns:
+            positive = float((ev_df["ev"] > 0).mean())
+        st.metric("% positive EV", _fmt_ratio(positive))
+        if not ev_df.empty and alt is not None and "ev" in ev_df.columns:
+            ev_clean = ev_df[ev_df["ev"].notna()].copy()
+            if not ev_clean.empty:
+                ev_clean["bucket"] = pd.cut(ev_clean["ev"], bins=24)
+                hist = ev_clean.groupby("bucket").size().reset_index(name="n")
+                hist["mid"] = hist["bucket"].apply(lambda item: (item.left + item.right) / 2)
+                chart = alt.Chart(hist).mark_bar().encode(
+                    x=alt.X("mid:Q", title="EV"),
+                    y=alt.Y("n:Q", title="count"),
+                ).properties(height=150)
+                st.altair_chart(_style_chart(chart), use_container_width=True)
 
 
 def _render_inventory_quotes(
@@ -2489,6 +2636,8 @@ def render_dashboard() -> None:
     use_fragment = bool(policy.auto_refresh and hasattr(st, "fragment"))
 
     def _render_live() -> None:
+        if stc is not None:
+            stc.html(_SCROLL_RESTORE_JS, height=0, scrolling=False)
         allow_panel_widgets = not use_fragment
         tick, heavy_refresh = _next_tick(policy)
         label_registry = build_label_registry(filters.selected_market)
@@ -2498,7 +2647,8 @@ def render_dashboard() -> None:
         with topbar_slot.container():
             _render_topbar(metrics, health, view_mode, label_registry)
         with status_slot.container():
-            st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
+            if is_developer_mode(view_mode):
+                st.caption(f"tick={tick} heavy_refresh={heavy_refresh} utc={_iso(_now_ms())} view={view_mode}")
             _render_selected_run_status(view_mode)
 
         with global_status_slot.container():
