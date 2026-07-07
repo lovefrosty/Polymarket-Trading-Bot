@@ -1,0 +1,16 @@
+[
+  "mnemonic in core/model_fit.py",
+  "mnemonic in core/model_fit_offset.py",
+  "private_key in logs/cache_gamma_markets.json",
+  "mnemonic in scripts/train_model.py",
+  "mnemonic in scripts/train_offset_model.py",
+  "mnemonic in .venv/lib/python3.13/site-packages/pip/_vendor/pygments/lexers/python.py",
+  "private_key in logs/0ac0b46d746b409489a3b35bd5e1ae52/resolved_markets.json",
+  "private_key in logs/1748c0ed0715452c918b0fb902d0d8a2/resolved_markets.json",
+  "private_key in logs/211e65a2a4334b22861b99c8effaff87/resolved_markets.json",
+  "private_key in logs/live/cache_gamma_markets.json",
+  "private_key in logs/4e66383863f04d9e8b807d5a576eb186/resolved_markets.json",
+  "private_key in logs/74cf3e5860ea4cfc9feed2ae487e7de2/resolved_markets.json",
+  "private_key in logs/204f9550159d44c6af39a150e5d71ed7/resolved_markets.json",
+  "mnemonic in backtests/scientific_method/engine.py"
+]

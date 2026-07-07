@@ -1,0 +1,9 @@
+{
+  "orphans": [
+    "data/gamma_client.py",
+    "src/features/orthogonalization.py",
+    "src/model/fair_probability.py",
+    "src/replay/replay_harness.py",
+    "src/data/gamma_api.py"
+  ]
+}

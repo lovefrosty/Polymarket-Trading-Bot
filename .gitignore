@@ -1,0 +1,186 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Ruff
+.ruff_cache/
+
+# PyPI configuration file
+.pypirc
+
+# Cursor
+.cursorignore
+.cursorindexingignore
+
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+
+# OS
+.DS_Store
+
+# Project-specific
+logs/
+artifacts/
+cache_gamma_markets.json
+cache_gamma_slug_markets.json
+*.sqlite
+node_modules/
+*.pem
+secrets/
+
+# Runtime artifacts (never commit)
+runtime.db
+runtime.db-*
+*.db-wal
+*.db-shm
+tmp/core_mm_runs/
+tmp/calibration_sweeps/
+tmp/portfolio_reports/
+tmp/research_lab/
+tmp/calibration_snapshots_*/
+tmp/meta_agent_dispatch/
+tmp/kill_switch_report.json
+tmp/test-run/
+tmp/smoke_*/
+tmp/smoke_fix_*/
+tmp/smoke_fix2_*/
+tmp/hedge_overfire_sweeps/
+tmp/kalshi-cleanup-sweep-*/
+tmp/kalshi-paper-6h-sess-*/
+
+# Local portfolio holdings and email destination (never commit)
+config/portfolio_daily_input.json
+
+# Quarantined third-party research repositories (inspect before use)
+external_research/
+
+# Local desktop UI build artifacts
+operator_app/node_modules/
+operator_app/dist/
+
+# Machine-generated research-loop run state (regenerated each run)
+STATE.md

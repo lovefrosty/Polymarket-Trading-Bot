@@ -1,0 +1,38 @@
+[
+  {
+    "slug": "btc-updown-15m-1690000000",
+    "conditionId": "0xbtc1",
+    "clobTokenIds": ["btc_old_up", "btc_old_down"],
+    "outcomes": ["Up", "Down"],
+    "question": "BTC up or down?",
+    "closed": false,
+    "endTime": 1690000800
+  },
+  {
+    "slug": "btc-updown-15m-1690000900",
+    "conditionId": "0xbtc2",
+    "clobTokenIds": ["btc_new_down", "btc_new_up"],
+    "outcomes": ["Down", "Up"],
+    "question": "BTC next 15m?",
+    "closed": false,
+    "endTime": 1690001700
+  },
+  {
+    "slug": "eth-updown-15m-1690000500",
+    "conditionId": "0xeth1",
+    "clobTokenIds": ["eth_up", "eth_down"],
+    "outcomes": ["Up", "Down"],
+    "question": "ETH up or down?",
+    "closed": false,
+    "endTime": 1690001400
+  },
+  {
+    "slug": "sol-other-1h-1690000000",
+    "conditionId": "0xsol",
+    "clobTokenIds": ["sol_a", "sol_b"],
+    "outcomes": ["Yes", "No"],
+    "question": "SOL?",
+    "closed": true,
+    "endTime": 1690003600
+  }
+]

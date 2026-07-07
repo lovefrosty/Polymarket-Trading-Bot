@@ -1,0 +1,61 @@
+{
+  "trading": {
+    "mode_default": "OBSERVE",
+    "post_only_enabled": true,
+    "quote_interval_ms": 1000,
+    "stats_interval_ms": 5000,
+    "rebalance_timeout_ms": 5000,
+    "emergency_taker_enabled": true,
+    "emergency_taker_after_ms": 1000,
+    "clob_client_version": "0.20.0",
+    "bankroll_usd": 10000.0,
+    "cap_gross_usd": 500.0,
+    "cap_gross_bankroll_frac": 0.005,
+    "cap_soft_ratio": 0.8,
+    "cap_net_ratio": 0.2,
+    "cap_total_gross_usd": 2000.0,
+    "cap_total_gross_bankroll_frac": 0.02,
+    "cap_total_net_ratio": 0.25,
+    "max_orders_per_min": 30,
+    "max_cancels_per_min": 60,
+    "max_daily_loss_usdc": 100.0,
+    "max_daily_notional_usdc": 2000.0,
+    "reference_poll_secs": 1.0,
+    "clock_drift_max_ms": 250.0,
+    "ws_starvation_max_ms": 5000.0,
+    "startup_liveness_grace_ms": 30000,
+    "observe_causality_freeze_after": 3,
+    "alert_emit_cooldown_ms": 10000,
+    "unknown_alert_policy": {
+      "threshold_per_min": 120,
+      "min_samples": 20,
+      "sustain_windows": 2,
+      "cooldown_secs": 60,
+      "clear_windows": 2,
+      "min_ratio_vs_active": 2.0,
+      "startup_grace_ms": 180000
+    },
+    "econ_min_net_edge_p50_bps": 0.0,
+    "econ_max_adverse_markout_5s_p95_bps": 20.0,
+    "ctf_split_merge_enabled": false
+  },
+  "policy": {
+    "pstar_max_age_ms": 3000,
+    "pstar_freeze_disagree_bps": 50.0,
+    "book_stale_after_ms": 30000,
+    "book_down_after_ms": 120000,
+    "max_book_age_ms": 2000,
+    "max_spread_bps": 500.0,
+    "max_slippage_bps": 120.0,
+    "min_depth_at_qty": 1.0,
+    "signal_age_max_ms": 1200,
+    "ack_p95_max_ms": 400.0,
+    "ws_lag_max_ms": 1000.0
+  },
+  "execution": {
+    "maker_quote_size": 1.0,
+    "maker_half_spread_bps": 40.0,
+    "inventory_skew_per_unit": 0.0025,
+    "risk_padding_bps": 5.0
+  }
+}

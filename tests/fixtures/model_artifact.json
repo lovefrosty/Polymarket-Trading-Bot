@@ -1,0 +1,8 @@
+{
+  "schema_version": "model_ridge_logit_v1",
+  "feature_order": ["ret_60s", "ret_300s", "ret_900s", "ewma_vol_300s", "z_mom", "z_rev"],
+  "w": [0.1, -0.1, 0.05, 0.0, 0.2, -0.2],
+  "b": 0.0,
+  "platt": {"a": 1.0, "c": 0.0},
+  "training_time_range": {"start_ms": 0, "end_ms": 1}
+}
