@@ -351,8 +351,28 @@ def _run_proof_only_crypto_hedge_scenario(
         },
     ]
     runner.refresh_market_selection(events, now_ms=base_now_ms)
-    for token_id in runner.all_token_ids:
-        runner.book_manager.apply_snapshot(token_id, bids=[(0.49, 200)], asks=[(0.51, 200)], ts_ms=base_now_ms - 1_000)
+    # Seed enough synchronized, inverse mid-price observations to exercise the
+    # production covariance gate. The proof harness should prove a hedge with
+    # the gate enabled, not bypass the gate to manufacture an acceptance.
+    covariance_samples = [
+        (0.5053663135, 0.4904054692),
+        (0.4952589872, 0.5002135786),
+        (0.5026878721, 0.4927103749),
+        (0.4976609933, 0.4976374786),
+        (0.5076142132, 0.4876847291),
+        (0.5000000000, 0.4950000000),
+    ]
+    for index, (inventory_mid, hedge_mid) in enumerate(covariance_samples):
+        sample_ts_ms = base_now_ms - (len(covariance_samples) - index) * 1_000
+        _apply_mid_snapshot(runner, "yes_70650", inventory_mid, sample_ts_ms)
+        _apply_mid_snapshot(runner, "no_70650", 1.0 - inventory_mid, sample_ts_ms)
+        _apply_mid_snapshot(runner, "no_70850", hedge_mid, sample_ts_ms)
+        _apply_mid_snapshot(runner, "yes_70850", 1.0 - hedge_mid, sample_ts_ms)
+        runner._hedge_engine._record_mid_history(
+            now_ms=sample_ts_ms,
+            active_markets=runner.hedge_search_markets,
+            book_manager=runner.book_manager,
+        )
     runner.book_manager.apply_snapshot("yes_70650", bids=[(0.45, 50)], asks=[(0.55, 50)], ts_ms=base_now_ms - 1_000)
     runner.book_manager.apply_snapshot("no_70750", bids=[(0.495, 4)], asks=[(0.505, 4)], ts_ms=base_now_ms - 1_000)
     runner.book_manager.apply_snapshot("no_70850", bids=[(0.49, 200)], asks=[(0.50, 200)], ts_ms=base_now_ms - 1_000)
@@ -376,6 +396,16 @@ def _run_proof_only_crypto_hedge_scenario(
         telemetry=telemetry,
         result=second,
         now_ms=base_now_ms + 1_000,
+    )
+
+
+def _apply_mid_snapshot(runner: CoreMMRunner, token_id: str, mid: float, ts_ms: int) -> None:
+    half_spread = 0.005
+    runner.book_manager.apply_snapshot(
+        token_id,
+        bids=[(round(float(mid) - half_spread, 6), 200)],
+        asks=[(round(float(mid) + half_spread, 6), 200)],
+        ts_ms=ts_ms,
     )
 
 

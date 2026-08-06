@@ -12,14 +12,13 @@ decision:
 - `ready with no-hedge constraints`
 - `not ready`
 
-Current classification for the first live deployment:
+Current classification for the first live deployment: **`not ready`**.
 
-- full strategy: `not ready now`
-- constrained quote-first strategy: `ready with no-hedge constraints` at best
-
-This means the bot is close to live-ready only if the first deployment is kept
-to one active Kalshi market at a time, with selector rotation allowed, and
-live promotion does not depend on hedge as an operational safety mechanism.
+The required narrow profile is still one active Kalshi market at a time, with
+selector rotation allowed and no live-promotion credit for hedge. However, the
+repository does not yet contain a sufficiently large, repeatable Kalshi paper
+run set under that frozen profile. Implemented controls are not evidence that
+the strategy is profitable or ready for capital.
 
 These criteria should therefore be treated as the operative first-launch
 standard while Polymarket access remains unavailable.
@@ -124,12 +123,13 @@ Required live constraints in this state:
 
 Current distance:
 
-- close
+- unmeasured until the required Kalshi paper dataset exists
 
 Interpretation:
 
-- this is the correct “we are close” framing
-- the bot may be promotable as a constrained market maker in these markets
+- this is the next possible promotion state, not the current state
+- the bot may become promotable as a constrained market maker only after the
+  evidence checklist below is satisfied
 - it is not yet promotable as a hedge-capable clustered strategy
 - this is the state that can justify a Kalshi-first launch while waiting on
   Polymarket
@@ -154,9 +154,9 @@ show:
 - unacceptable unwind behavior
 - poor repeatability once hedge is ignored
 
-Current distance:
+Current state:
 
-- likely past this state already, assuming conservative live sizing
+- the project remains here because committed Kalshi evidence is insufficient
 
 ## Exact Promotion Checklist
 
