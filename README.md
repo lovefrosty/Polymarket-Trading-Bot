@@ -1,247 +1,169 @@
-# Polymarket Read-Only Phase
+# Prediction-Market Market-Making Research System
 
-Read-only wiring for market + user websockets, local L2 books, and deterministic event/decision tapes with executable (VWAP) prices. No order placement or signing.
+A Python research and operations project for studying automated quoting on Polymarket-style binary markets. It combines live public order-book ingestion, deterministic paper execution, inventory-aware quoting, risk controls, experiment telemetry, and an operator dashboard.
 
-## Run (read-only)
+This is a portfolio project and research system—not a claim of a profitable trading product. The strongest committed result is from simulated paper execution, not live capital. The historical live-order path was built for Polymarket CLOB V1 and is **not production-compatible** with the CLOB V2 exchange introduced on April 28, 2026.
 
-```bash
-python3 -m scripts.run_readonly --markets config/markets.yaml
+## What this project demonstrates
+
+- Event-driven ingestion of public CLOB market data into local L2 books.
+- Market discovery and rotation for short-horizon BTC, ETH, SOL, and XRP markets.
+- Two-sided quote generation with inventory skew, flow filtering, volatility and fill-adversity overlays, and position-aware exits.
+- Deterministic paper fills with queue-wait, visible-depth, staleness, fee, markout, turnover, and PnL accounting assumptions.
+- Binary complement and multi-outcome NegRisk arbitrage scanners.
+- Liquidity-reward scoring and quote-tightening analysis.
+- Per-order, per-fill, and per-cycle telemetry written to reproducible run artifacts and SQLite.
+- A Streamlit operator dashboard for market state, positions, PnL, execution quality, risk, and reliability.
+- A fail-closed safety design with order, position, and loss limits plus cancel-on-shutdown behavior in the historical live adapter.
+
+## Current status
+
+| Area | Status | Evidence / limitation |
+| --- | --- | --- |
+| Core implementation | Working locally | `281` tests pass on August 6, 2026. |
+| Public-data observation | Verified August 6, 2026 | A 15-second read-only check discovered the current BTC 15-minute market, received 1,220 WebSocket messages, applied 2,432 book updates, and completed without a runtime error. |
+| Paper execution | Implemented | Uses a deterministic simulator, not exchange-confirmed fills. |
+| Recorded economics | Promising but insufficient | Best committed run recorded $23.93 realized net PnL and $17.11 total PnL on $1,331.10 turnover with 188 simulated fills. Of the other six committed summaries, four had zero fills and two had only 12 or 23 fills. |
+| Consistent income | Not established | No statistically adequate out-of-sample record, live fill record, or capital-scaled drawdown study exists. |
+| Live Polymarket execution | Blocked | The code pins the retired `py-clob-client==0.20.0`. Production now requires CLOB V2, pUSD collateral, updated signing, and end-to-end revalidation. |
+
+The recorded paper run is useful evidence that the accounting and reporting path works under its assumptions. It is not evidence that the same fills, latency, rebates, adverse selection, or returns would occur live.
+
+## Architecture
+
+```text
+Polymarket public APIs / WebSockets
+                 |
+                 v
+  market selector + L2 book manager
+                 |
+                 v
+ quote engine + alpha overlays + risk manager
+                 |
+          +------+------+
+          |             |
+       OBSERVE        PAPER
+     decisions only   simulated broker
+          |             |
+          +------+------+
+                 v
+     JSONL tapes + SQLite telemetry
+                 |
+                 v
+        reports + Streamlit dashboard
 ```
 
-Optional trained model (falls back to baseline if missing or mismatched):
+The active implementation is under `core_mm/`. The earlier research platform is preserved under `legacy/` for provenance and reference; it is not the primary runtime.
+
+## Quick start
+
+Python 3.11+ is recommended.
 
 ```bash
-python3 -m scripts.run_readonly --markets config/markets.yaml --model artifacts/model_BTC.json
+git clone https://github.com/lovefrosty/Polymarket-Trading-Bot.git
+cd Polymarket-Trading-Bot
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pytest -q
 ```
 
-Environment overrides (optional):
+Observe a current BTC market without submitting or simulating orders:
 
 ```bash
-LOG_DIR=./logs USER_WS_ENABLED=false MARKET_WS_ENABLED=true python3 -m scripts.run_readonly
+python scripts/run_core_mm.py \
+  --mode OBSERVE \
+  --runtime-root tmp/observe-demo \
+  --duration-secs 120 \
+  --symbol BTC
 ```
 
-## Discover Latest 15m Markets
+Run the paper broker against live public book data:
 
 ```bash
-python3 -m scripts.discover_markets --symbols BTC ETH
+python scripts/run_core_mm.py \
+  --mode PAPER \
+  --runtime-root tmp/paper-demo \
+  --run-name "Local paper demo" \
+  --duration-secs 300 \
+  --symbol BTC \
+  --trade-size 5 \
+  --max-size 25
 ```
 
-You can also auto-resolve missing IDs at runtime:
+Build a deterministic summary and open the dashboard:
 
 ```bash
-python3 -m scripts.run_readonly --markets config/markets.yaml --auto_discover
+python scripts/report_core_mm_run.py --runtime-root tmp/paper-demo
+python scripts/run_dashboard.py --db-path tmp/paper-demo/runtime.db
 ```
 
-Enable reference feeds (spot polling) for reference events:
+The dashboard is then available at `http://localhost:8501` by default.
+
+## Paper-model assumptions
+
+The simulator includes explicit approximations, but it does not reproduce a real matching engine. In particular:
+
+- Resting orders must wait at least 200 ms before an assumed fill.
+- The model assumes an average queue position behind 50% of displayed depth.
+- Fills are capped by the remaining visible depth at the modeled price.
+- Books older than five seconds are rejected.
+- Maker/taker fees are configured locally and may not match the current per-market fee schedule.
+- Network latency, cancel races, hidden liquidity, exchange rejection, settlement, and reward competition are not fully modeled.
+
+Any profitability study should vary these assumptions and report sensitivity, not select a single favorable configuration.
+
+## Safety and live-trading boundary
+
+Do **not** use `--mode LIVE` against production in the current version. The legacy V1 SDK and order-signing path are no longer accepted by Polymarket production. The archived [go-live guide](docs/GO_LIVE_GUIDE.md) records the old implementation context and the migration work still required.
+
+Before live execution could be reconsidered, the project would need to:
+
+1. Migrate to `py-clob-client-v2` and pUSD collateral handling.
+2. Query current fee schedules per market rather than rely on a static fee assumption.
+3. Revalidate discovery, signing, post/cancel, user-feed fills, reconciliation, and settlement end to end.
+4. Run a fresh observe period and a conservative paper study with delayed fills and adverse-selection stress tests.
+5. Use a separately approved, low-notional canary with a human-operated kill switch.
+6. Confirm the operator is legally permitted to trade in their physical jurisdiction.
+
+Never commit a private key, API secret, passphrase, wallet seed, or funded `.env` file.
+
+## Repository map
+
+| Path | Purpose |
+| --- | --- |
+| `core_mm/` | Active market-making, paper-broker, risk, strategy, and telemetry code. |
+| `scripts/run_core_mm.py` | Main OBSERVE/PAPER runtime; contains the historical LIVE wiring. |
+| `scripts/report_core_mm_run.py` | Deterministic run/economics summary. |
+| `dashboard/` | Streamlit operator and research views. |
+| `tests/core_mm/` | Focused tests for quoting, execution, risk, telemetry, and strategy modules. |
+| `tmp/core_mm_runs/` | Selected committed run evidence; most runtime output is intentionally ignored. |
+| `legacy/` | Archived first-generation runtime and research code. |
+| `audit/` | Earlier implementation, safety, and milestone records. |
+
+## Contributing
+
+Issues, experiments, and pull requests are welcome. Good contributions make one bounded claim and include the evidence needed to evaluate it.
 
 ```bash
-REFERENCE_ENABLED=true python3 -m scripts.run_readonly --auto_discover
+git checkout -b feature/short-description
+python -m pytest -q
+git push -u origin feature/short-description
 ```
 
-Override reference source (polling or WS):
+Then open a pull request describing the change, the assumptions it introduces, the tests run, and whether its evidence comes from fixtures, historical data, live public data, paper execution, or live fills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full checklist.
 
-```bash
-python3 -m scripts.run_readonly --reference_source poll_coinbase
-```
+Useful contribution areas include CLOB V2 migration, paper-model calibration, point-in-time datasets, fee/rebate accounting, latency and queue-position sensitivity, reproducible evaluation, and dashboard reliability.
 
-Multiple sources (comma-separated) for fallback:
+## Public-release checklist
 
-```bash
-python3 -m scripts.run_readonly --reference_source ws_kraken,poll_coinbase
-```
+This repository is currently private. Before using it as a public portfolio link:
 
-Reference fallback controls (partial reference confidence):
+- Choose and add an explicit open-source license. Without one, GitHub visitors may read the code but do not receive permission to reuse it.
+- Review the full Git history for secrets and remove any sensitive material safely.
+- Decide whether the two open draft pull requests should be merged, closed, or preserved as historical work.
+- Keep the CLOB V2/live-execution blocker prominent until it is actually resolved and independently verified.
 
-```bash
-REFERENCE_ALLOW_PARTIAL=true
-REFERENCE_PARTIAL_CONFIDENCE=0.6
-```
+## Disclaimer
 
-Ingest existing reference tapes (offline):
-
-```bash
-python3 -m scripts.run_readonly --reference_tape ./logs/reference_20240101.jsonl
-```
-
-Collect reference ticks via Kraken WS into EventTape:
-
-```bash
-python3 -m scripts.reference_collect --symbols BTC,ETH --venue kraken --log_dir ./logs
-```
-
-## On-Chain Ingestion (Optional, Read-Only)
-
-Enable Polygon on-chain ingestion (diagnostics only; no trading). Requires local ABI files:
-
-- `abis/ctf_exchange.json`
-- `abis/ctf.json`
-- `abis/negrisk_ctf_exchange.json` (optional)
-
-Set RPC endpoints:
-
-```bash
-export POLYGON_RPC_HTTP="https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
-export POLYGON_RPC_WS="wss://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
-```
-
-Run with on-chain ingestion:
-
-```bash
-python3 -m scripts.run_readonly --markets config/markets.yaml --auto_discover --log-dir ./logs --onchain
-```
-
-Faster heartbeats and debug logging (optional):
-
-```bash
-ONCHAIN_HEARTBEAT_SECS=2.0 ONCHAIN_DEBUG=1 python3 -m scripts.run_readonly --onchain
-```
-
-Disable WS subscriptions (fallback to polling):
-
-```bash
-ONCHAIN_USE_WS=false python3 -m scripts.run_readonly --onchain
-```
-
-Advanced tuning (optional):
-
-```bash
-ONCHAIN_POLL_RECONCILE_SECS=30
-ONCHAIN_WS_LOOP_SLEEP_SECS=0.2
-ONCHAIN_DEDUPE_LRU_SIZE=5000
-ONCHAIN_RECREATE_FILTER_AFTER_SECS=30
-ONCHAIN_LOG_LEVEL=INFO
-```
-
-Why WS + reconciliation beats polling (SOP):
-
-- Polling adds a latency floor (poll interval + RPC delay) and burns cycles when idle.
-- WS filters surface events near block inclusion; reconciliation closes gaps on disconnects.
-- Explicit IDs (tx_hash/log_index/block) make audits and dedupe deterministic.
-
-Signals are logged in DecisionTape under `notes.onchain_signals` (non-gating):
-
-- `imbalance`: float in [-1, 1]
-- `buy_volume`, `sell_volume`, `window_secs`
-- `whale_activity`: list of `{whale, direction, size, t_recv_mono_ns}`
-- `capital_flow`: `{net_amount, signal, window_secs}`
-
-On-chain events are logged to EventTape as `onchain_*.jsonl` with `source="rpc"`. Heartbeats are emitted when no events arrive for `ONCHAIN_HEARTBEAT_SECS` (default 2s, min 1s).
-
-Configure whale addresses via `config/whales.json` (array of hex addresses).
-
-## Replay from Tape
-
-```bash
-python3 -m scripts.replay_runner ./logs
-```
-
-Optional trained model for replay:
-
-```bash
-python3 -m scripts.replay_runner ./logs --model artifacts/model_BTC.json
-```
-
-Replay uses the latest `resolved_markets_*.json` artifact if present; you can also pass `--resolved-markets`.
-
-Resolved markets artifact (canonical):
-- `logs/<run_id>/resolved_markets.json` (schema `resolved_markets_v1`)
-
-Replay consumes `market_*.jsonl`, `reference_*.jsonl`, and `onchain_*.jsonl` from a directory for deterministic reproduction.
-
-Generate a walk-forward report after replay:
-
-```bash
-python3 -m scripts.replay_runner ./logs --walkforward --walkforward-out ./logs
-```
-
-## Audit Report (Offline)
-
-```bash
-python3 -m scripts.analyze_audit ./logs
-```
-
-This reads DecisionTape JSONL files and writes `audit_report.json` and `audit_report.md` to `LOG_DIR`.
-
-## Build Training Datasets (Offline)
-
-```bash
-python3 -m scripts.build_datasets --logs ./logs --symbols BTC
-```
-
-Outputs JSONL datasets under `./artifacts`:
-- `ref_window_BTC.jsonl` (reference-window features + labels)
-- `micro_decisions.jsonl` (microstructure features aligned to labels)
-- `dataset_manifest.json` (inputs, counts, schema_version)
-
-Additional exports (CSV + Parquet) are written into partitioned directories under `./artifacts`:
-
-- `ref_window_csv/` and `ref_window_parquet/`
-- `micro_decisions_csv/` and `micro_decisions_parquet/`
-
-Parquet export requires `pyarrow` (see `requirements.txt`).
-
-## Walk-forward Report (Offline)
-
-```bash
-python3 -m scripts.walkforward_report --logs ./logs --out ./logs
-```
-
-## Train Ridge-Logistic Baseline (Offline)
-
-```bash
-python3 -m scripts.train_model --data artifacts/ref_window_BTC.jsonl --out artifacts/model_BTC.json
-```
-
-The model artifact includes `schema_version`, feature order, weights, metrics, and Platt calibration.
-
-## Train Offset-Logit Model (Offline)
-
-```bash
-python3 -m scripts.train_offset_model --data artifacts/micro_decisions.jsonl --out artifacts/model_offset.json
-```
-
-Load the trained model in read-only or replay:
-
-```bash
-python3 -m scripts.run_readonly --model artifacts/model_offset.json
-python3 -m scripts.replay_runner ./logs --model artifacts/model_offset.json
-```
-
-## Arb Half-Life (Offline)
-
-```bash
-python3 -m scripts.arb_half_life \
-  --decision ./logs/decision_*.jsonl \
-  --reference ./logs/reference_*.jsonl \
-  --shock-horizon-sec 10 \
-  --shock-quantile-q 0.01 \
-  --shock-min-count 5 \
-  --output-dir ./logs
-```
-
-## Experiment Safety Notes (Offline)
-
-- `feature_asof_ts_ms` is enforced: experiments hard-fail if any feature uses data with `feature_asof_ts_ms >= t_decision_wall_ms` (`feature_from_future`).
-- Confidence blocking: if `confidence_final < c_trade_min`, trade size is forced to 0 and `low_confidence` is logged.
-- P* disagreement: `diff_bps <= soft` ⇒ no penalty; `soft < diff_bps <= hard` ⇒ exponential confidence decay; `diff_bps > hard` ⇒ freeze (`pstar_disagreement_extreme`).
-- Arb half-life shocks are quantile-based and deterministic: threshold is computed from the experiment window with fallback q schedule.
-
-## Scientific Method Backtests (Offline)
-
-Each hypothesis lives under `backtests/scientific_method/Hxxx_*/` with a `spec.json`.
-
-Run an experiment:
-
-```bash
-python3 -m scripts.run_experiment --spec backtests/scientific_method/H001_order_imbalance_persistence/spec.json
-python3 -m scripts.run_experiment --spec backtests/scientific_method/H002_one_sided_pressure_pre_resolution/spec.json
-python3 -m scripts.run_experiment --spec backtests/scientific_method/H003_time_of_day_effects/spec.json
-```
-
-Outputs are written to `backtests/scientific_method/Hxxx_*/outputs/` as:
-- `results.json`
-- `report.md`
-
-To add a new hypothesis, copy `backtests/scientific_method/_template/spec.json` into a new folder and update the fields.
-
-Note: 15m market slugs rotate every 15 minutes; discovery resolves the current contracts.
+This software is for research and educational use. Prediction-market trading can lose the full amount at risk, simulated performance can differ materially from live performance, and access depends on jurisdiction and platform rules. Nothing in this repository is financial, legal, or investment advice.
