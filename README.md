@@ -1,64 +1,100 @@
-# Prediction-Market Market-Making Research System
+# Prediction-Market Market Maker
 
-A Python research and operations project for studying automated quoting on Polymarket and Kalshi-style binary markets. It combines live public order-book ingestion, deterministic paper execution, inventory-aware quoting, risk controls, experiment telemetry, and local operator workstations.
+> A research and operator system for building, observing, and testing an
+> inventory-aware market maker on binary prediction markets.
 
-This is a portfolio project and research system—not a claim of a profitable trading product. The strongest committed result is from simulated paper execution, not live capital. The historical live-order path was built for Polymarket CLOB V1 and is **not production-compatible** with the CLOB V2 exchange introduced on April 28, 2026.
+This is the project I built to explore the engineering behind automated market
+making: live order-book ingestion, quote generation, paper execution, risk
+controls, experiment telemetry, and the operator tools needed to understand
+what the system is doing.
 
-## What this project demonstrates
+The project combines the trading runtime with the operator view: market
+selection, quoting, paper execution, risk handling, experiment data, and the
+tools to inspect each decision after a run.
 
-- Event-driven ingestion of public CLOB market data into local L2 books.
-- Market discovery and rotation for short-horizon BTC, ETH, SOL, and XRP markets.
-- Two-sided quote generation with inventory skew, flow filtering, volatility and fill-adversity overlays, and position-aware exits.
-- Deterministic paper fills with queue-wait, visible-depth, staleness, fee, markout, turnover, and PnL accounting assumptions.
-- Binary complement and multi-outcome NegRisk arbitrage scanners.
-- Liquidity-reward scoring and quote-tightening analysis.
-- Per-order, per-fill, and per-cycle telemetry written to reproducible run artifacts and SQLite.
-- A Streamlit operator dashboard for market state, positions, PnL, execution quality, risk, and reliability.
-- A Kalshi-oriented React/Tauri Operator Workstation backed by a local FastAPI control plane for starting paper runs, inspecting decisions and fills, and issuing validated stop/kill commands.
-- Kalshi market discovery, fee modeling, execution bridging, rotation reporting, risk harnesses, and hedge-calibration tooling.
-- A fail-closed safety design with order, position, and loss limits plus cancel-on-shutdown behavior in the historical live adapter.
+## Recruiter quick read
 
-## Current status
+| What | Evidence |
+| --- | --- |
+| Problem | Turn noisy public prediction-market books into controlled two-sided quotes without losing track of inventory, fees, or operational risk. |
+| Core build | Python market-making runtime with L2 book management, paper broker, quote/risk engines, JSONL + SQLite telemetry, and a Streamlit dashboard. |
+| Operator build | A local React/Tauri Kalshi Operator Workstation with a FastAPI control plane for paper runs, decisions, fills, and validated risk commands. |
+| Quality | **419 automated tests** pass; the Operator Workstation production build succeeds. |
+| Research result | Best committed simulator run: **188 fills**, **$23.93 realized net PnL**, **$17.11 ending total PnL**, and **$6.53 max drawdown**. |
+| Current evidence | The saved result spans three BTC 15-minute windows and is presented as paper-trading research. |
 
-| Area | Status | Evidence / limitation |
-| --- | --- | --- |
-| Core implementation | Working locally | `419` tests pass on August 6, 2026; the Operator Workstation production build also succeeds. |
-| Public-data observation | Verified August 6, 2026 | A 15-second read-only check discovered the current BTC 15-minute market, received 1,220 WebSocket messages, applied 2,432 book updates, and completed without a runtime error. |
-| Paper execution | Implemented | Uses a deterministic simulator, not exchange-confirmed fills. |
-| Recorded economics | Promising but insufficient | Best committed run recorded $23.93 realized net PnL and $17.11 total PnL on $1,331.10 turnover with 188 simulated fills. Of the other six committed summaries, four had zero fills and two had only 12 or 23 fills. |
-| Kalshi integration | Implemented, not promoted | The venue adapter, dynamic fee model, one-active-market launch profile, risk harness, and Operator Workstation are present. No committed Kalshi run set yet establishes profitability or live readiness. |
-| Consistent income | Not established | No statistically adequate out-of-sample record, live fill record, or capital-scaled drawdown study exists. |
-| Live Polymarket execution | Blocked | The code pins the retired `py-clob-client==0.20.0`. Production now requires CLOB V2, pUSD collateral, updated signing, and end-to-end revalidation. |
+## What I built
 
-The recorded paper run is useful evidence that the accounting and reporting path works under its assumptions. It is not evidence that the same fills, latency, rebates, adverse selection, or returns would occur live.
-
-## Architecture
-
-```text
-Polymarket or Kalshi public APIs / WebSockets
-                 |
-                 v
-  market selector + L2 book manager
-                 |
-                 v
- quote engine + alpha overlays + risk manager
-                 |
-          +------+------+
-          |             |
-       OBSERVE        PAPER
-     decisions only   simulated broker
-          |             |
-          +------+------+
-                 v
-     JSONL tapes + SQLite telemetry
-                 |
-                 v
- reports + Streamlit dashboard + Operator Workstation
+```mermaid
+flowchart LR
+    A[Public market data<br/>Polymarket / Kalshi] --> B[Market selection<br/>and L2 book manager]
+    B --> C[Quote engine<br/>inventory + alpha overlays]
+    C --> D[Risk ladder<br/>skew, unwind, force-flat, kill]
+    D --> E{Run mode}
+    E -->|Observe| F[Decisions only]
+    E -->|Paper| G[Deterministic fill simulator]
+    F --> H[JSONL tapes + SQLite]
+    G --> H
+    H --> I[Streamlit dashboard<br/>and Kalshi Operator Workstation]
 ```
 
-The active implementation is under `core_mm/`. The earlier research platform is preserved under `legacy/` for provenance and reference; it is not the primary runtime.
+The system is organized around four practical layers:
 
-## Quick start
+1. **Market intelligence** — discovers short-horizon BTC, ETH, SOL, and XRP
+   markets, maintains L2 books, and filters candidates by tradability,
+   spread, liquidity, and timing.
+2. **Execution research** — produces inventory-aware two-sided quotes and
+   runs a deterministic paper broker with queue, visible-depth, fee, staleness,
+   turnover, and markout assumptions.
+3. **Risk and controls** — sizes positions conservatively and drives explicit
+   `SKEW`, `UNWIND`, `FORCE_FLAT`, and kill-switch behavior instead of treating
+   PnL as the only control signal.
+4. **Operator experience** — records every cycle, decision, order, fill, and
+   PnL event so a human can inspect the reason for a market choice or risk
+   transition rather than blindly trust a bot.
+
+## What is inside
+
+- **Deterministic paper execution:** a reusable simulator models resting-order
+  wait time, visible queue depth, fill eligibility, fees, and inventory PnL.
+- **Risk is first-class:** per-order, per-market, per-event, and daily limits
+  feed a clear exit ladder, with cancel-on-shutdown behavior in the legacy live
+  adapter.
+- **Reproducible evidence:** raw JSONL tapes and SQLite telemetry support
+  dashboards, reports, regression tests, and the committed paper-trading EDA.
+- **Kalshi-first operator lane:** the repo includes market selection, fee
+  modeling, execution bridging, calibration harnesses, and a local paper-only
+  workstation focused on one active BTC market at a time.
+- **Evidence workflow:** JSONL tapes, SQLite telemetry, charts, and tests keep
+  experiments reviewable and reproducible.
+
+## Paper-run plots
+
+These figures come from the saved historical paper run. They are generated by
+[`scripts/analyze_paper_runs.py`](scripts/analyze_paper_runs.py) from committed
+JSONL tapes, with the accounting logic covered by
+[`tests/scripts/test_analyze_paper_runs.py`](tests/scripts/test_analyze_paper_runs.py).
+
+| Historical paper-run metric | Result |
+| --- | ---: |
+| Runtime | 33.1 minutes |
+| BTC 15-minute contracts | 3 |
+| Simulated fills | 188 |
+| Realized net PnL | $23.93 |
+| Ending total PnL | $17.11 |
+| Maximum drawdown | $6.53 |
+| Modeled turnover | $1,331.10 |
+
+![Historical paper equity and drawdown](docs/assets/paper_equity_drawdown.png)
+
+![Paper-run market concentration](docs/assets/paper_market_concentration.png)
+
+The saved run shows how the system behaved across three BTC 15-minute windows:
+**92% of fills and 95% of realized net PnL came from the first window.**
+
+Read the full, reproducible analysis: [Paper-Trading EDA](docs/analysis/PAPER_TRADING_EDA.md).
+
+## Run it locally
 
 Python 3.11+ is recommended.
 
@@ -81,7 +117,7 @@ python scripts/run_core_mm.py \
   --symbol BTC
 ```
 
-Run the paper broker against live public book data:
+Run a paper experiment against public book data:
 
 ```bash
 python scripts/run_core_mm.py \
@@ -94,38 +130,18 @@ python scripts/run_core_mm.py \
   --max-size 25
 ```
 
-For the current narrow research lane, run one Kalshi BTC market at a time:
+Rebuild the saved-run charts and metrics:
 
 ```bash
-python scripts/run_core_mm.py \
-  --exchange kalshi \
-  --mode PAPER \
-  --runtime-root tmp/core_mm_runs/kalshi-btc-paper \
-  --run-name "Kalshi BTC single-market paper" \
-  --duration-secs 900 \
-  --symbol BTC \
-  --max-active-markets 1 \
-  --safe-risk-profile 200
+python scripts/analyze_paper_runs.py
 ```
-
-Build a deterministic summary and open the dashboard:
-
-```bash
-python scripts/report_core_mm_run.py --runtime-root tmp/paper-demo
-python scripts/run_dashboard.py --db-path tmp/paper-demo/runtime.db
-```
-
-The dashboard is then available at `http://localhost:8501` by default.
 
 ## Kalshi Operator Workstation
 
-The repository now includes a local operator surface in `operator_app/`. It is
-designed around the Kalshi-first, one-active-market research plan: inspect why
-a market was selected, see after-fee decisions and fills, follow risk-state
-transitions, and operate paper runtimes without treating the UI as permission
-to trade live.
-
-Run the local control service and frontend in separate terminals:
+The `operator_app/` is a React/Tauri desktop operator surface backed by a local
+FastAPI service. It helps an operator start **paper** runs, inspect selection
+and fill rationale, see after-fee risk data, and issue validated stop or kill
+commands.
 
 ```bash
 python scripts/run_operator_service.py
@@ -136,94 +152,51 @@ npm run dev
 ```
 
 The service binds to `127.0.0.1:8765` by default and deliberately launches
-managed runtimes in `PAPER` mode. The workstation is an operator and reporting
-layer; it does not turn the current evidence into a live-trading approval. See
-the [owner-understanding checklist](docs/OWNER_UNDERSTANDING_CHECKLIST.md) and
-[Kalshi go-live criteria](docs/BTC_KALSHI_GO_LIVE_CRITERIA.md).
+managed runtimes in `PAPER` mode. The point is operational understanding, not
+one-click live trading. See the [operator checklist](docs/OWNER_UNDERSTANDING_CHECKLIST.md).
 
-## Paper-trading evidence
+## What I would build next
 
-The strongest committed simulator run made money, but the path was highly
-concentrated and ended with open-inventory losses. Maximum drawdown was $6.53,
-and 92% of fills plus 95% of realized net PnL came from the first of three BTC
-15-minute contracts.
+| Priority | Why it matters |
+| --- | --- |
+| Collect a fixed Kalshi BTC paper dataset | Needed for independent-window returns, downside distribution, and parameter sensitivity. |
+| Stress paper fills and current fees | A profitable backtest is unhelpful if queue position, cancels, or fee assumptions are flattering it. |
+| Port the Polymarket adapter to CLOB V2 | The checked-in Polymarket live path uses the retired V1 client and remains disabled until a V2 migration and full revalidation. |
+| Run a separately approved tiny canary | Only after the paper gate, fee reconciliation, and operator workflows are independently reviewed. |
 
-![Historical paper-run equity and drawdown](docs/assets/paper_equity_drawdown.png)
+For the Polymarket migration boundary, see the [official CLOB V2 migration guide](https://docs.polymarket.com/v2-migration).
 
-![Paper-run market concentration](docs/assets/paper_market_concentration.png)
-
-The reproducible [paper-trading EDA](docs/analysis/PAPER_TRADING_EDA.md) explains
-why neither Sharpe nor risk of ruin can be estimated defensibly from the saved
-sample, and documents the next one-market testing gate.
-
-## Paper-model assumptions
-
-The simulator includes explicit approximations, but it does not reproduce a real matching engine. In particular:
-
-- Resting orders must wait at least 200 ms before an assumed fill.
-- The model assumes an average queue position behind 50% of displayed depth.
-- Fills are capped by the remaining visible depth at the modeled price.
-- Books older than five seconds are rejected.
-- Maker/taker fees are configured locally and may not match the current per-market fee schedule.
-- Network latency, cancel races, hidden liquidity, exchange rejection, settlement, and reward competition are not fully modeled.
-
-Any profitability study should vary these assumptions and report sensitivity, not select a single favorable configuration.
-
-## Safety and live-trading boundary
-
-Do **not** use `--mode LIVE` against production in the current version. The legacy V1 SDK and order-signing path are no longer accepted by Polymarket production. The archived [go-live guide](docs/GO_LIVE_GUIDE.md) records the old implementation context and the migration work still required.
-
-Before live execution could be reconsidered, the project would need to:
-
-1. Follow Polymarket's [official CLOB V2 migration guide](https://docs.polymarket.com/v2-migration), replacing `py-clob-client` with `py-clob-client-v2` and adding pUSD collateral handling.
-2. Query current fee schedules per market rather than rely on a static fee assumption.
-3. Revalidate discovery, signing, post/cancel, user-feed fills, reconciliation, and settlement end to end.
-4. Run a fresh observe period and a conservative paper study with delayed fills and adverse-selection stress tests.
-5. Use a separately approved, low-notional canary with a human-operated kill switch.
-6. Confirm the operator is legally permitted to trade in their physical jurisdiction.
-
-Never commit a private key, API secret, passphrase, wallet seed, or funded `.env` file.
-
-## Repository map
+## Repository guide
 
 | Path | Purpose |
 | --- | --- |
-| `core_mm/` | Active market-making, paper-broker, risk, strategy, and telemetry code. |
-| `scripts/run_core_mm.py` | Main OBSERVE/PAPER runtime; contains the historical LIVE wiring. |
-| `scripts/report_core_mm_run.py` | Deterministic run/economics summary. |
-| `dashboard/` | Streamlit operator and research views. |
-| `operator_app/` | React/Tauri Kalshi Operator Workstation. |
-| `core_mm/operator_service.py` | Local paper-runtime control and inspection API. |
-| `scripts/analyze_paper_runs.py` | Reproducible saved-run EDA and chart generation. |
-| `docs/analysis/` | Evidence reports and statistical limitations. |
-| `tests/core_mm/` | Focused tests for quoting, execution, risk, telemetry, and strategy modules. |
-| `tmp/core_mm_runs/` | Selected committed run evidence; most runtime output is intentionally ignored. |
-| `legacy/` | Archived first-generation runtime and research code. |
-| `audit/` | Earlier implementation, safety, and milestone records. |
+| [`core_mm/`](core_mm/) | Active market-making, execution, risk, telemetry, and Kalshi integration. |
+| [`scripts/run_core_mm.py`](scripts/run_core_mm.py) | Main OBSERVE/PAPER runtime; contains historical LIVE wiring. |
+| [`dashboard/`](dashboard/) | Streamlit research and operator dashboard. |
+| [`operator_app/`](operator_app/) | React/Tauri Kalshi Operator Workstation. |
+| [`scripts/analyze_paper_runs.py`](scripts/analyze_paper_runs.py) | Reproducible EDA and chart generation. |
+| [`docs/`](docs/) | Go-live criteria, operator guidance, experiments, and analysis. |
+| [`tests/`](tests/) | Regression coverage for execution, risk, telemetry, dashboards, and scripts. |
+| [`legacy/`](legacy/) | Earlier implementation retained for provenance, not the primary runtime. |
 
-## Contributing
+## Collaborate
 
-Issues, experiments, and pull requests are welcome. Good contributions make one bounded claim and include the evidence needed to evaluate it.
+Interested in market microstructure, trading systems, or research tooling? Open
+an issue with a bounded experiment or submit a pull request with the assumption
+being changed, the evidence source, and the tests run. The detailed contribution
+guide is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-```bash
-git checkout -b feature/short-description
-python -m pytest -q
-git push -u origin feature/short-description
-```
+High-value contribution areas: CLOB V2 migration, point-in-time datasets,
+queue/latency sensitivity, fee and rebate accounting, reproducible evaluation,
+and operator reliability.
 
-Then open a pull request describing the change, the assumptions it introduces, the tests run, and whether its evidence comes from fixtures, historical data, live public data, paper execution, or live fills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full checklist.
+## Safety and research boundary
 
-Useful contribution areas include CLOB V2 migration, paper-model calibration, point-in-time datasets, fee/rebate accounting, latency and queue-position sensitivity, reproducible evaluation, and dashboard reliability.
+This is research and educational software, not financial, legal, or investment
+advice. Prediction-market trading can lose the full amount at risk, and
+simulated performance can differ materially from live performance.
 
-## Public-release checklist
-
-This repository is currently private. Before using it as a public portfolio link:
-
-- Choose and add an explicit open-source license. Without one, GitHub visitors may read the code but do not receive permission to reuse it.
-- Review the full Git history for secrets and remove any sensitive material safely.
-- PR #1 is closed as stale. PR #2 is superseded by a curated integration that excludes its unrelated legacy-tooling commit.
-- Keep the CLOB V2/live-execution blocker prominent until it is actually resolved and independently verified.
-
-## Disclaimer
-
-This software is for research and educational use. Prediction-market trading can lose the full amount at risk, simulated performance can differ materially from live performance, and access depends on jurisdiction and platform rules. Nothing in this repository is financial, legal, or investment advice.
+Do **not** run the current Polymarket `LIVE` path in production. It uses a
+retired CLOB V1 client and needs a CLOB V2 migration, current fee handling, and
+fresh end-to-end validation first. Never commit a wallet key, API credential,
+passphrase, seed phrase, or funded `.env` file.
