@@ -92,6 +92,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -150,6 +151,11 @@ cache_gamma_slug_markets.json
 *.sqlite
 node_modules/
 *.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
 secrets/
 
 # Runtime artifacts (never commit)
