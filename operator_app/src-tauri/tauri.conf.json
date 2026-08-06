@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Operator Workstation",
+  "version": "0.1.0",
+  "identifier": "com.polymarket.operatorworkstation",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Operator Workstation",
+        "width": 1680,
+        "height": 1040,
+        "minWidth": 1280,
+        "minHeight": 800,
+        "resizable": true
+      }
+    ]
+  }
+}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from core_mm.alpha_overlay import AlphaOverlayManager, AlphaSignal
 from core_mm.book_manager import BookManager
@@ -19,13 +19,17 @@ from core_mm.sizing import SizePlan, get_buy_sell_amount
 class MarketConfig:
     market_id: str
     token_ids: Sequence[str]
+    event_id: Optional[str] = None
+    exchange: Optional[str] = None
+    fee_model_exchange: Optional[str] = None
+    fee_type: Optional[str] = None
+    fee_multiplier: Optional[float] = None
     tick_size: Optional[float] = None
     min_size: float = 100.0
     fallback_size: float = 20.0
     within_pct: float = 0.02
     trade_size: float = 50.0
     max_size: float = 100.0
-    reverse_position_min_size: float = 20.0
     min_order_size: float = 0.0
     # Staleness gate: refuse to quote if the book hasn't updated within this window.
     # 0 = disabled (original behaviour).
@@ -36,6 +40,15 @@ class MarketConfig:
     # Inventory skew factor for sizing: 1.0 = linear scale from full buy at
     # flat to zero buy at max_size. 0.0 = disabled.
     inventory_skew_factor: float = 1.0
+    # Kelly criterion sizing: fraction of Kelly to use. 0.0 = disabled (fixed trade_size).
+    kelly_fraction: float = 0.0
+    end_ts_ms: Optional[int] = None
+    market_duration_ms: Optional[int] = None
+    stop_open_before_expiry_ms: int = 0
+    force_flat_before_expiry_ms: int = 0
+    stale_position_after_ms: int = 0
+    manual_force_flat: bool = False
+    base_spread_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -47,6 +60,52 @@ class TokenState:
     usdc_balance: Optional[float] = None
     three_hour_volatility: float = 0.0
     net_position: float = 0.0
+    current_equity: Optional[float] = None
+    reference_equity: Optional[float] = None
+    market_position_notional: float = 0.0
+    event_position_notional: float = 0.0
+    market_unrealized_pnl: float = 0.0
+    event_unrealized_pnl: float = 0.0
+    portfolio_total_pnl: float = 0.0
+    hedge_action: str = "NONE"
+    hedge_cluster_id: Optional[str] = None
+    control_state: str = "NORMAL"
+    hedge_action_reason: Optional[str] = None
+    hedge_market_id: Optional[str] = None
+    hedge_target_token_id: Optional[str] = None
+    hedge_target_side: Optional[str] = None
+    hedge_preferred_side: Optional[str] = None
+    hedge_ratio: Optional[float] = None
+    hedge_extra_skew_ticks: int = 0
+    hedge_block_buy: bool = False
+    hedge_block_sell: bool = False
+    hedge_reduce_only: bool = False
+    hedge_quality_score: Optional[float] = None
+    hedge_execution_quality_score: Optional[float] = None
+    hedge_covariance: Optional[float] = None
+    hedge_correlation: Optional[float] = None
+    hedge_beta_raw: Optional[float] = None
+    hedge_beta: Optional[float] = None
+    hedge_beta_shrunk: Optional[float] = None
+    hedge_beta_clipped: Optional[float] = None
+    hedge_covariance_sample_count: Optional[int] = None
+    hedge_covariance_state: Optional[str] = None
+    hedge_covariance_confidence: Optional[str] = None
+    hedge_pair_score: Optional[float] = None
+    hedgeability_tier: Optional[str] = None
+    hedge_structural_score: Optional[float] = None
+    hedge_covariance_score: Optional[float] = None
+    hedge_beta_stability_score: Optional[float] = None
+    hedge_execution_availability_score: Optional[float] = None
+    hedge_realized_outcome_score: Optional[float] = None
+    hedge_relation_confidence_state: Optional[str] = None
+    hedge_permission_state: Optional[str] = None
+    hedge_rejection_reason: Optional[str] = None
+    hedge_model_state: Optional[str] = None
+    hedge_realized_improvement_state: Optional[str] = None
+    hedge_success_window_ms: Optional[int] = None
+    hedge_failed_cooldown_until_ms: Optional[int] = None
+    hedge_rejection_reasons: Sequence[str] = ()
 
 
 @dataclass(frozen=True)
@@ -81,6 +140,7 @@ class TradingMainLoop:
         execution_adapter: Optional[ExecutionAdapter] = None,
         mode: str = "OBSERVE",
         flow_filter_ewma_span: int = 10,
+        post_fill_reentry_cooldown_ms: int = 0,
     ) -> None:
         self._book_manager = book_manager
         self._order_manager = order_manager
@@ -93,6 +153,8 @@ class TradingMainLoop:
         self._alpha_overlays: Dict[str, AlphaOverlayManager] = {}
         self._emergency_cancel_count: int = 0
         self._rush_fill_count: int = 0
+        self._post_fill_reentry_cooldown_ms = max(0, int(post_fill_reentry_cooldown_ms))
+        self._buy_reentry_block_until: Dict[str, int] = {}
 
     @property
     def flow_stats(self) -> Dict[str, Any]:
@@ -123,9 +185,33 @@ class TradingMainLoop:
         return self._alpha_overlays[token_id]
 
     def record_fill_for_alpha(self, token_id: str, side: str, price: float, mid_at_fill: float) -> None:
-        """Feed a fill into the alpha overlay's fill asymmetry tracker."""
+        """Backward-compatible alias for record_fill()."""
+        self.record_fill(token_id=token_id, side=side, price=price, mid_at_fill=mid_at_fill)
+
+    def record_fill(
+        self,
+        *,
+        token_id: str,
+        side: str,
+        price: float,
+        mid_at_fill: float,
+        ts_ms: Optional[int] = None,
+        cooldown_ms: Optional[int] = None,
+    ) -> None:
+        """Feed a fill into alpha and arm buy re-entry cooldowns after exits."""
         overlay = self._get_alpha_overlay(token_id)
         overlay.record_fill(side, price, mid_at_fill)
+        if hasattr(self._risk_manager, "record_fill"):
+            self._risk_manager.record_fill(token_id=token_id, side=side, ts_ms=ts_ms)
+        active_cooldown_ms = self._post_fill_reentry_cooldown_ms
+        if cooldown_ms is not None:
+            active_cooldown_ms = max(0, int(cooldown_ms))
+        if active_cooldown_ms <= 0:
+            return
+        if str(side).lower() != "sell":
+            return
+        active_ts_ms = int(ts_ms or 0)
+        self._buy_reentry_block_until[str(token_id)] = active_ts_ms + active_cooldown_ms
 
     async def run_market_cycle(
         self,
@@ -160,6 +246,11 @@ class TradingMainLoop:
             )
 
     def _evaluate_token(self, *, market: MarketConfig, token_state: TokenState, now_ms: int) -> TokenCycleDecision:
+        block_until_ms = int(self._buy_reentry_block_until.get(str(token_state.token_id), 0) or 0)
+        buy_reentry_blocked = block_until_ms > int(now_ms)
+        if block_until_ms and not buy_reentry_blocked:
+            self._buy_reentry_block_until.pop(str(token_state.token_id), None)
+
         book = self._book_manager.get_book(token_state.token_id)
         book_diag = classify_book_state(
             book,
@@ -259,11 +350,12 @@ class TradingMainLoop:
             avg_cost=token_state.avg_cost,
             mid_price=mid_price,
         )
+        inventory_skew_ticks += int(token_state.hedge_extra_skew_ticks or 0)
         # Apply alpha overlay: add extra skew from book imbalance signal.
         inventory_skew_ticks += alpha_signal.extra_skew_ticks
 
         # Apply alpha overlay spread multiplier (fill asymmetry + vol regime).
-        effective_spread_mult = spread_multiplier * alpha_signal.spread_multiplier
+        effective_spread_mult = spread_multiplier * alpha_signal.spread_multiplier * max(0.1, float(market.base_spread_multiplier or 1.0))
 
         quote_plan = get_order_prices(
             metrics,
@@ -302,18 +394,38 @@ class TradingMainLoop:
                         rush_fill = True
                         self._rush_fill_count += 1
 
+        # Compute p_fair for Kelly criterion sizing: mid_price + imbalance tilt
+        p_fair: Optional[float] = None
+        if market.kelly_fraction > 0.0 and mid_price > 0.0:
+            tilt = alpha_signal.imbalance_alpha_bps / 10000.0
+            p_fair = max(0.01, min(0.99, mid_price + tilt))
+
+        inferred_reference_equity = max(
+            0.0,
+            float(token_state.reference_equity or token_state.current_equity or token_state.usdc_balance or 0.0),
+        )
+        risk_per_trade_budget = (
+            inferred_reference_equity * float(self._risk_manager.config.per_trade_loss_pct)
+            if bool(self._risk_manager.config.risk_based_share_sizing) and inferred_reference_equity > 0.0
+            else None
+        )
         size_plan = get_buy_sell_amount(
             position=token_state.position,
             max_size=market.max_size,
             trade_size=market.trade_size,
             avg_price=token_state.avg_cost,
             reverse_position=token_state.reverse_position,
-            reverse_position_min_size=market.reverse_position_min_size,
             net_position=token_state.net_position,
             min_order_size=market.min_order_size,
             usdc_balance=token_state.usdc_balance,
             buy_price=quote_plan.bid_price,
+            sell_price=quote_plan.ask_price,
             inventory_skew_factor=market.inventory_skew_factor,
+            p_fair=p_fair,
+            kelly_fraction=market.kelly_fraction,
+            bankroll=token_state.reference_equity,
+            risk_per_trade_budget=risk_per_trade_budget,
+            risk_based_share_sizing=bool(self._risk_manager.config.risk_based_share_sizing),
         )
         spread_bps = None
         if metrics.best_bid is not None and metrics.best_ask is not None:
@@ -330,17 +442,67 @@ class TradingMainLoop:
             best_ask=book.best_ask,
             spread_bps=spread_bps,
             three_hour_volatility=token_state.three_hour_volatility,
+            token_id=token_state.token_id,
+            event_id=market.event_id,
+            current_equity=token_state.current_equity,
+            reference_equity=token_state.reference_equity,
+            planned_buy_price=quote_plan.bid_price,
+            market_position_notional=token_state.market_position_notional,
+            event_position_notional=token_state.event_position_notional,
+            market_unrealized_pnl=token_state.market_unrealized_pnl,
+            event_unrealized_pnl=token_state.event_unrealized_pnl,
+            portfolio_total_pnl=token_state.portfolio_total_pnl,
+            market_duration_ms=market.market_duration_ms,
+            time_to_expiry_ms=(
+                0
+                if market.manual_force_flat
+                else (
+                    max(0, int(market.end_ts_ms) - int(now_ms))
+                    if market.end_ts_ms is not None
+                    else None
+                )
+            ),
         )
 
+        if risk.action in {"STOP_LOSS", "TAKE_PROFIT", "STALE_UNWIND", "FORCE_FLAT", "EVENT_DE_RISK", "DAY_LOSS_CAP"} and risk.exit_price is not None and risk.exit_size > 0:
+            quote_plan = QuotePlan(
+                bid_price=quote_plan.bid_price,
+                ask_price=float(risk.exit_price),
+                bid_mode=quote_plan.bid_mode,
+                ask_mode=(
+                    f"risk_exit_{str(risk.action).lower()}_{str(risk.exit_mode or 'maker').lower()}"
+                ),
+                tick_size=quote_plan.tick_size,
+            )
+
         desired: List[DesiredQuote] = []
-        if flow.allow_buy and risk.allow_buy and quote_plan.bid_price is not None and size_plan.buy_amount > 0:
+        buy_amount = float(size_plan.buy_amount)
+        if buy_reentry_blocked:
+            buy_amount = 0.0
+        if token_state.hedge_reduce_only or token_state.hedge_block_buy:
+            buy_amount = 0.0
+        if token_state.hedge_action == "HEDGE" and token_state.hedge_target_side == "buy":
+            buy_amount *= max(0.0, min(1.0, float(token_state.hedge_ratio or 0.0)))
+        if risk.max_buy_size is not None:
+            buy_amount = min(buy_amount, max(0.0, float(risk.max_buy_size)))
+        min_effective_order_size = max(1.0, float(market.min_order_size or 0.0))
+        if buy_amount < min_effective_order_size:
+            buy_amount = 0.0
+
+        sell_amount = float(size_plan.sell_amount)
+        if token_state.hedge_block_sell:
+            sell_amount = 0.0
+        if risk.action in {"STOP_LOSS", "TAKE_PROFIT", "STALE_UNWIND", "FORCE_FLAT", "EVENT_DE_RISK", "DAY_LOSS_CAP"} and risk.exit_size > 0:
+            sell_amount = min(float(token_state.position), float(risk.exit_size))
+
+        if flow.allow_buy and risk.allow_buy and quote_plan.bid_price is not None and buy_amount > 0:
             desired.append(
                 DesiredQuote(
                     quote_key=f"{market.market_id}:{token_state.token_id}:buy",
                     token_id=token_state.token_id,
                     side="buy",
                     price=quote_plan.bid_price,
-                    size=size_plan.buy_amount,
+                    size=buy_amount,
                     metadata={
                         "market_id": market.market_id,
                         "quote_mode": quote_plan.bid_mode,
@@ -369,17 +531,81 @@ class TradingMainLoop:
                         "alpha_adversity": alpha_signal.fill_adversity_ratio,
                         "alpha_complement_bps": alpha_signal.complement_skew_bps,
                         "alpha_depth_change": alpha_signal.depth_change_signal,
+                        "p_fair": p_fair,
+                        "kelly_fraction": market.kelly_fraction,
+                        "buy_reentry_blocked": buy_reentry_blocked,
+                        "buy_reentry_block_until_ms": block_until_ms if buy_reentry_blocked else None,
+                        "event_id": market.event_id,
+                        "exchange": market.exchange,
+                        "fee_model_exchange": market.fee_model_exchange,
+                        "fee_type": market.fee_type,
+                        "fee_multiplier": market.fee_multiplier,
+                        "hedge_action": token_state.hedge_action,
+                        "hedge_cluster_id": token_state.hedge_cluster_id,
+                        "control_state": token_state.control_state,
+                        "hedge_action_reason": token_state.hedge_action_reason,
+                        "hedge_market_id": token_state.hedge_market_id,
+                        "hedge_target_token_id": token_state.hedge_target_token_id,
+                        "hedge_target_side": token_state.hedge_target_side,
+                        "hedge_preferred_side": token_state.hedge_preferred_side,
+                        "hedge_ratio": token_state.hedge_ratio,
+                        "hedge_quality_score": token_state.hedge_quality_score,
+                        "hedge_execution_quality_score": token_state.hedge_execution_quality_score,
+                        "hedge_covariance": token_state.hedge_covariance,
+                        "hedge_correlation": token_state.hedge_correlation,
+                        "hedge_beta_raw": token_state.hedge_beta_raw,
+                        "hedge_beta": token_state.hedge_beta,
+                        "hedge_beta_shrunk": token_state.hedge_beta_shrunk,
+                        "hedge_beta_clipped": token_state.hedge_beta_clipped,
+                        "hedge_covariance_sample_count": token_state.hedge_covariance_sample_count,
+                        "hedge_covariance_state": token_state.hedge_covariance_state,
+                        "hedge_covariance_confidence": token_state.hedge_covariance_confidence,
+                        "hedge_pair_score": token_state.hedge_pair_score,
+                        "hedgeability_tier": token_state.hedgeability_tier,
+                        "hedge_structural_score": token_state.hedge_structural_score,
+                        "hedge_covariance_score": token_state.hedge_covariance_score,
+                        "hedge_beta_stability_score": token_state.hedge_beta_stability_score,
+                        "hedge_execution_availability_score": token_state.hedge_execution_availability_score,
+                        "hedge_realized_outcome_score": token_state.hedge_realized_outcome_score,
+                        "hedge_relation_confidence_state": token_state.hedge_relation_confidence_state,
+                        "hedge_permission_state": token_state.hedge_permission_state,
+                        "hedge_rejection_reason": token_state.hedge_rejection_reason,
+                        "hedge_model_state": token_state.hedge_model_state,
+                        "hedge_realized_improvement_state": token_state.hedge_realized_improvement_state,
+                        "hedge_success_window_ms": token_state.hedge_success_window_ms,
+                        "hedge_failed_cooldown_until_ms": token_state.hedge_failed_cooldown_until_ms,
+                        "hedge_rejection_reasons": list(token_state.hedge_rejection_reasons or ()),
+                        "current_equity": risk.current_equity,
+                        "reference_equity": risk.reference_equity,
+                        "risk_state": risk.risk_state,
+                        "stale_state": risk.stale_state,
+                        "exit_mode": risk.exit_mode,
+                        "exit_escalation_reason": risk.exit_escalation_reason,
+                        "stop_open_triggered": risk.stop_open_triggered,
+                        "force_flat_triggered": risk.force_flat_triggered,
+                        "cross_armed": risk.cross_armed,
+                        "maker_exit_deadline_ms": risk.maker_exit_deadline_ms,
+                        "flatten_only_triggered": risk.flatten_only_triggered,
+                        "market_exposure_notional": risk.market_exposure_notional,
+                        "event_exposure_notional": risk.event_exposure_notional,
+                        "market_unrealized_pnl": risk.market_unrealized_pnl,
+                        "event_unrealized_pnl": risk.event_unrealized_pnl,
+                        "portfolio_total_pnl": risk.portfolio_total_pnl,
+                        "time_to_expiry_ms": risk.time_to_expiry_ms,
+                        "stale_after_ms": risk.stale_after_ms,
+                        "per_trade_loss_budget": risk.per_trade_loss_budget,
+                        "max_buy_size": risk.max_buy_size,
                     },
                 )
             )
-        if flow.allow_sell and risk.allow_sell and quote_plan.ask_price is not None and size_plan.sell_amount > 0:
+        if flow.allow_sell and risk.allow_sell and quote_plan.ask_price is not None and sell_amount > 0:
             desired.append(
                 DesiredQuote(
                     quote_key=f"{market.market_id}:{token_state.token_id}:sell",
                     token_id=token_state.token_id,
                     side="sell",
                     price=quote_plan.ask_price,
-                    size=size_plan.sell_amount,
+                    size=sell_amount,
                     metadata={
                         "market_id": market.market_id,
                         "quote_mode": quote_plan.ask_mode,
@@ -408,6 +634,70 @@ class TradingMainLoop:
                         "alpha_adversity": alpha_signal.fill_adversity_ratio,
                         "alpha_complement_bps": alpha_signal.complement_skew_bps,
                         "alpha_depth_change": alpha_signal.depth_change_signal,
+                        "p_fair": p_fair,
+                        "kelly_fraction": market.kelly_fraction,
+                        "buy_reentry_blocked": buy_reentry_blocked,
+                        "buy_reentry_block_until_ms": block_until_ms if buy_reentry_blocked else None,
+                        "event_id": market.event_id,
+                        "exchange": market.exchange,
+                        "fee_model_exchange": market.fee_model_exchange,
+                        "fee_type": market.fee_type,
+                        "fee_multiplier": market.fee_multiplier,
+                        "hedge_action": token_state.hedge_action,
+                        "hedge_cluster_id": token_state.hedge_cluster_id,
+                        "control_state": token_state.control_state,
+                        "hedge_action_reason": token_state.hedge_action_reason,
+                        "hedge_market_id": token_state.hedge_market_id,
+                        "hedge_target_token_id": token_state.hedge_target_token_id,
+                        "hedge_target_side": token_state.hedge_target_side,
+                        "hedge_preferred_side": token_state.hedge_preferred_side,
+                        "hedge_ratio": token_state.hedge_ratio,
+                        "hedge_quality_score": token_state.hedge_quality_score,
+                        "hedge_execution_quality_score": token_state.hedge_execution_quality_score,
+                        "hedge_covariance": token_state.hedge_covariance,
+                        "hedge_correlation": token_state.hedge_correlation,
+                        "hedge_beta_raw": token_state.hedge_beta_raw,
+                        "hedge_beta": token_state.hedge_beta,
+                        "hedge_beta_shrunk": token_state.hedge_beta_shrunk,
+                        "hedge_beta_clipped": token_state.hedge_beta_clipped,
+                        "hedge_covariance_sample_count": token_state.hedge_covariance_sample_count,
+                        "hedge_covariance_state": token_state.hedge_covariance_state,
+                        "hedge_covariance_confidence": token_state.hedge_covariance_confidence,
+                        "hedge_pair_score": token_state.hedge_pair_score,
+                        "hedgeability_tier": token_state.hedgeability_tier,
+                        "hedge_structural_score": token_state.hedge_structural_score,
+                        "hedge_covariance_score": token_state.hedge_covariance_score,
+                        "hedge_beta_stability_score": token_state.hedge_beta_stability_score,
+                        "hedge_execution_availability_score": token_state.hedge_execution_availability_score,
+                        "hedge_realized_outcome_score": token_state.hedge_realized_outcome_score,
+                        "hedge_relation_confidence_state": token_state.hedge_relation_confidence_state,
+                        "hedge_permission_state": token_state.hedge_permission_state,
+                        "hedge_rejection_reason": token_state.hedge_rejection_reason,
+                        "hedge_model_state": token_state.hedge_model_state,
+                        "hedge_realized_improvement_state": token_state.hedge_realized_improvement_state,
+                        "hedge_success_window_ms": token_state.hedge_success_window_ms,
+                        "hedge_failed_cooldown_until_ms": token_state.hedge_failed_cooldown_until_ms,
+                        "hedge_rejection_reasons": list(token_state.hedge_rejection_reasons or ()),
+                        "current_equity": risk.current_equity,
+                        "reference_equity": risk.reference_equity,
+                        "risk_state": risk.risk_state,
+                        "stale_state": risk.stale_state,
+                        "exit_mode": risk.exit_mode,
+                        "exit_escalation_reason": risk.exit_escalation_reason,
+                        "stop_open_triggered": risk.stop_open_triggered,
+                        "force_flat_triggered": risk.force_flat_triggered,
+                        "cross_armed": risk.cross_armed,
+                        "maker_exit_deadline_ms": risk.maker_exit_deadline_ms,
+                        "flatten_only_triggered": risk.flatten_only_triggered,
+                        "market_exposure_notional": risk.market_exposure_notional,
+                        "event_exposure_notional": risk.event_exposure_notional,
+                        "market_unrealized_pnl": risk.market_unrealized_pnl,
+                        "event_unrealized_pnl": risk.event_unrealized_pnl,
+                        "portfolio_total_pnl": risk.portfolio_total_pnl,
+                        "time_to_expiry_ms": risk.time_to_expiry_ms,
+                        "stale_after_ms": risk.stale_after_ms,
+                        "per_trade_loss_budget": risk.per_trade_loss_budget,
+                        "max_buy_size": risk.max_buy_size,
                     },
                 )
             )

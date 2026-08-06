@@ -47,6 +47,7 @@ class StandaloneTelemetry:
             "orders": self.tapes_dir / "orders.jsonl",
             "fills": self.tapes_dir / "fills.jsonl",
             "pnl": self.tapes_dir / "pnl.jsonl",
+            "hedge_candidates": self.tapes_dir / "hedge_candidates.jsonl",
         }
         self._pending_markouts: Dict[str, Dict[str, Any]] = {}
         self._last_summary: Dict[str, Any] = {}
@@ -236,6 +237,7 @@ class StandaloneTelemetry:
     def _record_decision(self, *, now_ms: int, market_slug: Optional[str], token_decision: TokenCycleDecision) -> None:
         action = _decision_action(token_decision)
         reasons = _decision_reasons(token_decision)
+        hedge_metadata = dict(token_decision.desired_quotes[0].metadata or {}) if token_decision.desired_quotes else {}
         expected_edge = None
         expected_cost = None
         if token_decision.metrics is not None and token_decision.metrics.best_bid is not None and token_decision.metrics.best_ask is not None:
@@ -250,6 +252,7 @@ class StandaloneTelemetry:
             "quote_plan": asdict(token_decision.quote_plan) if token_decision.quote_plan is not None else None,
             "size_plan": asdict(token_decision.size_plan) if token_decision.size_plan is not None else None,
             "risk_decision": asdict(token_decision.risk_decision) if token_decision.risk_decision is not None else None,
+            "hedge_context": hedge_metadata,
             "desired_quotes": [
                 {
                     "quote_key": quote.quote_key,
@@ -271,6 +274,40 @@ class StandaloneTelemetry:
             "p_hat": None,
             "expected_edge": expected_edge,
             "expected_cost": expected_cost,
+            "control_state": str(hedge_metadata.get("control_state") or "NORMAL"),
+            "hedge_action": str(hedge_metadata.get("hedge_action") or "NONE"),
+            "hedge_cluster_id": hedge_metadata.get("hedge_cluster_id"),
+            "hedge_action_reason": hedge_metadata.get("hedge_action_reason"),
+            "hedge_market_id": hedge_metadata.get("hedge_market_id"),
+            "hedge_target_token_id": hedge_metadata.get("hedge_target_token_id"),
+            "hedge_target_side": hedge_metadata.get("hedge_target_side"),
+            "hedge_preferred_side": hedge_metadata.get("hedge_preferred_side"),
+            "hedge_ratio": _float_or_none(hedge_metadata.get("hedge_ratio")),
+            "hedge_quality_score": _float_or_none(hedge_metadata.get("hedge_quality_score")),
+            "hedge_execution_quality_score": _float_or_none(hedge_metadata.get("hedge_execution_quality_score")),
+            "hedge_covariance": _float_or_none(hedge_metadata.get("hedge_covariance")),
+            "hedge_correlation": _float_or_none(hedge_metadata.get("hedge_correlation")),
+            "hedge_beta_raw": _float_or_none(hedge_metadata.get("hedge_beta_raw")),
+            "hedge_beta": _float_or_none(hedge_metadata.get("hedge_beta")),
+            "hedge_beta_shrunk": _float_or_none(hedge_metadata.get("hedge_beta_shrunk")),
+            "hedge_beta_clipped": _float_or_none(hedge_metadata.get("hedge_beta_clipped")),
+            "hedge_covariance_sample_count": _int_or_none(hedge_metadata.get("hedge_covariance_sample_count")),
+            "hedge_covariance_state": hedge_metadata.get("hedge_covariance_state"),
+            "hedge_covariance_confidence": hedge_metadata.get("hedge_covariance_confidence"),
+            "hedge_pair_score": _float_or_none(hedge_metadata.get("hedge_pair_score")),
+            "hedgeability_tier": hedge_metadata.get("hedgeability_tier"),
+            "hedge_structural_score": _float_or_none(hedge_metadata.get("hedge_structural_score")),
+            "hedge_covariance_score": _float_or_none(hedge_metadata.get("hedge_covariance_score")),
+            "hedge_beta_stability_score": _float_or_none(hedge_metadata.get("hedge_beta_stability_score")),
+            "hedge_execution_availability_score": _float_or_none(hedge_metadata.get("hedge_execution_availability_score")),
+            "hedge_realized_outcome_score": _float_or_none(hedge_metadata.get("hedge_realized_outcome_score")),
+            "hedge_relation_confidence_state": hedge_metadata.get("hedge_relation_confidence_state"),
+            "hedge_permission_state": hedge_metadata.get("hedge_permission_state"),
+            "hedge_rejection_reason": hedge_metadata.get("hedge_rejection_reason"),
+            "hedge_model_state": hedge_metadata.get("hedge_model_state"),
+            "hedge_realized_improvement_state": hedge_metadata.get("hedge_realized_improvement_state"),
+            "hedge_success_window_ms": _int_or_none(hedge_metadata.get("hedge_success_window_ms")),
+            "hedge_failed_cooldown_until_ms": _int_or_none(hedge_metadata.get("hedge_failed_cooldown_until_ms")),
             "policy_json": json.dumps(payload, sort_keys=True),
         }
         self._queues["decisions"].append(row)
@@ -370,10 +407,14 @@ class StandaloneTelemetry:
         fill: Dict[str, Any],
         broker_stats: Dict[str, Any],
     ) -> None:
+        placement = dict(fill.get("placement_metadata") or {})
         payload = {
             "market_slug": market_slug,
             "fee_bps": fill.get("fee_bps"),
             "fee_usdc": fill.get("fee_usdc"),
+            "fee_source": fill.get("fee_source"),
+            "fee_type": fill.get("fee_type"),
+            "fee_multiplier": fill.get("fee_multiplier"),
             "gross_notional": fill.get("gross_notional"),
             "net_notional": fill.get("net_notional"),
             "liquidity_mode": fill.get("liquidity_mode"),
@@ -381,7 +422,41 @@ class StandaloneTelemetry:
             "realized_gross_pnl_delta": fill.get("realized_gross_pnl_delta"),
             "realized_net_pnl_delta": fill.get("realized_net_pnl_delta"),
             "inventory_after_fill": fill.get("inventory_after_fill"),
-            "placement_metadata": fill.get("placement_metadata"),
+            "placement_metadata": placement,
+            "control_state": placement.get("control_state"),
+            "hedge_action": placement.get("hedge_action"),
+            "hedge_cluster_id": placement.get("hedge_cluster_id"),
+            "hedge_action_reason": placement.get("hedge_action_reason"),
+            "hedge_market_id": placement.get("hedge_market_id"),
+            "hedge_target_token_id": placement.get("hedge_target_token_id"),
+            "hedge_target_side": placement.get("hedge_target_side"),
+            "hedge_preferred_side": placement.get("hedge_preferred_side"),
+            "hedge_ratio": placement.get("hedge_ratio"),
+            "hedge_quality_score": placement.get("hedge_quality_score"),
+            "hedge_execution_quality_score": placement.get("hedge_execution_quality_score"),
+            "hedge_covariance": placement.get("hedge_covariance"),
+            "hedge_correlation": placement.get("hedge_correlation"),
+            "hedge_beta_raw": placement.get("hedge_beta_raw"),
+            "hedge_beta": placement.get("hedge_beta"),
+            "hedge_beta_shrunk": placement.get("hedge_beta_shrunk"),
+            "hedge_beta_clipped": placement.get("hedge_beta_clipped"),
+            "hedge_covariance_sample_count": placement.get("hedge_covariance_sample_count"),
+            "hedge_covariance_state": placement.get("hedge_covariance_state"),
+            "hedge_covariance_confidence": placement.get("hedge_covariance_confidence"),
+            "hedge_pair_score": placement.get("hedge_pair_score"),
+            "hedgeability_tier": placement.get("hedgeability_tier"),
+            "hedge_structural_score": placement.get("hedge_structural_score"),
+            "hedge_covariance_score": placement.get("hedge_covariance_score"),
+            "hedge_beta_stability_score": placement.get("hedge_beta_stability_score"),
+            "hedge_execution_availability_score": placement.get("hedge_execution_availability_score"),
+            "hedge_realized_outcome_score": placement.get("hedge_realized_outcome_score"),
+            "hedge_relation_confidence_state": placement.get("hedge_relation_confidence_state"),
+            "hedge_permission_state": placement.get("hedge_permission_state"),
+            "hedge_rejection_reason": placement.get("hedge_rejection_reason"),
+            "hedge_model_state": placement.get("hedge_model_state"),
+            "hedge_realized_improvement_state": placement.get("hedge_realized_improvement_state"),
+            "hedge_success_window_ms": placement.get("hedge_success_window_ms"),
+            "hedge_failed_cooldown_until_ms": placement.get("hedge_failed_cooldown_until_ms"),
         }
         row = {
             "ts_ms": int(fill.get("ts_ms") or now_ms),
@@ -391,12 +466,44 @@ class StandaloneTelemetry:
             "side": fill.get("side"),
             "fill_price": fill.get("price"),
             "fill_qty": fill.get("size"),
+            "control_state": str(placement.get("control_state") or "NORMAL"),
+            "hedge_action": str(placement.get("hedge_action") or "NONE"),
+            "hedge_cluster_id": placement.get("hedge_cluster_id"),
+            "hedge_action_reason": placement.get("hedge_action_reason"),
+            "hedge_market_id": placement.get("hedge_market_id"),
+            "hedge_target_token_id": placement.get("hedge_target_token_id"),
+            "hedge_target_side": placement.get("hedge_target_side"),
+            "hedge_preferred_side": placement.get("hedge_preferred_side"),
+            "hedge_ratio": _float_or_none(placement.get("hedge_ratio")),
+            "hedge_quality_score": _float_or_none(placement.get("hedge_quality_score")),
+            "hedge_execution_quality_score": _float_or_none(placement.get("hedge_execution_quality_score")),
+            "hedge_covariance": _float_or_none(placement.get("hedge_covariance")),
+            "hedge_correlation": _float_or_none(placement.get("hedge_correlation")),
+            "hedge_beta_raw": _float_or_none(placement.get("hedge_beta_raw")),
+            "hedge_beta": _float_or_none(placement.get("hedge_beta")),
+            "hedge_beta_shrunk": _float_or_none(placement.get("hedge_beta_shrunk")),
+            "hedge_beta_clipped": _float_or_none(placement.get("hedge_beta_clipped")),
+            "hedge_covariance_sample_count": _int_or_none(placement.get("hedge_covariance_sample_count")),
+            "hedge_covariance_state": placement.get("hedge_covariance_state"),
+            "hedge_covariance_confidence": placement.get("hedge_covariance_confidence"),
+            "hedge_pair_score": _float_or_none(placement.get("hedge_pair_score")),
+            "hedgeability_tier": placement.get("hedgeability_tier"),
+            "hedge_structural_score": _float_or_none(placement.get("hedge_structural_score")),
+            "hedge_covariance_score": _float_or_none(placement.get("hedge_covariance_score")),
+            "hedge_beta_stability_score": _float_or_none(placement.get("hedge_beta_stability_score")),
+            "hedge_execution_availability_score": _float_or_none(placement.get("hedge_execution_availability_score")),
+            "hedge_realized_outcome_score": _float_or_none(placement.get("hedge_realized_outcome_score")),
+            "hedge_relation_confidence_state": placement.get("hedge_relation_confidence_state"),
+            "hedge_permission_state": placement.get("hedge_permission_state"),
+            "hedge_rejection_reason": placement.get("hedge_rejection_reason"),
+            "hedge_model_state": placement.get("hedge_model_state"),
+            "hedge_realized_improvement_state": placement.get("hedge_realized_improvement_state"),
+            "hedge_success_window_ms": _int_or_none(placement.get("hedge_success_window_ms")),
+            "hedge_failed_cooldown_until_ms": _int_or_none(placement.get("hedge_failed_cooldown_until_ms")),
             "payload_json": json.dumps(payload, sort_keys=True),
         }
         self._queues["fills"].append(row)
         self._append_tape("fills", row)
-
-        placement = dict(fill.get("placement_metadata") or {})
         mid_at_placement = _float_or_none(placement.get("mid"))
         book = self._book_manager.get_book(str(fill.get("token_id") or ""))
         mid_at_fill = _float_or_none(book.mid_price if book is not None else None)
@@ -413,11 +520,48 @@ class StandaloneTelemetry:
             "market_slug": market_slug,
             "fee_bps": fee_bps,
             "fee_usdc": fill.get("fee_usdc"),
+            "fee_source": fill.get("fee_source"),
+            "fee_type": fill.get("fee_type"),
+            "fee_multiplier": fill.get("fee_multiplier"),
             "gross_notional": fill.get("gross_notional"),
             "net_notional": fill.get("net_notional"),
             "liquidity_mode": fill.get("liquidity_mode"),
             "fill_trigger": fill.get("fill_trigger"),
             "quote_mode": placement.get("quote_mode"),
+            "control_state": placement.get("control_state"),
+            "hedge_action": placement.get("hedge_action"),
+            "hedge_cluster_id": placement.get("hedge_cluster_id"),
+            "hedge_action_reason": placement.get("hedge_action_reason"),
+            "hedge_market_id": placement.get("hedge_market_id"),
+            "hedge_target_token_id": placement.get("hedge_target_token_id"),
+            "hedge_target_side": placement.get("hedge_target_side"),
+            "hedge_preferred_side": placement.get("hedge_preferred_side"),
+            "hedge_ratio": placement.get("hedge_ratio"),
+            "hedge_quality_score": placement.get("hedge_quality_score"),
+            "hedge_execution_quality_score": placement.get("hedge_execution_quality_score"),
+            "hedge_covariance": placement.get("hedge_covariance"),
+            "hedge_correlation": placement.get("hedge_correlation"),
+            "hedge_beta_raw": placement.get("hedge_beta_raw"),
+            "hedge_beta": placement.get("hedge_beta"),
+            "hedge_beta_shrunk": placement.get("hedge_beta_shrunk"),
+            "hedge_beta_clipped": placement.get("hedge_beta_clipped"),
+            "hedge_covariance_sample_count": placement.get("hedge_covariance_sample_count"),
+            "hedge_covariance_state": placement.get("hedge_covariance_state"),
+            "hedge_covariance_confidence": placement.get("hedge_covariance_confidence"),
+            "hedge_pair_score": placement.get("hedge_pair_score"),
+            "hedgeability_tier": placement.get("hedgeability_tier"),
+            "hedge_structural_score": placement.get("hedge_structural_score"),
+            "hedge_covariance_score": placement.get("hedge_covariance_score"),
+            "hedge_beta_stability_score": placement.get("hedge_beta_stability_score"),
+            "hedge_execution_availability_score": placement.get("hedge_execution_availability_score"),
+            "hedge_realized_outcome_score": placement.get("hedge_realized_outcome_score"),
+            "hedge_relation_confidence_state": placement.get("hedge_relation_confidence_state"),
+            "hedge_permission_state": placement.get("hedge_permission_state"),
+            "hedge_rejection_reason": placement.get("hedge_rejection_reason"),
+            "hedge_model_state": placement.get("hedge_model_state"),
+            "hedge_realized_improvement_state": placement.get("hedge_realized_improvement_state"),
+            "hedge_success_window_ms": placement.get("hedge_success_window_ms"),
+            "hedge_failed_cooldown_until_ms": placement.get("hedge_failed_cooldown_until_ms"),
             "best_bid_at_placement": placement.get("best_bid"),
             "best_ask_at_placement": placement.get("best_ask"),
             "spread_bps_at_placement": placement.get("spread_bps"),
@@ -520,6 +664,11 @@ class StandaloneTelemetry:
         per_token_quote_stats = runner.per_token_quote_stats if hasattr(runner, "per_token_quote_stats") else {}
         payload = {
             "runner": asdict(runner_status),
+            "selection": getattr(runner_status, "selection", {}),
+            "active_market_health": getattr(runner_status, "active_market_health", {}),
+            "cluster_exposure": getattr(runner_status, "cluster_exposure", {}),
+            "cluster_hedge": getattr(runner_status, "cluster_hedge", {}),
+            "control_state": getattr(runner_status, "control_state", {}),
             "feed": dict(feed_status),
             "broker_stats": broker_stats,
             "merge_stats": merge_stats,
@@ -527,6 +676,7 @@ class StandaloneTelemetry:
             "per_token_quote_stats": per_token_quote_stats,
             "config": config,
         }
+        self._record_hedge_candidates(now_ms=now_ms, runner_status=runner_status)
         row = {
             "as_of_ts": now_ms,
             "is_frozen": 1 if bool(reasons) else 0,
@@ -545,6 +695,183 @@ class StandaloneTelemetry:
                 token_id=str(token_id),
                 broker_stats=broker_stats,
             )
+
+    def _record_hedge_candidates(self, *, now_ms: int, runner_status: Any) -> None:
+        cluster_hedge = getattr(runner_status, "cluster_hedge", {})
+        if not isinstance(cluster_hedge, dict):
+            return
+        cluster_exposure = getattr(runner_status, "cluster_exposure", {})
+        exposure_by_cluster: Dict[str, Dict[str, Any]] = {}
+        if isinstance(cluster_exposure, dict):
+            for cluster in list(cluster_exposure.get("clusters") or []):
+                if not isinstance(cluster, dict):
+                    continue
+                cluster_id = str(cluster.get("cluster_id") or "").strip()
+                if cluster_id:
+                    exposure_by_cluster[cluster_id] = cluster
+        for cluster in list(cluster_hedge.get("clusters") or []):
+            if not isinstance(cluster, dict):
+                continue
+            cluster_id = str(cluster.get("cluster_id") or "").strip()
+            if not cluster_id:
+                continue
+            exposure = exposure_by_cluster.get(cluster_id, {})
+            candidate_summary = dict(cluster.get("candidate_summary") or {})
+            rejection_reasons = [str(item) for item in (cluster.get("rejection_reasons") or []) if item not in (None, "")]
+            affected_market_ids = [str(item) for item in (cluster.get("affected_market_ids") or []) if item not in (None, "")]
+            candidate_state = str(cluster.get("candidate_state") or "").strip().lower()
+            if not candidate_state:
+                candidate_state = "rejected" if rejection_reasons else ("accepted" if str(cluster.get("action") or "").upper() == "HEDGE" else "deferred")
+            hedge_quality_score = _float_or_none(cluster.get("hedge_quality_score"))
+            hedge_execution_quality_score = _float_or_none(cluster.get("hedge_execution_quality_score"))
+            hedge_covariance = _float_or_none(cluster.get("hedge_covariance"))
+            hedge_correlation = _float_or_none(cluster.get("hedge_correlation"))
+            hedge_beta_raw = _float_or_none(cluster.get("hedge_beta_raw"))
+            hedge_beta = _float_or_none(cluster.get("hedge_beta"))
+            hedge_beta_shrunk = _float_or_none(cluster.get("hedge_beta_shrunk"))
+            hedge_beta_clipped = _float_or_none(cluster.get("hedge_beta_clipped"))
+            hedge_covariance_sample_count = _int_or_none(cluster.get("hedge_covariance_sample_count"))
+            hedge_covariance_state = str(cluster.get("hedge_covariance_state") or "").strip() or "unknown"
+            hedge_covariance_confidence = str(cluster.get("hedge_covariance_confidence") or "").strip() or "unknown"
+            hedge_pair_score = _float_or_none(cluster.get("hedge_pair_score"))
+            hedgeability_tier = str(cluster.get("hedgeability_tier") or "").strip() or "not_hedgeable"
+            hedge_structural_score = _float_or_none(cluster.get("hedge_structural_score"))
+            hedge_covariance_score = _float_or_none(cluster.get("hedge_covariance_score"))
+            hedge_beta_stability_score = _float_or_none(cluster.get("hedge_beta_stability_score"))
+            hedge_execution_availability_score = _float_or_none(cluster.get("hedge_execution_availability_score"))
+            hedge_realized_outcome_score = _float_or_none(cluster.get("hedge_realized_outcome_score"))
+            hedge_relation_confidence_state = str(cluster.get("hedge_relation_confidence_state") or "").strip() or "unknown"
+            hedge_permission_state = str(cluster.get("hedge_permission_state") or "").strip() or candidate_state
+            hedge_rejection_reason = cluster.get("hedge_rejection_reason")
+            hedge_model_state = str(cluster.get("hedge_model_state") or "").strip() or candidate_state
+            hedge_realized_improvement_state = str(cluster.get("hedge_realized_improvement_state") or "").strip() or "pending"
+            inventory_quality_score = _float_or_none(
+                cluster.get("inventory_market_quality_score")
+                if cluster.get("inventory_market_quality_score") not in (None, "")
+                else exposure.get("dominant_inventory_market_quality_score")
+            )
+            quality_gap = _float_or_none(cluster.get("hedge_quality_gap"))
+            if quality_gap is None and hedge_quality_score is not None and inventory_quality_score is not None:
+                quality_gap = hedge_quality_score - inventory_quality_score
+            quality_gap_state = "unknown"
+            if quality_gap is not None:
+                if quality_gap > 0:
+                    quality_gap_state = "positive"
+                elif quality_gap < 0:
+                    quality_gap_state = "negative"
+                else:
+                    quality_gap_state = "flat"
+            best_candidate = dict(candidate_summary.get("best_candidate") or {})
+            best_candidate_alignment_fraction = _float_or_none(best_candidate.get("alignment_fraction"))
+            row = {
+                "ts_ms": now_ms,
+                "event_id": self._next_event_id(),
+                "cluster_id": cluster_id,
+                "action": str(cluster.get("action") or "NONE"),
+                "candidate_state": candidate_state,
+                "control_state": str(cluster.get("control_state") or "NORMAL"),
+                "action_reason": cluster.get("action_reason"),
+                "dominant_side": cluster.get("dominant_side"),
+                "hedge_market_id": cluster.get("hedge_market_id"),
+                "hedge_target_token_id": cluster.get("hedge_target_token_id"),
+                "hedge_target_side": cluster.get("hedge_target_side"),
+                "hedge_ratio": _float_or_none(cluster.get("hedge_ratio")),
+                "inventory_market_quality_score": inventory_quality_score,
+                "hedge_quality_score": hedge_quality_score,
+                "hedge_execution_quality_score": hedge_execution_quality_score,
+                "hedge_quality_gap": quality_gap,
+                "hedge_covariance": hedge_covariance,
+                "hedge_correlation": hedge_correlation,
+                "hedge_beta_raw": hedge_beta_raw,
+                "hedge_beta": hedge_beta,
+                "hedge_beta_shrunk": hedge_beta_shrunk,
+                "hedge_beta_clipped": hedge_beta_clipped,
+                "hedge_covariance_sample_count": hedge_covariance_sample_count,
+                "hedge_covariance_state": hedge_covariance_state,
+                "hedge_covariance_confidence": hedge_covariance_confidence,
+                "hedge_pair_score": hedge_pair_score,
+                "hedgeability_tier": hedgeability_tier,
+                "hedge_structural_score": hedge_structural_score,
+                "hedge_covariance_score": hedge_covariance_score,
+                "hedge_beta_stability_score": hedge_beta_stability_score,
+                "hedge_execution_availability_score": hedge_execution_availability_score,
+                "hedge_realized_outcome_score": hedge_realized_outcome_score,
+                "hedge_relation_confidence_state": hedge_relation_confidence_state,
+                "hedge_permission_state": hedge_permission_state,
+                "hedge_rejection_reason": hedge_rejection_reason,
+                "hedge_model_state": hedge_model_state,
+                "hedge_realized_improvement_state": hedge_realized_improvement_state,
+                "hedge_success_window_ms": _int_or_none(cluster.get("hedge_success_window_ms")),
+                "hedge_failed_cooldown_until_ms": _int_or_none(cluster.get("hedge_failed_cooldown_until_ms")),
+                "candidate_count": _int_or_none(candidate_summary.get("candidate_count")),
+                "accepted_count": _int_or_none(candidate_summary.get("accepted_count")),
+                "rejection_counts_json": json.dumps(candidate_summary.get("rejection_counts") or {}, sort_keys=True),
+                "best_candidate_market_id": best_candidate.get("market_id"),
+                "best_candidate_token_id": best_candidate.get("token_id"),
+                "best_candidate_quality_score": _float_or_none(best_candidate.get("quality_score")),
+                "best_candidate_quality_gap": _float_or_none(best_candidate.get("quality_gap")),
+                "best_candidate_alignment_fraction": best_candidate_alignment_fraction,
+                "search_profile": candidate_summary.get("search_profile"),
+                "proof_only_lane": 1 if bool(candidate_summary.get("proof_only_lane")) else 0,
+                "proof_only_bucket_distance": _int_or_none(candidate_summary.get("proof_only_bucket_distance")),
+                "proof_only_expiry_slack_ms": _int_or_none(candidate_summary.get("proof_only_expiry_slack_ms")),
+                "rejection_reasons": json.dumps(sorted(rejection_reasons)),
+                "affected_market_ids": json.dumps(sorted(set(affected_market_ids))),
+                "token_directives_json": json.dumps(cluster.get("token_directives") or [], sort_keys=True),
+                "quality_gap_state": quality_gap_state,
+                "payload_json": json.dumps(
+                    {
+                        "cluster": cluster,
+                        "cluster_exposure": exposure,
+                        "quality_gap_state": quality_gap_state,
+                        "hedge_covariance_state": hedge_covariance_state,
+                        "hedge_pair_score": hedge_pair_score,
+                        "hedgeability_tier": hedgeability_tier,
+                        "hedge_permission_state": hedge_permission_state,
+                        "hedge_model_state": hedge_model_state,
+                        "hedge_realized_improvement_state": hedge_realized_improvement_state,
+                    },
+                    sort_keys=True,
+                ),
+            }
+            self._queues["hedge_candidates"].append(row)
+            self._append_tape("hedge_candidates", row)
+            for relation in list(cluster.get("pair_relations") or []):
+                if not isinstance(relation, dict):
+                    continue
+                relation_row = {
+                    "ts_ms": now_ms,
+                    "event_id": self._next_event_id(),
+                    "cluster_id": cluster_id,
+                    "inventory_market_id": relation.get("inventory_market_id"),
+                    "hedge_market_id": relation.get("hedge_market_id"),
+                    "underlying_symbol": relation.get("underlying_symbol"),
+                    "event_family": relation.get("event_family"),
+                    "expiry_bucket": relation.get("expiry_bucket"),
+                    "contract_family": relation.get("contract_family"),
+                    "structural_score": _float_or_none(relation.get("structural_score")),
+                    "covariance_score": _float_or_none(relation.get("covariance_score")),
+                    "beta_stability_score": _float_or_none(relation.get("beta_stability_score")),
+                    "execution_availability_score": _float_or_none(relation.get("execution_availability_score")),
+                    "realized_outcome_score": _float_or_none(relation.get("realized_outcome_score")),
+                    "pair_score": _float_or_none(relation.get("pair_score")),
+                    "hedgeability_tier": relation.get("hedgeability_tier"),
+                    "confidence_state": relation.get("confidence_state"),
+                    "basis_accumulation_flag": 1 if bool(relation.get("basis_accumulation_flag")) else 0,
+                    "accepted_hedge_count": _int_or_none(relation.get("accepted_hedge_count")),
+                    "successful_hedge_count": _int_or_none(relation.get("successful_hedge_count")),
+                    "failed_hedge_count": _int_or_none(relation.get("failed_hedge_count")),
+                    "execution_observation_count": _int_or_none(relation.get("execution_observation_count")),
+                    "execution_ok_count": _int_or_none(relation.get("execution_ok_count")),
+                    "covariance_state": relation.get("covariance_state"),
+                    "covariance_confidence": relation.get("covariance_confidence"),
+                    "execution_state": relation.get("execution_state"),
+                    "candidate_state": relation.get("candidate_state"),
+                    "rejection_reason": relation.get("rejection_reason"),
+                    "last_updated_at_ms": _int_or_none(relation.get("last_updated_at_ms")),
+                    "payload_json": json.dumps(relation, sort_keys=True),
+                }
+                self._queues["hedge_pair_relations"].append(relation_row)
 
     def _write_run_summary(self, *, final: bool) -> None:
         summary = self._summary_payload()
@@ -569,6 +896,9 @@ class StandaloneTelemetry:
         decisions = int(scalar("SELECT COUNT(*) FROM decisions") or 0)
         placed_orders = int(scalar("SELECT COUNT(*) FROM orders WHERE status IN ('open', 'replace')") or 0)
         canceled_orders = int(scalar("SELECT COUNT(*) FROM orders WHERE status = 'canceled'") or 0)
+        control_commands = int(scalar("SELECT COUNT(*) FROM control_commands") or 0)
+        applied_commands = int(scalar("SELECT COUNT(*) FROM control_commands WHERE status = 'applied'") or 0)
+        rejected_commands = int(scalar("SELECT COUNT(*) FROM control_commands WHERE status = 'rejected'") or 0)
         fill_rate = _safe_div(fills, placed_orders)
         total_pnl = realized_net + unrealized
         per_token_rows = cur.execute(
@@ -622,12 +952,18 @@ class StandaloneTelemetry:
             cycle_summary=cycle_summary,
             loss_source_hints=loss_source_hints,
         )
+        risk_proof = _risk_proof_summary(cur)
+        hedge_summary = _hedge_summary(cur)
+        hedge_candidate_summary = _hedge_candidate_summary(cur)
         return {
             "runtime_db_path": self.db_path.as_posix(),
             "decisions": decisions,
             "placed_orders": placed_orders,
             "canceled_orders": canceled_orders,
             "fills": fills,
+            "control_commands": control_commands,
+            "applied_commands": applied_commands,
+            "rejected_commands": rejected_commands,
             "fill_rate": fill_rate,
             "realized_gross_pnl": realized_gross,
             "realized_net_pnl": realized_net,
@@ -639,6 +975,9 @@ class StandaloneTelemetry:
             "cycle_summary": cycle_summary,
             "execution_quality": execution_quality,
             "phase0_acceptance": phase0_acceptance,
+            "risk_proof": risk_proof,
+            "hedge_summary": hedge_summary,
+            "hedge_candidate_summary": hedge_candidate_summary,
             "updated_at_ms": _now_ms(),
         }
 
@@ -668,6 +1007,40 @@ class StandaloneTelemetry:
               p_hat REAL,
               expected_edge REAL,
               expected_cost REAL,
+              control_state TEXT,
+              hedge_action TEXT,
+              hedge_cluster_id TEXT,
+              hedge_action_reason TEXT,
+              hedge_market_id TEXT,
+              hedge_target_token_id TEXT,
+              hedge_target_side TEXT,
+              hedge_preferred_side TEXT,
+              hedge_ratio REAL,
+              hedge_quality_score REAL,
+              hedge_execution_quality_score REAL,
+              hedge_covariance REAL,
+              hedge_correlation REAL,
+              hedge_beta_raw REAL,
+              hedge_beta REAL,
+              hedge_beta_shrunk REAL,
+              hedge_beta_clipped REAL,
+              hedge_covariance_sample_count INTEGER,
+              hedge_covariance_state TEXT,
+              hedge_covariance_confidence TEXT,
+              hedge_pair_score REAL,
+              hedgeability_tier TEXT,
+              hedge_structural_score REAL,
+              hedge_covariance_score REAL,
+              hedge_beta_stability_score REAL,
+              hedge_execution_availability_score REAL,
+              hedge_realized_outcome_score REAL,
+              hedge_relation_confidence_state TEXT,
+              hedge_permission_state TEXT,
+              hedge_rejection_reason TEXT,
+              hedge_model_state TEXT,
+              hedge_realized_improvement_state TEXT,
+              hedge_success_window_ms INTEGER,
+              hedge_failed_cooldown_until_ms INTEGER,
               policy_json TEXT
             );
             CREATE TABLE IF NOT EXISTS orders (
@@ -693,6 +1066,40 @@ class StandaloneTelemetry:
               side TEXT,
               fill_price REAL,
               fill_qty REAL,
+              control_state TEXT,
+              hedge_action TEXT,
+              hedge_cluster_id TEXT,
+              hedge_action_reason TEXT,
+              hedge_market_id TEXT,
+              hedge_target_token_id TEXT,
+              hedge_target_side TEXT,
+              hedge_preferred_side TEXT,
+              hedge_ratio REAL,
+              hedge_quality_score REAL,
+              hedge_execution_quality_score REAL,
+              hedge_covariance REAL,
+              hedge_correlation REAL,
+              hedge_beta_raw REAL,
+              hedge_beta REAL,
+              hedge_beta_shrunk REAL,
+              hedge_beta_clipped REAL,
+              hedge_covariance_sample_count INTEGER,
+              hedge_covariance_state TEXT,
+              hedge_covariance_confidence TEXT,
+              hedge_pair_score REAL,
+              hedgeability_tier TEXT,
+              hedge_structural_score REAL,
+              hedge_covariance_score REAL,
+              hedge_beta_stability_score REAL,
+              hedge_execution_availability_score REAL,
+              hedge_realized_outcome_score REAL,
+              hedge_relation_confidence_state TEXT,
+              hedge_permission_state TEXT,
+              hedge_rejection_reason TEXT,
+              hedge_model_state TEXT,
+              hedge_realized_improvement_state TEXT,
+              hedge_success_window_ms INTEGER,
+              hedge_failed_cooldown_until_ms INTEGER,
               payload_json TEXT
             );
             CREATE TABLE IF NOT EXISTS open_orders_snapshot (
@@ -764,9 +1171,287 @@ class StandaloneTelemetry:
               quote_mode TEXT,
               payload_json TEXT
             );
+            CREATE TABLE IF NOT EXISTS hedge_candidates (
+              ts_ms INTEGER,
+              event_id INTEGER,
+              cluster_id TEXT,
+              action TEXT,
+              candidate_state TEXT,
+              control_state TEXT,
+              action_reason TEXT,
+              dominant_side TEXT,
+              hedge_market_id TEXT,
+              hedge_target_token_id TEXT,
+              hedge_target_side TEXT,
+              hedge_ratio REAL,
+              inventory_market_quality_score REAL,
+              hedge_quality_score REAL,
+              hedge_execution_quality_score REAL,
+              hedge_quality_gap REAL,
+              hedge_covariance REAL,
+              hedge_correlation REAL,
+              hedge_beta_raw REAL,
+              hedge_beta REAL,
+              hedge_beta_shrunk REAL,
+              hedge_beta_clipped REAL,
+              hedge_covariance_sample_count INTEGER,
+              hedge_covariance_state TEXT,
+              hedge_covariance_confidence TEXT,
+              hedge_pair_score REAL,
+              hedgeability_tier TEXT,
+              hedge_structural_score REAL,
+              hedge_covariance_score REAL,
+              hedge_beta_stability_score REAL,
+              hedge_execution_availability_score REAL,
+              hedge_realized_outcome_score REAL,
+              hedge_relation_confidence_state TEXT,
+              hedge_permission_state TEXT,
+              hedge_rejection_reason TEXT,
+              hedge_model_state TEXT,
+              hedge_realized_improvement_state TEXT,
+              hedge_success_window_ms INTEGER,
+              hedge_failed_cooldown_until_ms INTEGER,
+              candidate_count INTEGER,
+              accepted_count INTEGER,
+              rejection_counts_json TEXT,
+              best_candidate_market_id TEXT,
+              best_candidate_token_id TEXT,
+              best_candidate_quality_score REAL,
+              best_candidate_quality_gap REAL,
+              best_candidate_alignment_fraction REAL,
+              search_profile TEXT,
+              proof_only_lane INTEGER,
+              proof_only_bucket_distance INTEGER,
+              proof_only_expiry_slack_ms INTEGER,
+              rejection_reasons TEXT,
+              affected_market_ids TEXT,
+              token_directives_json TEXT,
+              quality_gap_state TEXT,
+              payload_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS hedge_pair_relations (
+              ts_ms INTEGER,
+              event_id INTEGER,
+              cluster_id TEXT,
+              inventory_market_id TEXT,
+              hedge_market_id TEXT,
+              underlying_symbol TEXT,
+              event_family TEXT,
+              expiry_bucket TEXT,
+              contract_family TEXT,
+              structural_score REAL,
+              covariance_score REAL,
+              beta_stability_score REAL,
+              execution_availability_score REAL,
+              realized_outcome_score REAL,
+              pair_score REAL,
+              hedgeability_tier TEXT,
+              confidence_state TEXT,
+              basis_accumulation_flag INTEGER,
+              accepted_hedge_count INTEGER,
+              successful_hedge_count INTEGER,
+              failed_hedge_count INTEGER,
+              execution_observation_count INTEGER,
+              execution_ok_count INTEGER,
+              covariance_state TEXT,
+              covariance_confidence TEXT,
+              execution_state TEXT,
+              candidate_state TEXT,
+              rejection_reason TEXT,
+              last_updated_at_ms INTEGER,
+              payload_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS control_commands (
+              command_id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              runtime_root TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              command_type TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              requested_by TEXT NOT NULL,
+              requested_at_ms INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              expires_at_ms INTEGER,
+              result_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS control_events (
+              event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              command_id TEXT NOT NULL,
+              ts_ms INTEGER NOT NULL,
+              event_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              payload_json TEXT NOT NULL
+            );
             """
         )
+        self._ensure_table_columns(
+            "decisions",
+            {
+                "control_state": "TEXT",
+                "hedge_action": "TEXT",
+                "hedge_cluster_id": "TEXT",
+                "hedge_action_reason": "TEXT",
+                "hedge_market_id": "TEXT",
+                "hedge_target_token_id": "TEXT",
+                "hedge_target_side": "TEXT",
+                "hedge_preferred_side": "TEXT",
+                "hedge_ratio": "REAL",
+                "hedge_quality_score": "REAL",
+                "hedge_execution_quality_score": "REAL",
+                "hedge_covariance": "REAL",
+                "hedge_correlation": "REAL",
+                "hedge_beta_raw": "REAL",
+                "hedge_beta": "REAL",
+                "hedge_beta_shrunk": "REAL",
+                "hedge_beta_clipped": "REAL",
+                "hedge_covariance_sample_count": "INTEGER",
+                "hedge_covariance_state": "TEXT",
+                "hedge_covariance_confidence": "TEXT",
+                "hedge_pair_score": "REAL",
+                "hedgeability_tier": "TEXT",
+                "hedge_structural_score": "REAL",
+                "hedge_covariance_score": "REAL",
+                "hedge_beta_stability_score": "REAL",
+                "hedge_execution_availability_score": "REAL",
+                "hedge_realized_outcome_score": "REAL",
+                "hedge_relation_confidence_state": "TEXT",
+                "hedge_permission_state": "TEXT",
+                "hedge_rejection_reason": "TEXT",
+                "hedge_model_state": "TEXT",
+                "hedge_realized_improvement_state": "TEXT",
+                "hedge_success_window_ms": "INTEGER",
+                "hedge_failed_cooldown_until_ms": "INTEGER",
+            },
+        )
+        self._ensure_table_columns(
+            "fills",
+            {
+                "control_state": "TEXT",
+                "hedge_action": "TEXT",
+                "hedge_cluster_id": "TEXT",
+                "hedge_action_reason": "TEXT",
+                "hedge_market_id": "TEXT",
+                "hedge_target_token_id": "TEXT",
+                "hedge_target_side": "TEXT",
+                "hedge_preferred_side": "TEXT",
+                "hedge_ratio": "REAL",
+                "hedge_quality_score": "REAL",
+                "hedge_execution_quality_score": "REAL",
+                "hedge_covariance": "REAL",
+                "hedge_correlation": "REAL",
+                "hedge_beta_raw": "REAL",
+                "hedge_beta": "REAL",
+                "hedge_beta_shrunk": "REAL",
+                "hedge_beta_clipped": "REAL",
+                "hedge_covariance_sample_count": "INTEGER",
+                "hedge_covariance_state": "TEXT",
+                "hedge_covariance_confidence": "TEXT",
+                "hedge_pair_score": "REAL",
+                "hedgeability_tier": "TEXT",
+                "hedge_structural_score": "REAL",
+                "hedge_covariance_score": "REAL",
+                "hedge_beta_stability_score": "REAL",
+                "hedge_execution_availability_score": "REAL",
+                "hedge_realized_outcome_score": "REAL",
+                "hedge_relation_confidence_state": "TEXT",
+                "hedge_permission_state": "TEXT",
+                "hedge_rejection_reason": "TEXT",
+                "hedge_model_state": "TEXT",
+                "hedge_realized_improvement_state": "TEXT",
+                "hedge_success_window_ms": "INTEGER",
+                "hedge_failed_cooldown_until_ms": "INTEGER",
+            },
+        )
+        self._ensure_table_columns(
+            "hedge_candidates",
+            {
+                "candidate_state": "TEXT",
+                "inventory_market_quality_score": "REAL",
+                "hedge_quality_gap": "REAL",
+                "hedge_execution_quality_score": "REAL",
+                "hedge_covariance": "REAL",
+                "hedge_correlation": "REAL",
+                "hedge_beta_raw": "REAL",
+                "hedge_beta": "REAL",
+                "hedge_beta_shrunk": "REAL",
+                "hedge_beta_clipped": "REAL",
+                "hedge_covariance_sample_count": "INTEGER",
+                "hedge_covariance_state": "TEXT",
+                "hedge_covariance_confidence": "TEXT",
+                "hedge_pair_score": "REAL",
+                "hedgeability_tier": "TEXT",
+                "hedge_structural_score": "REAL",
+                "hedge_covariance_score": "REAL",
+                "hedge_beta_stability_score": "REAL",
+                "hedge_execution_availability_score": "REAL",
+                "hedge_realized_outcome_score": "REAL",
+                "hedge_relation_confidence_state": "TEXT",
+                "hedge_permission_state": "TEXT",
+                "hedge_rejection_reason": "TEXT",
+                "hedge_model_state": "TEXT",
+                "hedge_realized_improvement_state": "TEXT",
+                "candidate_count": "INTEGER",
+                "accepted_count": "INTEGER",
+                "rejection_counts_json": "TEXT",
+                "best_candidate_market_id": "TEXT",
+                "best_candidate_token_id": "TEXT",
+                "best_candidate_quality_score": "REAL",
+                "best_candidate_quality_gap": "REAL",
+                "best_candidate_alignment_fraction": "REAL",
+                "search_profile": "TEXT",
+                "proof_only_lane": "INTEGER",
+                "proof_only_bucket_distance": "INTEGER",
+                "proof_only_expiry_slack_ms": "INTEGER",
+                "rejection_reasons": "TEXT",
+                "affected_market_ids": "TEXT",
+                "token_directives_json": "TEXT",
+                "quality_gap_state": "TEXT",
+            },
+        )
+        self._ensure_table_columns(
+            "hedge_pair_relations",
+            {
+                "cluster_id": "TEXT",
+                "inventory_market_id": "TEXT",
+                "hedge_market_id": "TEXT",
+                "underlying_symbol": "TEXT",
+                "event_family": "TEXT",
+                "expiry_bucket": "TEXT",
+                "contract_family": "TEXT",
+                "structural_score": "REAL",
+                "covariance_score": "REAL",
+                "beta_stability_score": "REAL",
+                "execution_availability_score": "REAL",
+                "realized_outcome_score": "REAL",
+                "pair_score": "REAL",
+                "hedgeability_tier": "TEXT",
+                "confidence_state": "TEXT",
+                "basis_accumulation_flag": "INTEGER",
+                "accepted_hedge_count": "INTEGER",
+                "successful_hedge_count": "INTEGER",
+                "failed_hedge_count": "INTEGER",
+                "execution_observation_count": "INTEGER",
+                "execution_ok_count": "INTEGER",
+                "covariance_state": "TEXT",
+                "covariance_confidence": "TEXT",
+                "execution_state": "TEXT",
+                "candidate_state": "TEXT",
+                "rejection_reason": "TEXT",
+                "last_updated_at_ms": "INTEGER",
+                "payload_json": "TEXT",
+            },
+        )
         self._cx.commit()
+
+    def _ensure_table_columns(self, table: str, columns: Dict[str, str]) -> None:
+        existing = {
+            str(row[1])
+            for row in self._cx.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for column, column_type in columns.items():
+            if column in existing:
+                continue
+            self._cx.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def _decision_action(token_decision: TokenCycleDecision) -> str:
@@ -812,6 +1497,15 @@ def _float_or_none(value: Any) -> Optional[float]:
         if value is None:
             return None
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -975,6 +1669,240 @@ def _phase0_acceptance_summary(
         "manual_tuning_review_required": bool(result == "tunable_loss"),
         "structural_blocker_detected": structural_blocker,
         "loss_source_hints": sorted(hint_set),
+    }
+
+
+def _risk_proof_summary(cur: sqlite3.Cursor) -> Dict[str, Any]:
+    decision_risk_actions: Counter[str] = Counter()
+    fill_risk_actions: Counter[str] = Counter()
+    fill_exit_modes: Counter[str] = Counter()
+    flatten_only_cycles = 0
+    kill_switch_cycles = 0
+    risk_warning_cycles = 0
+
+    for (policy_json,) in cur.execute("SELECT policy_json FROM decisions ORDER BY ts_ms ASC").fetchall():
+        try:
+            payload = json.loads(policy_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        risk_decision = payload.get("risk_decision") or {}
+        action = str(risk_decision.get("action") or "").strip()
+        if action:
+            decision_risk_actions[action] += 1
+
+    for (payload_json,) in cur.execute("SELECT payload_json FROM fills ORDER BY ts_ms ASC").fetchall():
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        risk_action = str(payload.get("risk_action") or "").strip()
+        exit_mode = str(payload.get("exit_mode") or "").strip()
+        if risk_action:
+            fill_risk_actions[risk_action] += 1
+        if exit_mode:
+            fill_exit_modes[exit_mode] += 1
+
+    for (payload_json,) in cur.execute("SELECT payload_json FROM system_state ORDER BY as_of_ts ASC").fetchall():
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        control_state = payload.get("control_state") or {}
+        if bool(control_state.get("flatten_only_mode")):
+            flatten_only_cycles += 1
+        if bool(control_state.get("kill_switch_enabled")):
+            kill_switch_cycles += 1
+        if bool(control_state.get("risk_warning_triggered")):
+            risk_warning_cycles += 1
+
+    kill_switch_applied = int(
+        cur.execute(
+            "SELECT COUNT(*) FROM control_commands WHERE command_type = 'kill_switch_on' AND status = 'applied'"
+        ).fetchone()[0]
+        or 0
+    )
+
+    return {
+        "decision_risk_actions": {key: int(decision_risk_actions[key]) for key in sorted(decision_risk_actions)},
+        "fill_risk_actions": {key: int(fill_risk_actions[key]) for key in sorted(fill_risk_actions)},
+        "fill_exit_modes": {key: int(fill_exit_modes[key]) for key in sorted(fill_exit_modes)},
+        "flatten_only_cycles": int(flatten_only_cycles),
+        "kill_switch_cycles": int(kill_switch_cycles),
+        "risk_warning_cycles": int(risk_warning_cycles),
+        "kill_switch_applied_commands": int(kill_switch_applied),
+        "stale_unwind_observed": bool(decision_risk_actions.get("STALE_UNWIND") or fill_risk_actions.get("STALE_UNWIND")),
+        "force_flat_observed": bool(decision_risk_actions.get("FORCE_FLAT") or fill_risk_actions.get("FORCE_FLAT")),
+        "day_loss_observed": bool(decision_risk_actions.get("DAY_LOSS_CAP") or fill_risk_actions.get("DAY_LOSS_CAP") or flatten_only_cycles > 0),
+        "stop_loss_observed": bool(decision_risk_actions.get("STOP_LOSS") or fill_risk_actions.get("STOP_LOSS")),
+        "take_profit_observed": bool(decision_risk_actions.get("TAKE_PROFIT") or fill_risk_actions.get("TAKE_PROFIT")),
+        "cross_exit_observed": bool(fill_exit_modes.get("cross")),
+    }
+
+
+def _hedge_summary(cur: sqlite3.Cursor) -> Dict[str, Any]:
+    decision_actions: Counter[str] = Counter()
+    decision_control_states: Counter[str] = Counter()
+    decision_targets: Counter[str] = Counter()
+    decision_clusters: Counter[str] = Counter()
+    fill_actions: Counter[str] = Counter()
+    fill_control_states: Counter[str] = Counter()
+    fill_targets: Counter[str] = Counter()
+    fill_clusters: Counter[str] = Counter()
+    cluster_actions: Counter[str] = Counter()
+    cluster_control_states: Counter[str] = Counter()
+    rejection_reasons: Counter[str] = Counter()
+    candidate_count_total = 0
+    accepted_count_total = 0
+    proof_only_cluster_count = 0
+    best_candidate_quality_gap: Dict[str, Optional[float]] = {}
+
+    for (policy_json,) in cur.execute("SELECT policy_json FROM decisions ORDER BY ts_ms ASC").fetchall():
+        try:
+            payload = json.loads(policy_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        for quote in list(payload.get("desired_quotes") or []):
+            metadata = dict(quote.get("metadata") or {})
+            hedge_action = str(metadata.get("hedge_action") or "").strip()
+            if hedge_action:
+                decision_actions[hedge_action] += 1
+            control_state = str(metadata.get("control_state") or "").strip()
+            if control_state:
+                decision_control_states[control_state] += 1
+            cluster_id = str(metadata.get("hedge_cluster_id") or "").strip()
+            if cluster_id:
+                decision_clusters[cluster_id] += 1
+            target_market = str(metadata.get("hedge_market_id") or "").strip()
+            target_token = str(metadata.get("hedge_target_token_id") or "").strip()
+            target_side = str(metadata.get("hedge_target_side") or "").strip()
+            if target_market or target_token or target_side:
+                decision_targets["present"] += 1
+            for reason in list(metadata.get("hedge_rejection_reasons") or []):
+                rejection_reasons[str(reason)] += 1
+
+    for (payload_json,) in cur.execute("SELECT payload_json FROM fills ORDER BY ts_ms ASC").fetchall():
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        hedge_action = str(payload.get("hedge_action") or "").strip()
+        if hedge_action:
+            fill_actions[hedge_action] += 1
+        control_state = str(payload.get("control_state") or "").strip()
+        if control_state:
+            fill_control_states[control_state] += 1
+        cluster_id = str(payload.get("hedge_cluster_id") or "").strip()
+        if cluster_id:
+            fill_clusters[cluster_id] += 1
+        target_market = str(payload.get("hedge_market_id") or "").strip()
+        target_token = str(payload.get("hedge_target_token_id") or "").strip()
+        target_side = str(payload.get("hedge_target_side") or "").strip()
+        if target_market or target_token or target_side:
+            fill_targets["present"] += 1
+
+    for (payload_json,) in cur.execute("SELECT payload_json FROM system_state ORDER BY as_of_ts ASC").fetchall():
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        cluster_hedge = payload.get("cluster_hedge") or {}
+        for cluster in list(cluster_hedge.get("clusters") or []):
+            hedge_action = str(cluster.get("action") or "").strip()
+            if hedge_action:
+                cluster_actions[hedge_action] += 1
+            control_state = str(cluster.get("control_state") or "").strip()
+            if control_state:
+                cluster_control_states[control_state] += 1
+            candidate_summary = dict(cluster.get("candidate_summary") or {})
+            candidate_count_total += int(candidate_summary.get("candidate_count") or 0)
+            accepted_count_total += int(candidate_summary.get("accepted_count") or 0)
+            if bool(candidate_summary.get("proof_only_lane")):
+                proof_only_cluster_count += 1
+            best_candidate = dict(candidate_summary.get("best_candidate") or {})
+            cluster_id = str(candidate_summary.get("cluster_id") or cluster.get("cluster_id") or "").strip()
+            if cluster_id:
+                best_candidate_quality_gap[cluster_id] = _float_or_none(best_candidate.get("quality_gap"))
+            for reason in list(cluster.get("rejection_reasons") or []):
+                rejection_reasons[str(reason)] += 1
+
+    return {
+        "decision_actions": {key: int(decision_actions[key]) for key in sorted(decision_actions)},
+        "decision_control_states": {key: int(decision_control_states[key]) for key in sorted(decision_control_states)},
+        "decision_cluster_ids": {key: int(decision_clusters[key]) for key in sorted(decision_clusters)},
+        "decision_target_presence": int(decision_targets.get("present", 0)),
+        "fill_actions": {key: int(fill_actions[key]) for key in sorted(fill_actions)},
+        "fill_control_states": {key: int(fill_control_states[key]) for key in sorted(fill_control_states)},
+        "fill_cluster_ids": {key: int(fill_clusters[key]) for key in sorted(fill_clusters)},
+        "fill_target_presence": int(fill_targets.get("present", 0)),
+        "cluster_actions": {key: int(cluster_actions[key]) for key in sorted(cluster_actions)},
+        "cluster_control_states": {key: int(cluster_control_states[key]) for key in sorted(cluster_control_states)},
+        "rejection_reasons": {key: int(rejection_reasons[key]) for key in sorted(rejection_reasons)},
+        "candidate_count_total": int(candidate_count_total),
+        "accepted_count_total": int(accepted_count_total),
+        "proof_only_cluster_count": int(proof_only_cluster_count),
+        "best_candidate_quality_gap_by_cluster": {
+            key: best_candidate_quality_gap[key] for key in sorted(best_candidate_quality_gap)
+        },
+        "hedge_observed": bool(decision_actions or fill_actions or cluster_actions),
+    }
+
+
+def _hedge_candidate_summary(cur: sqlite3.Cursor) -> Dict[str, Any]:
+    rows = cur.execute(
+        """
+        SELECT action, candidate_state, control_state, hedge_quality_gap, rejection_reasons, quality_gap_state
+        FROM hedge_candidates
+        ORDER BY ts_ms ASC
+        """
+    ).fetchall()
+    action_counts: Counter[str] = Counter()
+    candidate_state_counts: Counter[str] = Counter()
+    control_state_counts: Counter[str] = Counter()
+    rejection_reasons: Counter[str] = Counter()
+    quality_gap_state_counts: Counter[str] = Counter()
+    quality_gaps: List[float] = []
+    for action, candidate_state, control_state, hedge_quality_gap, rejection_blob, quality_gap_state in rows:
+        action_text = str(action or "").strip()
+        if action_text:
+            action_counts[action_text] += 1
+        state_text = str(candidate_state or "").strip()
+        if state_text:
+            candidate_state_counts[state_text] += 1
+        control_text = str(control_state or "").strip()
+        if control_text:
+            control_state_counts[control_text] += 1
+        quality_state_text = str(quality_gap_state or "").strip()
+        if quality_state_text:
+            quality_gap_state_counts[quality_state_text] += 1
+        if hedge_quality_gap is not None:
+            quality_gaps.append(float(hedge_quality_gap))
+        try:
+            reasons = json.loads(rejection_blob or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            reasons = []
+        if isinstance(reasons, list):
+            for reason in reasons:
+                if reason not in (None, ""):
+                    rejection_reasons[str(reason)] += 1
+    accepted = int(candidate_state_counts.get("accepted", 0))
+    rejected = int(candidate_state_counts.get("rejected", 0))
+    deferred = int(candidate_state_counts.get("deferred", 0))
+    return {
+        "clusters_seen": int(len(rows)),
+        "accepted_clusters": accepted,
+        "rejected_clusters": rejected,
+        "deferred_clusters": deferred,
+        "action_counts": {key: int(action_counts[key]) for key in sorted(action_counts)},
+        "candidate_state_counts": {key: int(candidate_state_counts[key]) for key in sorted(candidate_state_counts)},
+        "control_state_counts": {key: int(control_state_counts[key]) for key in sorted(control_state_counts)},
+        "rejection_reason_counts": {key: int(rejection_reasons[key]) for key in sorted(rejection_reasons)},
+        "quality_gap_state_counts": {key: int(quality_gap_state_counts[key]) for key in sorted(quality_gap_state_counts)},
+        "quality_gap_known": int(len(quality_gaps)),
+        "quality_gap_positive": int(sum(1 for value in quality_gaps if value > 0)),
+        "quality_gap_negative": int(sum(1 for value in quality_gaps if value < 0)),
+        "quality_gap_flat": int(sum(1 for value in quality_gaps if value == 0)),
+        "avg_quality_gap": _avg(quality_gaps),
+        "hedge_candidate_observed": bool(rows),
     }
 
 
